@@ -1,6 +1,6 @@
 /*****************************************************************************
 
-Copyright (c) 2012, 2019, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 2012, 2020, Oracle and/or its affiliates. All Rights Reserved.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License, version 2.0, as published by the
@@ -503,8 +503,8 @@ static MY_ATTRIBUTE((warn_unused_result)) dberr_t
   FILE *file = fopen(name, "w+b");
 
   if (file == nullptr) {
-    ib_errf(thd, IB_LOG_LEVEL_WARN, ER_CANT_CREATE_FILE, name, errno,
-            strerror(errno));
+    ib_senderrf(thd, IB_LOG_LEVEL_WARN, ER_CANT_CREATE_FILE, name, errno,
+                strerror(errno));
 
     err = DB_IO_ERROR;
   } else {
@@ -668,8 +668,8 @@ static MY_ATTRIBUTE((nonnull, warn_unused_result)) dberr_t
   FILE *file = fopen(name, "w+b");
 
   if (file == nullptr) {
-    ib_errf(thd, IB_LOG_LEVEL_WARN, ER_CANT_CREATE_FILE, name, errno,
-            strerror(errno));
+    ib_senderrf(thd, IB_LOG_LEVEL_WARN, ER_CANT_CREATE_FILE, name, errno,
+                strerror(errno));
 
     err = DB_IO_ERROR;
   } else {
@@ -726,10 +726,10 @@ static bool row_quiesce_table_has_fts_index(
   return (exists);
 }
 
-/** Quiesce the tablespace that the table resides in. */
-void row_quiesce_table_start(dict_table_t *table, /*!< in: quiesce this table */
-                             trx_t *trx) /*!< in/out: transaction/session */
-{
+/** Quiesce the tablespace that the table resides in.
+@param[in] table Quiesce this table
+@param[in,out] trx Transaction/session */
+void row_quiesce_table_start(dict_table_t *table, trx_t *trx) {
   ut_a(trx->mysql_thd != nullptr);
   ut_a(srv_n_purge_threads > 0);
   ut_ad(!srv_read_only_mode);
@@ -788,11 +788,10 @@ void row_quiesce_table_start(dict_table_t *table, /*!< in: quiesce this table */
   ut_a(err == DB_SUCCESS);
 }
 
-/** Cleanup after table quiesce. */
-void row_quiesce_table_complete(
-    dict_table_t *table, /*!< in: quiesce this table */
-    trx_t *trx)          /*!< in/out: transaction/session */
-{
+/** Cleanup after table quiesce.
+@param[in] table Quiesce this table
+@param[in,out] trx Transaction/session */
+void row_quiesce_table_complete(dict_table_t *table, trx_t *trx) {
   ulint count = 0;
 
   ut_a(trx->mysql_thd != nullptr);

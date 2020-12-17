@@ -1,4 +1,4 @@
-# Copyright (c) 2017, 2019, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2017, 2020, Oracle and/or its affiliates.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License, version 2.0,
@@ -129,7 +129,6 @@ add_harness_plugin(mock_server
   mysql_protocol_encoder.cc
   x_protocol_decoder.cc
   x_protocol_encoder.cc
-  mysql_protocol_utils.cc
   mysql_server_mock.cc
   mock_session.cc
   classic_mock_session.cc
@@ -140,7 +139,8 @@ add_harness_plugin(mock_server
   mock_server_plugin.cc
   mock_server_component.cc
   authentication.cc
-  REQUIRES mysql_protocol;duktape;${PROTOBUF_LIBRARY};mysqlxmessages)
+  REQUIRES mysql_protocol;duktape;${PROTOBUF_LITE_LIBRARY};mysqlxmessages_lite;
+  harness_stdx;harness-library)
 
 TARGET_INCLUDE_DIRECTORIES(mock_server SYSTEM PUBLIC
   ${DUKTAPE_SOURCE_DIR}/src/
@@ -173,8 +173,10 @@ MYSQL_ADD_EXECUTABLE(mysql_server_mock
   LINK_LIBRARIES
   ${common_libraries}
   harness-library
-  mysqlxmessages
-  ${PROTOBUF_LIBRARY}
+  mysqlxmessages_lite
+  ${PROTOBUF_LITE_LIBRARY}
+  harness_stdx
+  harness_net_ts
   SKIP_INSTALL
   )
 
@@ -189,6 +191,5 @@ ADD_DEPENDENCIES(mysqlrouter_all mock_server_rest_client)
 TARGET_COMPILE_DEFINITIONS(mysql_server_mock
   PRIVATE -Dmysql_protocol_DEFINE_STATIC=1
   )
-SET_PATH_TO_SSL(mysql_server_mock ${CMAKE_BINARY_DIR}/runtime_output_directory)
+SET_PATH_TO_CUSTOM_SSL_FOR_APPLE(mysql_server_mock)
 
-ADD_DEFINITIONS(-DUSE_MYSQLX_FULL_PROTO)

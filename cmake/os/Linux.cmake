@@ -61,6 +61,14 @@ IF(EXISTS "/etc/os-release")
   ENDIF()
 ENDIF()
 
+IF(MY_HOST_SYSTEM_VERSION AND MY_HOST_FILESYSTEM_NAME)
+  IF( MY_HOST_SYSTEM_VERSION MATCHES "\\.el6(uek)?\\."
+      OR
+      MY_HOST_FILESYSTEM_NAME MATCHES "\\.el6\\.")
+    SET(LINUX_RHEL6 1)
+  ENDIF()
+ENDIF()
+
 # We require at least GCC 5.3 or Clang 3.4.
 IF(NOT FORCE_UNSUPPORTED_COMPILER)
   IF(MY_COMPILER_IS_GNU)
@@ -106,6 +114,7 @@ IF(NOT WITH_ASAN AND
    NOT WITH_TSAN AND
    NOT WITH_UBSAN)
   SET(LINK_FLAG_NO_UNDEFINED "-Wl,--no-undefined")
+  SET(LINK_FLAG_Z_DEFS "-z,defs")
 ENDIF()
 
 # Linux specific HUGETLB /large page support

@@ -168,9 +168,6 @@ struct Srv_threads {
   /** Error monitor thread. */
   IB_thread m_error_monitor;
 
-  /** Redo closer thread. */
-  IB_thread m_log_closer;
-
   /** Redo checkpointer thread. */
   IB_thread m_log_checkpointer;
 
@@ -250,12 +247,26 @@ struct Srv_threads {
   is ended and final plugin's shutdown is started (when plugin is DELETED).
   Note that you may only delay the shutdown for threads for which there is no
   waiting procedure used in the pre_dd_shutdown. */
-  os_event_t shutdown_cleanup_dbg;
+  os_event_t m_shutdown_cleanup_dbg;
 #endif /* UNIV_DEBUG */
+
+  /** When the master thread notices that shutdown has started (by noticing
+  srv_shutdown_state >= SRV_SHUTDOWN_PRE_DD_AND_SYSTEM_TRANSACTIONS), it exits
+  its main loop. Then the master thread proceeds with actions related to tasks:
+    - which it has been responsible for,
+    - and which might depend on DD objects.
+  After finishing them, the master thread sets this event.
+  @remarks We use this event to wait in srv_pre_dd_shutdown before we enter
+  next phase (SRV_SHUTDOWN_PURGE) in which master thread is not allowed to
+  use system transactions or touch DD objects. */
+  os_event_t m_master_ready_for_dd_shutdown;
 };
 
 /** Check if given thread is still active. */
 bool srv_thread_is_active(const IB_thread &thread);
+
+/** Check if given thread is cleaned-up and stopped. */
+bool srv_thread_is_stopped(const IB_thread &thread);
 
 /** Delay the thread after it discovered that the shutdown_state
 is greater or equal to SRV_SHUTDOWN_CLEANUP, before it proceeds
@@ -314,6 +325,12 @@ extern bool srv_buffer_pool_load_at_startup;
 
 /* Whether to disable file system cache if it is defined */
 extern bool srv_disable_sort_file_cache;
+
+/** Enable or disable writing of NULLs while extending a tablespace.
+If this is FALSE, then the server will just allocate the space without
+actually initializing it with NULLs. If the variable is true, the
+server will allocate and initialize the space by writing NULLs in it. */
+extern bool tbsp_extend_and_initialize;
 
 /* If the last data file is auto-extended, we add this many pages to it
 at a time */
@@ -400,6 +417,10 @@ extern bool srv_undo_log_encrypt;
 /** Default size of UNDO tablespace while it is created new. */
 extern const page_no_t SRV_UNDO_TABLESPACE_SIZE_IN_PAGES;
 
+/** Maximum number of recently truncated undo tablespace IDs for
+the same undo number. */
+extern const size_t CONCURRENT_UNDO_TRUNCATE_LIMIT;
+
 extern char *srv_log_group_home_dir;
 
 /** Enable or Disable Encrypt of REDO tablespace. */
@@ -457,6 +478,9 @@ extern ulong srv_log_recent_written_size;
 for total order of dirty pages, when they are added to flush lists.
 The slots are addressed by LSN values modulo number of the slots. */
 extern ulong srv_log_recent_closed_size;
+
+/** Whether to activate/pause the log writer threads. */
+extern bool srv_log_writer_threads;
 
 /** Minimum absolute value of cpu time for which spin-delay is used. */
 extern uint srv_log_spin_cpu_abs_lwm;
@@ -516,13 +540,6 @@ extern ulong srv_log_flush_notifier_spin_delay;
 /** Initial timeout used to wait on flush_notifier_event. */
 extern ulong srv_log_flush_notifier_timeout;
 
-/** Number of spin iterations, for which log closerr thread is waiting
-for a reachable untraversed link in recent_closed. */
-extern ulong srv_log_closer_spin_delay;
-
-/** Initial sleep used in log closer after spin delay is finished. */
-extern ulong srv_log_closer_timeout;
-
 /** Whether to generate and require checksums on the redo log pages. */
 extern bool srv_log_checksums;
 
@@ -573,6 +590,8 @@ extern ulong srv_buf_pool_instances;
 extern const ulong srv_buf_pool_instances_default;
 /** Number of locks to protect buf_pool->page_hash */
 extern ulong srv_n_page_hash_locks;
+/** Whether to validate InnoDB tablespace paths on startup */
+extern bool srv_validate_tablespace_paths;
 /** Scan depth for LRU flush batch i.e.: number of blocks scanned*/
 extern ulong srv_LRU_scan_depth;
 /** Whether or not to flush neighbors of a block */
@@ -672,7 +691,6 @@ extern bool srv_print_innodb_lock_monitor;
 
 extern ulong srv_n_spin_wait_rounds;
 extern ulong srv_n_free_tickets_to_enter;
-extern ulong srv_thread_sleep_delay;
 extern ulong srv_spin_wait_delay;
 extern ibool srv_priority_boost;
 
@@ -724,6 +742,8 @@ extern bool srv_print_ddl_logs;
 
 extern bool srv_cmp_per_index_enabled;
 
+extern bool srv_redo_log;
+
 /** Status variables to be passed to MySQL */
 extern struct export_var_t export_vars;
 
@@ -750,7 +770,6 @@ extern mysql_pfs_key_t io_log_thread_key;
 extern mysql_pfs_key_t io_read_thread_key;
 extern mysql_pfs_key_t io_write_thread_key;
 extern mysql_pfs_key_t log_writer_thread_key;
-extern mysql_pfs_key_t log_closer_thread_key;
 extern mysql_pfs_key_t log_checkpointer_thread_key;
 extern mysql_pfs_key_t log_flusher_thread_key;
 extern mysql_pfs_key_t log_write_notifier_thread_key;
@@ -767,7 +786,6 @@ extern mysql_pfs_key_t srv_worker_thread_key;
 extern mysql_pfs_key_t trx_recovery_rollback_thread_key;
 extern mysql_pfs_key_t srv_ts_alter_encrypt_thread_key;
 extern mysql_pfs_key_t parallel_read_thread_key;
-extern mysql_pfs_key_t parallel_read_ahead_thread_key;
 #endif /* UNIV_PFS_THREAD */
 #endif /* !UNIV_HOTBACKUP */
 
@@ -921,11 +939,12 @@ enum srv_thread_type {
 void srv_boot(void);
 /** Frees the data structures created in srv_init(). */
 void srv_free(void);
-/** Sets the info describing an i/o thread current state. */
-void srv_set_io_thread_op_info(
-    ulint i,          /*!< in: the 'segment' of the i/o thread */
-    const char *str); /*!< in: constant char string describing the
-                      state */
+
+/** Sets the info describing an i/o thread current state.
+@param[in] i The 'segment' of the i/o thread
+@param[in] str Constant char string describing the state */
+void srv_set_io_thread_op_info(ulint i, const char *str);
+
 /** Resets the info describing an i/o thread current state. */
 void srv_reset_io_thread_op_info();
 /** Tells the purge thread that there has been activity in the database
@@ -950,16 +969,16 @@ void srv_active_wake_master_thread_low(void);
 void srv_wake_master_thread(void);
 #ifndef UNIV_HOTBACKUP
 /** Outputs to a file the output of the InnoDB Monitor.
- @return false if not all information printed
- due to failure to obtain necessary mutex */
-ibool srv_printf_innodb_monitor(
-    FILE *file,       /*!< in: output stream */
-    ibool nowait,     /*!< in: whether to wait for the
-                      lock_sys_t::mutex */
-    ulint *trx_start, /*!< out: file position of the start of
-                      the list of active transactions */
-    ulint *trx_end);  /*!< out: file position of the end of
-                      the list of active transactions */
+@param[in]    file      output stream
+@param[in]    nowait    whether to wait for the exclusive global lock_sys latch
+@param[out]   trx_start file position of the start of the list of active
+                        transactions
+@param[out]   trx_end   file position of the end of the list of active
+                        transactions
+@return false if not all information printed due to failure to obtain necessary
+        mutex */
+bool srv_printf_innodb_monitor(FILE *file, bool nowait, ulint *trx_start,
+                               ulint *trx_end);
 
 /** Function to pass InnoDB status variables to MySQL */
 void srv_export_innodb_status(void);
@@ -997,8 +1016,8 @@ void srv_worker_thread();
 void undo_rotate_default_master_key();
 
 /** Set encryption for UNDO tablespace with given space id.
-@param[in] space_id     undo tablespace id
-@param[in] mtr          mini-transaction
+@param[in] space_id     Undo tablespace id
+@param[in] mtr          Mini-transaction
 @param[in] is_boot	true if it is called during server start up.
 @return false for success, true otherwise */
 bool set_undo_tablespace_encryption(space_id_t space_id, mtr_t *mtr,
@@ -1046,9 +1065,10 @@ void srv_purge_wakeup(void);
 bool srv_purge_threads_active();
 
 /** Create an undo tablespace with an explicit file name
-@param[in]	space_name	tablespace name
-@param[in]	file_name	file name
-@param[out]	space_id	Tablespace ID chosen
+This is called during CREATE UNDO TABLESPACE.
+@param[in]  space_name  tablespace name
+@param[in]  file_name   file name
+@param[in]  space_id    Tablespace ID
 @return DB_SUCCESS or error code */
 dberr_t srv_undo_tablespace_create(const char *space_name,
                                    const char *file_name, space_id_t space_id);
@@ -1060,6 +1080,10 @@ void undo_spaces_init();
 /** Free the resources occupied by undo::spaces and trx_sys_undo_spaces,
 called once during thread de-initialization. */
 void undo_spaces_deinit();
+
+/** Set redo log variable for performance schema global status.
+@param[in]	enable	true => redo log enabled, false => redo log disabled */
+void set_srv_redo_log(bool enable);
 
 #ifdef UNIV_DEBUG
 struct SYS_VAR;
@@ -1121,6 +1145,7 @@ struct export_var_t {
   ulint innodb_pages_created;          /*!< buf_pool->stat.n_pages_created */
   ulint innodb_pages_read;             /*!< buf_pool->stat.n_pages_read */
   ulint innodb_pages_written;          /*!< buf_pool->stat.n_pages_written */
+  bool innodb_redo_log_enabled;        /*!< srv_redo_log */
   ulint innodb_row_lock_waits;         /*!< srv_n_lock_wait_count */
   ulint innodb_row_lock_current_waits; /*!< srv_n_lock_wait_current_count */
   int64_t innodb_row_lock_time;        /*!< srv_n_lock_wait_time

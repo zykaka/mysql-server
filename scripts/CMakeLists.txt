@@ -1,4 +1,4 @@
-# Copyright (c) 2006, 2020, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2006, 2020, Oracle and/or its affiliates.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License, version 2.0,
@@ -159,12 +159,6 @@ IF(UNIX)
 )
 ENDIF()
 
-# TCMalloc hacks
-IF(MALLOC_LIB)
-  MESSAGE("Using tcmalloc '${MALLOC_LIB}'")
-  INSTALL(FILES ${MALLOC_LIB} DESTINATION ${INSTALL_LIBDIR} OPTIONAL)
-ENDIF()
-
 SET(COMPILE_DEFINITIONS_WHITELIST
 )
 
@@ -259,6 +253,7 @@ IF(UNIX)
   ENDIF()
 
   SET(MYSQLD_USER "mysql")
+  SET(MYSQLROUTER_USER "mysqlrouter")
 
 ENDIF(UNIX)
 
@@ -489,5 +484,27 @@ ELSE()
       COMPONENT Server
       PERMISSIONS OWNER_READ OWNER_WRITE GROUP_READ WORLD_READ
     )
+
+    # MySQL Router
+    IF(WITH_ROUTER)
+      CONFIGURE_FILE(systemd/mysqlrouter.service.in
+        ${CMAKE_CURRENT_BINARY_DIR}/mysqlrouter.service
+        ESCAPE_QUOTES @ONLY)
+
+      INSTALL(FILES ${CMAKE_CURRENT_BINARY_DIR}/mysqlrouter.service
+        DESTINATION ${SYSTEMD_INSTALL_PREFIX}${SYSTEMD_SERVICES_DIR}
+        COMPONENT Router
+        PERMISSIONS OWNER_READ OWNER_WRITE GROUP_READ WORLD_READ
+      )
+
+      CONFIGURE_FILE(systemd/mysqlrouter.tmpfiles.d.in
+        ${CMAKE_CURRENT_BINARY_DIR}/mysqlrouter.conf ESCAPE_QUOTES @ONLY)
+
+      INSTALL(FILES ${CMAKE_CURRENT_BINARY_DIR}/mysqlrouter.conf
+        DESTINATION ${SYSTEMD_INSTALL_PREFIX}${SYSTEMD_TMPFILES_DIR}
+        COMPONENT Router
+        PERMISSIONS OWNER_READ OWNER_WRITE GROUP_READ WORLD_READ
+      )
+    ENDIF()
   ENDIF()
 ENDIF()

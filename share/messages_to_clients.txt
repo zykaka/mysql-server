@@ -1,4 +1,4 @@
-# Copyright (c) 2017, 2020, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2017, 2020, Oracle and/or its affiliates.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License, version 2.0,
@@ -5856,7 +5856,7 @@ ER_BLOB_FIELD_IN_PART_FUNC_ERROR
         ger "In der Partitionierungsfunktion sind BLOB-Spalten nicht erlaubt"
         swe "Ett BLOB-fält är inte tillåtet i partitioneringsfunktioner"
 ER_UNIQUE_KEY_NEED_ALL_FIELDS_IN_PF
-        eng "A %-.192s must include all columns in the table's partitioning function"
+        eng "A %-.192s must include all columns in the table's partitioning function (prefixed columns are not considered)."
 ER_NO_PARTS_ERROR
         eng "Number of %-.64s = 0 is not an allowed value"
         ger "Eine Anzahl von %-.64s = 0 ist kein erlaubter Wert"
@@ -6464,7 +6464,7 @@ ER_LOCK_ABORTED
 ER_DATA_OUT_OF_RANGE 22003
   eng "%s value is out of range in '%s'"
 
-ER_WRONG_SPVAR_TYPE_IN_LIMIT
+OBSOLETE_ER_WRONG_SPVAR_TYPE_IN_LIMIT
   eng "A variable of a non-integer based type in LIMIT clause"
 
 ER_BINLOG_UNSAFE_MULTIPLE_ENGINES_AND_SELF_LOGGING_ENGINE
@@ -8348,7 +8348,7 @@ ER_INVALID_THREAD_PRIORITY
   eng "Invalid thread priority value %d for %s resource group %s. Allowed range is [%d, %d]."
 
 ER_DISALLOWED_OPERATION
-  eng "%s operation is disallowed on %s "
+  eng "%s operation is disallowed on %s"
 
 ER_RESOURCE_GROUP_BUSY
   eng "Resource group %s is busy."
@@ -9307,6 +9307,143 @@ ER_WARN_DEPRECATED_SQL_CALC_FOUND_ROWS
 # code.
 ER_WARN_DEPRECATED_FOUND_ROWS
   eng "FOUND_ROWS() is deprecated and will be removed in a future release. Consider using COUNT(*) instead."
+
+ER_MISSING_JSON_VALUE 22035
+  eng "No value was found by '%.192s' on the specified path."
+
+ER_MULTIPLE_JSON_VALUES 22034
+  eng "More than one value was found by '%.192s' on the specified path."
+
+ER_HOSTNAME_TOO_LONG
+  eng "Hostname cannot be longer than %d characters."
+
+# When using this error message, use the ER_WARN_DEPRECATED_SYNTAX_NO_REPLACEMENT error code.
+ER_WARN_CLIENT_DEPRECATED_PARTITION_PREFIX_KEY
+  eng "Column '%.64s.%.64s.%.64s' having prefix key part '%.64s(%u)' is ignored by the partitioning function. Use of prefixed columns in the PARTITION BY KEY() clause is deprecated and will be removed in a future release."
+
+ER_GROUP_REPLICATION_USER_EMPTY_MSG
+  eng "The START GROUP_REPLICATION command failed since the username provided for recovery channel is empty."
+
+ER_GROUP_REPLICATION_USER_MANDATORY_MSG
+  eng "The START GROUP_REPLICATION command failed since the USER option was not provided with PASSWORD for recovery channel."
+
+ER_GROUP_REPLICATION_PASSWORD_LENGTH
+  eng "The START GROUP_REPLICATION command failed since the password provided for the recovery channel exceeds the maximum length of 32 characters."
+
+ER_SUBQUERY_TRANSFORM_REJECTED
+  eng "Statement requires a transform of a subquery to a non-SET operation (like IN2EXISTS, or subquery-to-LATERAL-derived-table). This is not allowed with optimizer switch 'subquery_to_derived' on".
+
+ER_DA_GRP_RPL_RECOVERY_ENDPOINT_FORMAT
+  eng "Invalid input value for recovery socket endpoints '%s'. Please, provide a valid, comma separated, list of endpoints (IP:port)".
+
+ER_DA_GRP_RPL_RECOVERY_ENDPOINT_INVALID
+  eng "The server is not listening on endpoint '%s'. Only endpoints that the server is listening on are valid recovery endpoints."
+
+ER_WRONG_VALUE_FOR_VAR_PLUS_ACTIONABLE_PART
+  eng "Variable '%-.64s' cannot be set to the value of '%-.200s'. %-.200s"
+
+ER_STATEMENT_NOT_ALLOWED_AFTER_START_TRANSACTION
+  eng "Only BINLOG INSERT, COMMIT and ROLLBACK statements are allowed after CREATE TABLE with START TRANSACTION statement."
+
+ER_FOREIGN_KEY_WITH_ATOMIC_CREATE_SELECT
+  eng "Foreign key creation is not allowed with CREATE TABLE as SELECT and CREATE TABLE with START TRANSACTION statement."
+
+ER_NOT_ALLOWED_WITH_START_TRANSACTION
+  eng "START TRANSACTION clause cannot be used %.128s".
+
+ER_INVALID_JSON_ATTRIBUTE
+  eng "Invalid json attribute, error: \"%s\" at pos %u: '%s'"
+
+ER_ENGINE_ATTRIBUTE_NOT_SUPPORTED
+  eng "Storage engine '%s' does not support ENGINE_ATTRIBUTE."
+
+ER_INVALID_USER_ATTRIBUTE_JSON
+  eng "The user attribute must be a valid JSON object"
+
+ER_INNODB_REDO_DISABLED
+  eng "Cannot perform operation as InnoDB redo logging is disabled. Please retry after enabling redo log with ALTER INSTANCE"
+
+ER_INNODB_REDO_ARCHIVING_ENABLED
+  eng "Cannot perform operation as InnoDB is archiving redo log. Please retry after stopping redo archive by invoking innodb_redo_log_archive_stop()"
+
+ER_MDL_OUT_OF_RESOURCES
+  eng "Not enough resources to complete lock request."
+
+ER_IMPLICIT_COMPARISON_FOR_JSON
+  eng "Evaluating a JSON value in SQL boolean context does an implicit comparison against JSON integer 0; if this is not what you want, consider converting JSON to a SQL numeric type with JSON_VALUE RETURNING"
+
+ER_FUNCTION_DOES_NOT_SUPPORT_CHARACTER_SET
+  eng "The function %s does not support the character set '%s'."
+
+ER_IMPOSSIBLE_STRING_CONVERSION
+  eng "Conversion from collation %s into %s impossible for %s"
+
+ER_SCHEMA_READ_ONLY
+  eng "Schema '%s' is in read only mode."
+
+ER_RPL_ASYNC_RECONNECT_GTID_MODE_OFF
+  eng "Failed to enable Asynchronous Replication Connection Failover feature. The CHANGE MASTER TO SOURCE_CONNECTION_AUTO_FAILOVER = 1 can only be set when @@GLOBAL.GTID_MODE = ON."
+
+ER_RPL_ASYNC_RECONNECT_AUTO_POSITION_OFF
+  eng "Failed to enable Asynchronous Replication Connection Failover feature. The CHANGE MASTER TO SOURCE_CONNECTION_AUTO_FAILOVER = 1 can only be set when MASTER_AUTO_POSITION option of CHANGE MASTER TO is enabled."
+
+ER_DISABLE_GTID_MODE_REQUIRES_ASYNC_RECONNECT_OFF
+  eng "The @@GLOBAL.GTID_MODE = %-.64s cannot be executed because Asynchronous Replication Connection Failover is enabled i.e. CHANGE MASTER TO SOURCE_CONNECTION_AUTO_FAILOVER = 1."
+
+ER_DISABLE_AUTO_POSITION_REQUIRES_ASYNC_RECONNECT_OFF
+  eng "CHANGE MASTER TO MASTER_AUTO_POSITION = 0 cannot be executed because Asynchronous Replication Connection Failover is enabled i.e. CHANGE MASTER TO SOURCE_CONNECTION_AUTO_FAILOVER = 1."
+
+ER_INVALID_PARAMETER_USE
+  eng "Invalid use of parameters in '%s'"
+
+ER_CHARACTER_SET_MISMATCH
+  eng "Character set '%s' cannot be used in conjunction with '%s' in call to %s."
+
+ER_WARN_VAR_VALUE_CHANGE_NOT_SUPPORTED
+  eng "Changing %s not supported on this platform. Falling back to the default."
+
+ER_INVALID_TIME_ZONE_INTERVAL
+  eng "Invalid time zone interval: '%s'"
+
+ER_INVALID_CAST
+  eng "Cannot cast value to %s."
+
+ER_HYPERGRAPH_NOT_SUPPORTED_YET 42000
+  eng "The hypergraph optimizer does not yet support '%s'"
+
+ER_WARN_HYPERGRAPH_EXPERIMENTAL
+  eng "The hypergraph optimizer is highly experimental and is meant for testing only. Do not enable it unless you are a MySQL developer."
+
+ER_DA_NO_ERROR_LOG_PARSER_CONFIGURED
+  eng "None of the log-sinks selected with --log-error-services=... provides a log-parser. The server will not be able to make the previous runs' error-logs available in performance_schema.error_log."
+
+ER_DA_ERROR_LOG_TABLE_DISABLED
+  eng "None of the log-sinks selected in @@global.log_error_services supports writing to the performance schema. The server will not be able to make the current runs' error events available in performance_schema.error_log. To change this, add a log-sink that supports the performance schema to @@global.log_error_services."
+
+ER_DA_ERROR_LOG_MULTIPLE_FILTERS
+  eng "@@global.log_error_services lists more than one log-filter service. This is discouraged as it will make it hard to understand which rule in which filter affected a log-event."
+
+ER_DA_CANT_OPEN_ERROR_LOG
+  eng "Could not open file '%s' for error logging%s%s"
+
+ER_USER_REFERENCED_AS_DEFINER
+  eng "User %.256s is referenced as a definer account in %s."
+
+ER_CANNOT_USER_REFERENCED_AS_DEFINER
+  eng "Operation %s failed for %.256s as it is referenced as a definer account in %s."
+
+ER_REGEX_NUMBER_TOO_BIG
+  eng "Decimal number in regular expression is too large."
+
+# When using this error message, use the ER_PARSE_ERROR message
+ER_SPVAR_NONINTEGER_TYPE
+  eng "The variable \"%s\" has a non-integer based type"
+
+WARN_UNSUPPORTED_ACL_TABLES_READ
+  eng "Reads with serializable isolation/SELECT FOR SHARE are not supported for ACL tables."
+
+ER_BINLOG_UNSAFE_ACL_TABLE_READ_IN_DML_DDL
+  eng "The statement is unsafe because it updates a table depending on ACL table read operation. As storage engine row locks are skipped for ACL table, it may not have same effect on master and slave."
 
 #
 #  End of 8.0 error messages (server-to-client).

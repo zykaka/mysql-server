@@ -1,6 +1,6 @@
 /*****************************************************************************
 
-Copyright (c) 2014, 2019, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 2014, 2020, Oracle and/or its affiliates. All Rights Reserved.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License, version 2.0, as published by the
@@ -38,6 +38,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 
 #include "dict0dict.h"
 #include "page0cur.h"
+#include "ut0class_life_cycle.h"
 #include "ut0new.h"
 
 /** Innodb B-tree index fill factor for bulk load. */
@@ -53,7 +54,7 @@ The proper function call sequence of PageBulk is as below:
 -- PageBulk::commit
 */
 
-class PageBulk {
+class PageBulk : private ut::Non_copyable {
  public:
   /** Page split point descriptor. */
   struct SplitPoint {
@@ -103,6 +104,10 @@ class PageBulk {
   /** Destructor */
   ~PageBulk() {
     if (m_heap) {
+      /* mtr is allocated using heap. */
+      if (m_mtr != nullptr) {
+        m_mtr->~mtr_t();
+      }
       mem_heap_free(m_heap);
     }
   }
@@ -351,7 +356,8 @@ class BtrBulk {
   pointer to father page if needed, and commit mini-transaction.
   @param[in]	page_bulk	page to commit
   @param[in]	next_page_bulk	next page
-  @param[in]	insert_father	flag whether need to insert node ptr
+  @param[in]	insert_father	false when page_bulk is a root page and
+                                  true when it's a non-root page
   @return	error code */
   dberr_t pageCommit(PageBulk *page_bulk, PageBulk *next_page_bulk,
                      bool insert_father) MY_ATTRIBUTE((warn_unused_result));
@@ -376,7 +382,7 @@ class BtrBulk {
   /** Insert a tuple to a page.
   @param[in]  page_bulk   page bulk object
   @param[in]  tuple       tuple to insert
-  @param[in]  big_rec     big record vector, maybe NULL if there is no
+  @param[in]  big_rec     big record vector, could be nullptr if there is no
                           data to be stored externally.
   @param[in]  rec_size    record size
   @return error code */

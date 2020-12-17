@@ -45,7 +45,13 @@
 #include "storage/ndb/src/ndbapi/NdbQueryBuilder.hpp"
 #include "storage/ndb/src/ndbapi/NdbQueryOperation.hpp"
 
-typedef NdbDictionary::Table NDBTAB;
+/**
+ * antijoin_null_cond is inserted by the optimizer when it create the
+ * special antijoin-NULL-condition. It serves as a token to uniquely
+ * identify such a NULL-condition. Also see similar usage of it
+ * when building the iterators in sql_executor.cc
+ */
+extern const char *antijoin_null_cond;
 
 /*
   Explain why an operation could not be pushed
@@ -82,6 +88,40 @@ uint ndb_table_access_map::first_table(uint start) const {
     if (contain(table_no)) return table_no;
   }
   return length();
+}
+
+static const Item_func_trig_cond *GetTriggerCondOrNull(const Item *item) {
+  if (item->type() == Item::FUNC_ITEM &&
+      down_cast<const Item_func *>(item)->functype() ==
+          Item_bool_func2::TRIG_COND_FUNC) {
+    return down_cast<const Item_func_trig_cond *>(item);
+  } else {
+    return nullptr;
+  }
+}
+
+/**
+ * Check if the specified 'item' is a antijoin-NULL-condition.
+ * This condition is constructed such that all rows being 'matches'
+ * are filtered away, and only the non-(anti)matches will pass.
+ *
+ * Logic inspired by similar code in sql_executor.cc.
+ */
+static bool is_antijoin_null_cond(const Item *item) {
+  const Item_func_trig_cond *trig_cond = GetTriggerCondOrNull(item);
+  if (trig_cond != nullptr &&
+      trig_cond->get_trig_type() == Item_func_trig_cond::IS_NOT_NULL_COMPL) {
+    const Item *inner_cond = trig_cond->arguments()[0];
+    const Item_func_trig_cond *inner_trig_cond =
+        GetTriggerCondOrNull(inner_cond);
+    if (inner_trig_cond != nullptr) {
+      const Item *inner_inner_cond = inner_trig_cond->arguments()[0];
+      if (inner_inner_cond->item_name.ptr() == antijoin_null_cond) {
+        return true;
+      }
+    }
+  }
+  return false;
 }
 
 uint ndb_table_access_map::last_table(uint start) const {
@@ -273,7 +313,7 @@ NdbQuery *ndb_pushed_join::make_query_instance(
     for (uint i = 0; i < outer_fields; i++) {
       Field *field = m_referred_fields[i];
       DBUG_ASSERT(!field->is_real_null());  // Checked by ::check_if_pushable()
-      uchar *raw = field->ptr;
+      uchar *raw = field->field_ptr();
 
 #ifdef WORDS_BIGENDIAN
       if (field->table->s->db_low_byte_first &&
@@ -282,7 +322,7 @@ NdbQuery *ndb_pushed_join::make_query_instance(
         raw = static_cast<uchar *>(my_alloca(field_length));
 
         // Byte order is swapped to get the correct endian format.
-        const uchar *last = field->ptr + field_length;
+        const uchar *last = field->field_ptr() + field_length;
         for (uint pos = 0; pos < field_length; pos++) raw[pos] = *(--last);
       }
 #else
@@ -416,6 +456,17 @@ uint ndb_pushed_builder_ctx::get_table_no(const Item *key_item) const {
     }
   }
   return MAX_TABLES;
+}
+
+/**
+ * Get a ndb_table_access_map containg all tables [first..last]
+ */
+static ndb_table_access_map get_tables_in_range(uint first, uint last) {
+  ndb_table_access_map table_map;
+  for (uint i = first; i <= last; i++) {
+    table_map.add(i);
+  }
+  return table_map;
 }
 
 /**
@@ -817,8 +868,8 @@ bool ndb_pushed_builder_ctx::is_pushable_as_child(AQP::Table_access *table) {
     const Item *const key_item = table->get_key_field(key_part_no);
     const KEY_PART_INFO *key_part = table->get_key_part_info(key_part_no);
 
-    if (key_item->const_item())  // REF is a literal or field from const-table
-    {
+    if (key_item->const_for_execution()) {
+      // REF is a literal or field from const-table
       DBUG_PRINT("info", (" Item type:%d is 'const_item'", key_item->type()));
       if (!is_const_item_pushable(key_item, key_part)) {
         return false;
@@ -876,8 +927,18 @@ bool ndb_pushed_builder_ctx::is_pushable_as_child(AQP::Table_access *table) {
     handler->m_cond.prep_cond_push(pending_cond, other_tbls_ok);
     pending_cond = handler->m_cond.m_remainder_cond;
   }
-  if (pending_cond != nullptr) m_has_pending_cond.add(tab_no);
-
+  if (pending_cond != nullptr) {
+    /**
+     * An anti join will always have an 'antijoin_null_cond' attached.
+     * The general rule is that we do not allow any tables having unpushed
+     * conditions to be pushed as part of a SPJ operation. However, this
+     * special 'antijoin_null_cond' could be ignored, as the same NULL-only
+     * filtering is done by the antijoin execution at the server.
+     */
+    if (!(table->is_antijoin() && is_antijoin_null_cond(pending_cond))) {
+      m_has_pending_cond.add(tab_no);
+    }
+  }
   if (!ndbcluster_is_lookup_operation(table->get_access_type())) {
     // Check extra limitations on when index scan is pushable,
     if (!is_pushable_as_child_scan(table, all_parents)) {
@@ -1155,7 +1216,8 @@ bool ndb_pushed_builder_ctx::is_pushable_as_child_scan(
     ndb_table_access_map outer_join_nests(m_tables[tab_no].embedding_nests());
     outer_join_nests.subtract(full_inner_nest(root_no, tab_no));
 
-    if (!is_pushable_within_nest(table, outer_join_nests, "outer")) {
+    const char *join_type = table->is_antijoin() ? "anti" : "outer";
+    if (!is_pushable_within_nest(table, outer_join_nests, join_type)) {
       return false;
     }
 
@@ -1167,9 +1229,10 @@ bool ndb_pushed_builder_ctx::is_pushable_as_child_scan(
     if (unlikely(!embedding_nests.contain(all_parents))) {           // 3)
       if (unlikely(!embedding_nests.contain(m_has_pending_cond))) {  // 3a)
         EXPLAIN_NO_PUSH(
-            "Can't push outer joined table '%s' as child of '%s', "
+            "Can't push %s joined table '%s' as child of '%s', "
             "exists unpushed condition in join-nests it depends on",
-            table->get_table()->alias, m_join_root->get_table()->alias);
+            join_type, table->get_table()->alias,
+            m_join_root->get_table()->alias);
         return false;
       }
 
@@ -1184,14 +1247,16 @@ bool ndb_pushed_builder_ctx::is_pushable_as_child_scan(
        *  'Are there any unpushed tables outside of our embedding nests',
        *  instead of 'Do we refer tables from nests outside embedding nests,
        *  having unpushed tables'. As we alread know 'all_parents' are not
-       *  contained in 'embedding', the outcome should be the same except if
-       * we have parent refs to multiple non-embedded nests. (very unlikely)
+       *  contained in 'embedding'.
+       * The outcome should be the same except if we have parent refs to
+       * multiple non-embedded nests. (very unlikely)
        */
       if (unlikely(!embedding_nests.contain(unpushed_tables))) {  // 3b)
         EXPLAIN_NO_PUSH(
-            "Can't push outer joined table '%s' as child of '%s', "
+            "Can't push %s joined table '%s' as child of '%s', "
             "table depends on join-nests with unpushed tables",
-            table->get_table()->alias, m_join_root->get_table()->alias);
+            join_type, table->get_table()->alias,
+            m_join_root->get_table()->alias);
         return false;
       }
     }
@@ -1225,7 +1290,6 @@ bool ndb_pushed_builder_ctx::is_pushable_as_child_scan(
     // (We support semi-join only if firstMatch strategy is used)
     DBUG_ASSERT(m_tables[tab_no].m_sj_nest.contain(table->get_access_no()));
 
-    const ndb_table_access_map sj_nest(m_tables[tab_no].m_sj_nest);
     if (!is_pushable_within_nest(table, m_tables[tab_no].m_sj_nest, "semi")) {
       return false;
     }
@@ -1318,9 +1382,8 @@ bool ndb_pushed_builder_ctx::is_outer_nests_referable(
 
   const uint tab_no = table->get_access_no();
   const uint first_inner = m_tables[tab_no].m_first_inner;
-  const ndb_table_access_map embedding_nests(
-      m_tables[tab_no].embedding_nests());
-  DBUG_ASSERT(!embedding_nests.contain(depend_parents));
+  // Check that embedding nests does not already contain dependent parents
+  DBUG_ASSERT(!m_tables[tab_no].embedding_nests().contain(depend_parents));
 
   /**
    * Include nest-level ancestor dependencies already enforced.
@@ -1469,6 +1532,11 @@ void ndb_pushed_builder_ctx::validate_join_nest(ndb_table_access_map inner_nest,
       AQP::Table_access *table = m_plan.get_table_access(tab_no);
       const Item *cond = table->get_condition();
       if (cond != nullptr) {
+        // Condition could possibly be a 'antijoin_null_cond', in which case
+        // the pending_cond flag has been cleared, it should then be ignored.
+        if (m_join_scope.contain(tab_no) && !m_has_pending_cond.contain(tab_no))
+          continue;
+
         struct {
           table_map nest_scope;   // Aggregated 'inner_tables' scope of triggers
           table_map found_match;  // FOUND_MATCH-trigger scope
@@ -1477,28 +1545,23 @@ void ndb_pushed_builder_ctx::validate_join_nest(ndb_table_access_map inner_nest,
         // Check 'cond' for match trigger / filters
         WalkItem(const_cast<Item *>(cond), enum_walk::PREFIX,
                  [&trig_cond](Item *item) {
-                   if (item->type() == Item::FUNC_ITEM) {
-                     const Item_func *func_item =
-                         static_cast<const Item_func *>(item);
-                     if (func_item->functype() == Item_func::TRIG_COND_FUNC) {
-                       const Item_func_trig_cond *func_trig =
-                           static_cast<const Item_func_trig_cond *>(func_item);
+                   const Item_func_trig_cond *func_trig =
+                       GetTriggerCondOrNull(item);
+                   if (func_trig != nullptr) {
+                     /**
+                      * The FOUND_MATCH-trigger may be encapsulated inside
+                      * multiple IS_NOT_NULL_COMPL-triggers, which defines
+                      * the scope of the triggers. Aggregate these
+                      * 'inner_tables' scopes.
+                      */
+                     trig_cond.nest_scope |= func_trig->get_inner_tables();
 
-                       /**
-                        * The FOUND_MATCH-trigger may be encapsulated inside
-                        * multiple IS_NOT_NULL_COMPL-triggers, which defines
-                        * the scope of the triggers. Aggregate these
-                        * 'inner_tables' scopes.
-                        */
-                       trig_cond.nest_scope |= func_trig->get_inner_tables();
-
-                       if (func_trig->get_trig_type() ==
-                           Item_func_trig_cond::FOUND_MATCH) {
-                         // The FOUND_MATCH-trigger is evaluated on top of
-                         // the collected trigger nest_scope.
-                         trig_cond.found_match |= trig_cond.nest_scope;
-                         return true;  // break out of this cond-branch
-                       }
+                     if (func_trig->get_trig_type() ==
+                         Item_func_trig_cond::FOUND_MATCH) {
+                       // The FOUND_MATCH-trigger is evaluated on top of
+                       // the collected trigger nest_scope.
+                       trig_cond.found_match |= trig_cond.nest_scope;
+                       return true;  // break out of this cond-branch
                      }
                    }
                    return false;  // continue WalkItem
@@ -1545,21 +1608,22 @@ void ndb_pushed_builder_ctx::validate_join_nest(ndb_table_access_map inner_nest,
         if (nest_has_unpushed) {
           EXPLAIN_NO_PUSH(
               "Can't push %s joined table '%s' as child of '%s', "
-              "some tables in embedding nest(s) are not part of pushed join",
+              "some tables in embedding join-nest(s) are not part of pushed "
+              "join",
               nest_type, table->get_table()->alias,
               m_join_root->get_table()->alias);
           remove_pushable(table);
         } else if (nest_has_pending_cond) {
           EXPLAIN_NO_PUSH(
               "Can't push %s joined table '%s' as child of '%s', "
-              "nest containing the table has pending unpushed_conditions",
+              "join-nest containing the table has pending unpushed_conditions",
               nest_type, table->get_table()->alias,
               m_join_root->get_table()->alias);
           remove_pushable(table);
         } else if (nest_has_filter_cond) {
           EXPLAIN_NO_PUSH(
               "Can't push %s joined table '%s' as child of '%s', "
-              "nest containing the table has a FILTER conditions",
+              "join-nest containing the table has a FILTER conditions",
               nest_type, table->get_table()->alias,
               m_join_root->get_table()->alias);
           remove_pushable(table);
@@ -1782,7 +1846,7 @@ bool ndb_pushed_builder_ctx::is_field_item_pushable(
 bool ndb_pushed_builder_ctx::is_const_item_pushable(
     const Item *key_item, const KEY_PART_INFO *key_part) {
   DBUG_TRACE;
-  DBUG_ASSERT(key_item->const_item());
+  DBUG_ASSERT(key_item->const_for_execution());
 
   /**
    * Propagate Items constant value to Field containing the value of this
@@ -1963,7 +2027,7 @@ void ndb_pushed_builder_ctx::collect_key_refs(const AQP::Table_access *table,
 
   const uint tab_no = table->get_access_no();
   const uint parent_no = m_tables[tab_no].m_parent;
-  const ndb_table_access_map &ancestors = m_tables[tab_no].m_ancestors;
+  const ndb_table_access_map ancestors = m_tables[tab_no].m_ancestors;
 
   DBUG_ASSERT(m_join_scope.contain(ancestors));
   DBUG_ASSERT(ancestors.contain(parent_no));
@@ -1978,7 +2042,8 @@ void ndb_pushed_builder_ctx::collect_key_refs(const AQP::Table_access *table,
     const Item *const key_item = table->get_key_field(key_part_no);
     key_refs[key_part_no] = key_item;
 
-    DBUG_ASSERT(key_item->const_item() || key_item->type() == Item::FIELD_ITEM);
+    DBUG_ASSERT(key_item->const_for_execution() ||
+                key_item->type() == Item::FIELD_ITEM);
 
     if (key_item->type() == Item::FIELD_ITEM) {
       const Item_field *join_item = static_cast<const Item_field *>(key_item);
@@ -2096,8 +2161,8 @@ int ndb_pushed_builder_ctx::build_key(const AQP::Table_access *table,
     if (ndbcluster_is_lookup_operation(table->get_access_type())) {
       const ha_ndbcluster *handler =
           down_cast<ha_ndbcluster *>(table->get_table()->file);
-      ndbcluster_build_key_map(
-          handler->m_table, handler->m_index[table->get_index_no()], key, map);
+      const NDB_INDEX_DATA &index = handler->m_index[table->get_index_no()];
+      index.fill_column_map(key, map);
     } else {
       for (uint ix = 0; ix < key_fields; ix++) {
         map[ix] = ix;
@@ -2113,8 +2178,7 @@ int ndb_pushed_builder_ctx::build_key(const AQP::Table_access *table,
       const Item *const item = join_items[i];
       op_key[map[i]] = NULL;
 
-      DBUG_ASSERT(item->const_item() == item->const_for_execution());
-      if (item->const_item()) {
+      if (item->const_for_execution()) {
         /**
          * Propagate Items constant value to Field containing the value of this
          * key_part:
@@ -2123,8 +2187,8 @@ int ndb_pushed_builder_ctx::build_key(const AQP::Table_access *table,
         DBUG_ASSERT(!field->is_real_null());
         const uchar *const ptr =
             (field->real_type() == MYSQL_TYPE_VARCHAR)
-                ? field->ptr + ((Field_varstring *)field)->length_bytes
-                : field->ptr;
+                ? field->field_ptr() + field->get_length_bytes()
+                : field->field_ptr();
 
         op_key[map[i]] = m_builder->constValue(ptr, field->data_length());
       } else {
@@ -2238,6 +2302,62 @@ int ndb_pushed_builder_ctx::build_query() {
         }
       }
 
+      if (table->is_antijoin()) {
+        DBUG_ASSERT(m_tables[tab_no].isOuterJoined(m_tables[parent_no]));
+        const ndb_table_access_map antijoin_scope(
+            get_tables_in_range(tab_no, m_tables[tab_no].m_last_inner));
+
+        /**
+         * From SPJ point of view, antijoin is a normal outer join. So once
+         * we have accounted for the special antijoin_null_cond added to such
+         * queries, no special handling is required for antijoin's wrt.
+         * query correctness.
+         *
+         * However, as an added optimization, the SPJ API may eliminate the
+         * upper-table rows not matching the 'Not exists' requirement, if:
+         *  1) The entire (anti-)outer-joined-nest has been pushed down
+         *  2) There are no unpushed conditions in the above join-nest.
+         * -> or: 'antijoin-nest is completely evaluated by SPJ'
+         *
+         * Note that this is a pure optimization: Any returned rows supposed
+         * to 'Not exist' will simply be eliminated by the mysql server.
+         * -> We do join-pushdown of such antijoins even if the check below
+         * does not allow us to setMatchType('MatchNullOnly')
+         */
+        if (m_join_scope.contain(antijoin_scope) &&
+            !m_has_pending_cond.is_overlapping(antijoin_scope)) {
+          const uint first_upper = m_tables[tab_no].m_first_upper;
+          ndb_table_access_map upper_nest(full_inner_nest(first_upper, tab_no));
+          upper_nest.intersect(m_join_scope);
+
+          if (upper_nest.contain(parent_no)) {
+            /**
+             * Antijoin is relative to the *upper_nest*. Thus we can only
+             * eliminate found matches if they are relative the upper_nest.
+             * Example: '(t1 oj (t2)) where not exists (t3 where t3.x = t1.y)'
+             *
+             * This nest structure is such that the upper of 'antijoin t3' is
+             * t1. Thus we can only do match elimination of such a query when it
+             * is built with 't3.parent == t1'.
+             */
+            options.setMatchType(NdbQueryOptions::MatchNullOnly);
+          } else {
+            /**
+             * Else, subquery condition do not refer upper_nest.
+             * Example: '(t1 oj (t2)) where not exists (t3 where t3.x = t2.y)'
+             * Due to the nest structure, we still have t3.upper = t1.
+             * However, the where condition dependencies will result in:
+             * '3.parent == t2'. Specifying antijoin for this query may
+             * eliminate matching rows from t2, while t1 rows will still
+             * exists (with t2 NULL-extended).
+             * However, we can still specify the less restrictive firstMatch
+             * for such queries.
+             */
+            options.setMatchType(NdbQueryOptions::MatchFirst);
+          }
+        }
+      }
+
       /**
        * Inform SPJ API about the join nest dependencies. Needed in those
        * cases where the are no linkedValues determining which inner_
@@ -2252,31 +2372,31 @@ int ndb_pushed_builder_ctx::build_query() {
        *
        * Such queries need to set the join nest dependencies, such that
        * the NdbQuery interface is able to correcly generate NULL extended
-       * rows for.
+       * rows.
        *
        * Below we add these nest dependencies even when not strictly required.
        * The API will just ignore such redundant nest dependencies.
        */
-      ndb_table_access_map inner_nest(m_tables[tab_no].m_inner_nest);
-      inner_nest.intersect(m_join_scope);
-      if (!inner_nest.is_clear_all()) {
-        // Table not first in its join_nest, set firstInner which it depends on
-        const uint real_first_inner =
-            inner_nest.first_table(m_tables[tab_no].m_first_inner);
-        options.setFirstInnerJoin(m_tables[real_first_inner].m_op);
+      if (m_tables[tab_no].isOuterJoined(m_tables[parent_no])) {
+        ndb_table_access_map inner_nest(m_tables[tab_no].m_inner_nest);
+        inner_nest.intersect(m_join_scope);
+        if (!inner_nest.is_clear_all()) {
+          // Table not first in its join_nest, set firstInner which it
+          // depends on
+          const uint real_first_inner =
+              inner_nest.first_table(m_tables[tab_no].m_first_inner);
+          options.setFirstInnerJoin(m_tables[real_first_inner].m_op);
 
-      } else if (m_tables[tab_no].m_first_upper >= 0) {
-        const uint first_upper = m_tables[tab_no].m_first_upper;
-        ndb_table_access_map upper_nest(full_inner_nest(first_upper, tab_no));
-        upper_nest.intersect(m_join_scope);
-        if (!upper_nest.is_clear_all()) {
-          // There is an upper nest which we outer join with
-          const uint real_first_upper =
-              upper_nest.first_table(m_tables[tab_no].m_first_upper);
-          options.setUpperJoin(m_tables[real_first_upper].m_op);
-        } else {
-          // There is an upper outside of the m_join_scope -> use root
-          options.setUpperJoin(m_tables[root_no].m_op);
+        } else if (m_tables[tab_no].m_first_upper >= 0) {
+          const uint first_upper = m_tables[tab_no].m_first_upper;
+          ndb_table_access_map upper_nest(full_inner_nest(first_upper, tab_no));
+          upper_nest.intersect(m_join_scope);
+          if (!upper_nest.is_clear_all()) {
+            // There is an upper nest which we outer join with
+            const uint real_first_upper =
+                upper_nest.first_table(m_tables[tab_no].m_first_upper);
+            options.setUpperJoin(m_tables[real_first_upper].m_op);
+          }
         }
       }
     }  // if '!m_join_root'
@@ -2335,50 +2455,3 @@ int ndb_pushed_builder_ctx::build_query() {
 
   return 0;
 }  // ndb_pushed_builder_ctx::build_query()
-
-/**
- * Fill in ix_map[] to map from KEY_PART_INFO[] order into
- * primary key / unique key order of key fields.
- */
-void ndbcluster_build_key_map(const NDBTAB *table, const NDB_INDEX_DATA &index,
-                              const KEY *key_def, uint ix_map[]) {
-  uint ix;
-
-  if (index.unique_index_attrid_map)  // UNIQUE_ORDERED_INDEX or UNIQUE_INDEX
-  {
-    for (ix = 0; ix < key_def->user_defined_key_parts; ix++) {
-      ix_map[ix] = index.unique_index_attrid_map[ix];
-    }
-  } else  // Primary key does not have a 'unique_index_attrid_map'
-  {
-    KEY_PART_INFO *key_part;
-    uint key_pos = 0;
-    int columnnr = 0;
-    assert(index.type == PRIMARY_KEY_ORDERED_INDEX ||
-           index.type == PRIMARY_KEY_INDEX);
-
-    for (ix = 0, key_part = key_def->key_part;
-         ix < key_def->user_defined_key_parts; ix++, key_part++) {
-      // As NdbColumnImpl::m_keyInfoPos isn't available through
-      // NDB API we have to calculate it ourself, else we could:
-      // ix_map[ix]= table->getColumn(key_part->fieldnr-1)->m_impl.m_keyInfoPos;
-
-      if (key_part->fieldnr < columnnr) {
-        // PK columns are not in same order as the columns are defined in the
-        // table, Restart PK search from first column:
-        key_pos = 0;
-        columnnr = 0;
-      }
-
-      while (columnnr < key_part->fieldnr - 1) {
-        if (table->getColumn(columnnr++)->getPrimaryKey()) key_pos++;
-      }
-
-      assert(table->getColumn(columnnr)->getPrimaryKey());
-      ix_map[ix] = key_pos;
-
-      columnnr++;
-      key_pos++;
-    }
-  }
-}  // ndbcluster_build_key_map

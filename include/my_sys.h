@@ -1,4 +1,4 @@
-/* Copyright (c) 2000, 2019, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2000, 2020, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -86,6 +86,7 @@ struct PSI_system_bootstrap;
 struct PSI_table_bootstrap;
 struct PSI_thread_bootstrap;
 struct PSI_transaction_bootstrap;
+struct PSI_tls_channel_bootstrap;
 struct MEM_ROOT;
 
 #define MY_INIT(name)   \
@@ -313,7 +314,7 @@ struct MY_TMPDIR {
 
 struct DYNAMIC_STRING {
   char *str;
-  size_t length, max_length, alloc_increment;
+  size_t length, max_length;
 };
 
 struct IO_CACHE;
@@ -455,6 +456,11 @@ struct IO_CACHE /* Used when cacheing files */
   Stream_cipher *m_encryptor = nullptr;
   // This is a decryptor for decrypting the temporary file of the IO cache.
   Stream_cipher *m_decryptor = nullptr;
+  // Synchronize flushed buffer with disk.
+  bool disk_sync{false};
+  // Delay in milliseconds after disk synchronization of the flushed buffer.
+  // Requires disk_sync = true.
+  uint disk_sync_delay{0};
 };
 
 typedef int (*qsort2_cmp)(const void *, const void *, const void *);
@@ -766,6 +772,11 @@ extern bool real_open_cached_file(IO_CACHE *cache);
 extern void close_cached_file(IO_CACHE *cache);
 
 enum UnlinkOrKeepFile { UNLINK_FILE, KEEP_FILE };
+#ifdef WIN32
+// Maximum temporary filename length is 3 chars for prefix + 16 chars for base
+// 32 encoded UUID (excluding MAC address)
+const size_t MY_MAX_TEMP_FILENAME_LEN = 19;
+#endif
 File create_temp_file(char *to, const char *dir, const char *pfx, int mode,
                       UnlinkOrKeepFile unlink_or_keep, myf MyFlags);
 
@@ -784,7 +795,7 @@ extern void *alloc_dynamic(DYNAMIC_ARRAY *array);
 extern void delete_dynamic(DYNAMIC_ARRAY *array);
 
 extern bool init_dynamic_string(DYNAMIC_STRING *str, const char *init_str,
-                                size_t init_alloc, size_t alloc_increment);
+                                size_t init_alloc);
 extern bool dynstr_append(DYNAMIC_STRING *str, const char *append);
 bool dynstr_append_mem(DYNAMIC_STRING *str, const char *append, size_t length);
 extern bool dynstr_append_os_quoted(DYNAMIC_STRING *str, const char *append,
@@ -954,6 +965,8 @@ extern MYSQL_PLUGIN_IMPORT PSI_thread_bootstrap *psi_thread_hook;
 extern void set_psi_thread_service(void *psi);
 extern MYSQL_PLUGIN_IMPORT PSI_transaction_bootstrap *psi_transaction_hook;
 extern void set_psi_transaction_service(void *psi);
+extern MYSQL_PLUGIN_IMPORT PSI_tls_channel_bootstrap *psi_tls_channel_hook;
+extern void set_psi_tls_channel_service(void *psi);
 #endif /* HAVE_PSI_INTERFACE */
 
 /**

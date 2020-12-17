@@ -1,4 +1,4 @@
-/* Copyright (c) 2016, 2019, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2015, 2020, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -22,17 +22,18 @@
 
 #include "sql/sql_show_status.h"
 
-#include <stddef.h>
-
 #include "lex_string.h"
 #include "m_string.h"  // STRING_WITH_LEN
+#include "my_alloc.h"  // operator new
 #include "my_sqlcommand.h"
 #include "sql/item_cmpfunc.h"  // Item_func_like
 #include "sql/mem_root_array.h"
-#include "sql/parse_tree_items.h"  // PTI_simple_ident_ident
-#include "sql/parse_tree_nodes.h"  // PT_select_item_list
-#include "sql/sql_class.h"         // THD
-#include "sql/sql_lex.h"           // Query_options
+#include "sql/parse_tree_items.h"      // PTI_simple_ident_ident
+#include "sql/parse_tree_node_base.h"  // Parse_context
+#include "sql/parse_tree_nodes.h"      // PT_select_item_list
+#include "sql/parser_yystype.h"        // Create_col_name_list
+#include "sql/sql_class.h"             // THD
+#include "sql/sql_lex.h"               // Query_options
 #include "sql/strfunc.h"
 #include "sql_string.h"
 
@@ -99,8 +100,6 @@ static SELECT_LEX *build_query(const POS &pos, THD *thd,
   static const LEX_CSTRING col_value = {STRING_WITH_LEN("VARIABLE_VALUE")};
   static const LEX_CSTRING as_value = {STRING_WITH_LEN("Value")};
   static const LEX_CSTRING pfs = {STRING_WITH_LEN("performance_schema")};
-
-  static const LEX_CSTRING star = {STRING_WITH_LEN("*")};
 
   static const Query_options options = {
       0 /* query_spec_options */
@@ -197,8 +196,8 @@ static SELECT_LEX *build_query(const POS &pos, THD *thd,
   if (table_reference_list1.push_back(derived_table)) return nullptr;
 
   /* SELECT * ... */
-  PTI_simple_ident_ident *ident_star;
-  ident_star = new (thd->mem_root) PTI_simple_ident_ident(pos, star);
+  Item_asterisk *ident_star;
+  ident_star = new (thd->mem_root) Item_asterisk(pos, nullptr, nullptr);
   if (ident_star == nullptr) return nullptr;
 
   PT_select_item_list *item_list1;

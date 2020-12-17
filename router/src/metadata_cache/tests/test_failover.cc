@@ -1,5 +1,5 @@
 /*
-  Copyright (c) 2016, 2020, Oracle and/or its affiliates. All rights reserved.
+  Copyright (c) 2016, 2020, Oracle and/or its affiliates.
 
   This program is free software; you can redistribute it and/or modify
   it under the terms of the GNU General Public License, version 2.0,
@@ -36,6 +36,7 @@
 
 #include "gmock/gmock.h"
 
+using namespace std::chrono_literals;
 using namespace metadata_cache;
 
 constexpr unsigned kRouterId = 1;
@@ -49,7 +50,7 @@ class FailoverTest : public ::testing::Test {
   FailoverTest() {}
 
   // per-test setup
-  virtual void SetUp() override {
+  void SetUp() override {
     session.reset(new MySQLSessionReplayer(true));
 
     // setup DI for MySQLSession
@@ -81,7 +82,8 @@ class FailoverTest : public ::testing::Test {
         "@@SESSION.character_set_results=utf8, "
         "@@SESSION.character_set_connection=utf8, "
         "@@SESSION.sql_mode='ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_"
-        "DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION'");
+        "DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION', "
+        "@@SESSION.optimizer_switch='derived_merge=on'");
     m.then_ok();
     m.expect_execute("SET @@SESSION.group_replication_consistency='EVENTUAL'");
     m.then_ok();
@@ -95,8 +97,7 @@ class FailoverTest : public ::testing::Test {
                           m.string_or_null("1")},
                      });
     m.expect_query(
-        "SELECT R.replicaset_name, I.mysql_server_uuid, I.role, I.weight, "
-        "I.version_token, "
+        "SELECT R.replicaset_name, I.mysql_server_uuid, "
         "I.addresses->>'$.mysqlClassic', I.addresses->>'$.mysqlX' FROM "
         "mysql_innodb_cluster_metadata.clusters "
         "AS F JOIN mysql_innodb_cluster_metadata.replicasets AS R ON "
@@ -107,21 +108,18 @@ class FailoverTest : public ::testing::Test {
         "'3e4338a1-2c5d-49ac-8baa-e5a25ba61e76'");
     m.then_return(
         7,
-        {// replicaset_name, mysql_server_uuid, role, weight, version_token,
+        {// replicaset_name, mysql_server_uuid,
          // location, I.addresses->>'$.mysqlClassic', I.addresses->>'$.mysqlX'
          {m.string_or_null("default"),
           m.string_or_null("3c85a47b-7cc1-4fa8-bb4c-8f2dbf1c3c39"),
-          m.string_or_null("HA"), m.string_or_null(), m.string_or_null(),
           m.string_or_null("localhost:3000"),
           m.string_or_null("localhost:30000")},
          {m.string_or_null("default"),
           m.string_or_null("8148cba4-2ad5-456e-a04e-2ba73eb10cc5"),
-          m.string_or_null("HA"), m.string_or_null(), m.string_or_null(),
           m.string_or_null("localhost:3001"),
           m.string_or_null("localhost:30010")},
          {m.string_or_null("default"),
           m.string_or_null("f0a2079f-8b90-4324-9eec-a0496c4338e0"),
-          m.string_or_null("HA"), m.string_or_null(), m.string_or_null(),
           m.string_or_null("localhost:3002"),
           m.string_or_null("localhost:30020")}});
 
@@ -236,7 +234,7 @@ TEST_F(FailoverTest, basics) {
 
   // this should succeed right away
   DelayCheck t;
-  EXPECT_TRUE(cache->wait_primary_failover("default", 2));
+  EXPECT_TRUE(cache->wait_primary_failover("default", 2s));
   EXPECT_LE(t.time_elapsed(), 1);
 
   // ensure no expected queries leftover
@@ -270,7 +268,7 @@ TEST_F(FailoverTest, primary_failover) {
   // this should succeed right away
   {
     DelayCheck t;
-    EXPECT_TRUE(cache->wait_primary_failover("default", 2));
+    EXPECT_TRUE(cache->wait_primary_failover("default", 2s));
     EXPECT_LE(t.time_elapsed(), 1);
   }
 
@@ -289,7 +287,7 @@ TEST_F(FailoverTest, primary_failover) {
   // this should fail with timeout b/c no primary yet
   {
     DelayCheck t;
-    EXPECT_FALSE(cache->wait_primary_failover("default", 1));
+    EXPECT_FALSE(cache->wait_primary_failover("default", 1s));
     EXPECT_GE(t.time_elapsed(), 1);
   }
 
@@ -318,7 +316,7 @@ TEST_F(FailoverTest, primary_failover) {
   // this should succeed
   {
     DelayCheck t;
-    EXPECT_TRUE(cache->wait_primary_failover("default", 2));
+    EXPECT_TRUE(cache->wait_primary_failover("default", 2s));
     EXPECT_LE(t.time_elapsed(), 1);
   }
 
@@ -334,6 +332,30 @@ TEST_F(FailoverTest, primary_failover) {
   EXPECT_EQ("f0a2079f-8b90-4324-9eec-a0496c4338e0",
             instances[2].mysql_server_uuid);
   EXPECT_EQ(ServerMode::ReadOnly, instances[2].mode);
+}
+
+TEST_F(FailoverTest, primary_failover_shutdown) {
+  ASSERT_NO_THROW(init_cache());
+  expect_metadata_1();
+  expect_group_members_1();
+  ASSERT_NO_THROW(cache->refresh());
+
+  cache->mark_instance_reachability(
+      "3c85a47b-7cc1-4fa8-bb4c-8f2dbf1c3c39",
+      metadata_cache::InstanceStatus::Unreachable);
+
+  auto wait_failover_thread = std::thread([&] {
+    DelayCheck t;
+    // even though we wait for 10s for the primary failover the function should
+    // return promptly when the catche->stop() gets called (mimicking terminate
+    // request)
+    EXPECT_FALSE(cache->wait_primary_failover("default", 10s));
+    EXPECT_LE(t.time_elapsed(), 1);
+  });
+
+  cache->stop();
+
+  wait_failover_thread.join();
 }
 
 int main(int argc, char *argv[]) {

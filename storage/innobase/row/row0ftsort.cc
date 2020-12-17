@@ -1,6 +1,6 @@
 /*****************************************************************************
 
-Copyright (c) 2010, 2019, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 2010, 2020, Oracle and/or its affiliates. All Rights Reserved.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License, version 2.0, as published by the
@@ -175,24 +175,22 @@ store Doc ID during sort */
 
   return (new_index);
 }
+
 /** Initialize FTS parallel sort structures.
- @return true if all successful */
-ibool row_fts_psort_info_init(
-    trx_t *trx,           /*!< in: transaction */
-    row_merge_dup_t *dup, /*!< in,own: descriptor of
-                          FTS index being created */
-    const dict_table_t *old_table,
-    const dict_table_t *new_table, /*!< in: table on which indexes are
-                                 created */
-    ibool opt_doc_id_size,
-    /*!< in: whether to use 4 bytes
-    instead of 8 bytes integer to
-    store Doc ID during sort */
-    fts_psort_t **psort, /*!< out: parallel sort info to be
-                         instantiated */
-    fts_psort_t **merge) /*!< out: parallel merge info
-                         to be instantiated */
-{
+@param[in] trx Transaction
+@param[in,out] dup Descriptor of fts index being created
+@param[in] old_table Needed to fetch lob from old table
+@param[in] new_table Table where indexes are created
+@param[in] opt_doc_id_size Whether to use 4 bytes instead of 8 bytes integer to
+store doc id during sort
+@param[out] psort Parallel sort info to be instantiated
+@param[out] merge Parallel merge info to be instantiated
+@return true if all successful */
+ibool row_fts_psort_info_init(trx_t *trx, row_merge_dup_t *dup,
+                              const dict_table_t *old_table,
+                              const dict_table_t *new_table,
+                              ibool opt_doc_id_size, fts_psort_t **psort,
+                              fts_psort_t **merge) {
   ulint i;
   ulint j;
   fts_psort_common_t *common_info = nullptr;
@@ -226,8 +224,8 @@ ibool row_fts_psort_info_init(
   common_info->new_table = (dict_table_t *)new_table;
   common_info->trx = trx;
   common_info->all_info = psort_info;
-  common_info->sort_event = os_event_create(nullptr);
-  common_info->merge_event = os_event_create(nullptr);
+  common_info->sort_event = os_event_create();
+  common_info->merge_event = os_event_create();
   common_info->opt_doc_id_size = opt_doc_id_size;
 
   ut_ad(trx->mysql_thd != nullptr);

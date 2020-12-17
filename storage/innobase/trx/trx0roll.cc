@@ -1,6 +1,6 @@
 /*****************************************************************************
 
-Copyright (c) 1996, 2019, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 1996, 2020, Oracle and/or its affiliates. All Rights Reserved.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License, version 2.0, as published by the
@@ -231,7 +231,7 @@ static dberr_t trx_rollback_low(trx_t *trx) {
         recovery will replay the rollback in case
         the redo log gets applied past this point. */
         mtr.commit();
-        ut_ad(mtr.commit_lsn() > 0);
+        ut_ad(mtr.commit_lsn() > 0 || !mtr_t::s_logging.is_enabled());
       }
 #ifdef ENABLED_DEBUG_SYNC
       if (trx->mysql_thd == nullptr) {
@@ -351,12 +351,11 @@ static void trx_roll_savepoint_free(
   ut_free(savep);
 }
 
-/** Frees savepoint structs starting from savep. */
-void trx_roll_savepoints_free(
-    trx_t *trx,                /*!< in: transaction handle */
-    trx_named_savept_t *savep) /*!< in: free all savepoints starting
-                               with this savepoint i*/
-{
+/** Frees savepoint structs starting from savep.
+@param[in] trx Transaction handle
+@param[in] savep Free all savepoints starting with this savepoint i, if savep is
+nullptr free all save points */
+void trx_roll_savepoints_free(trx_t *trx, trx_named_savept_t *savep) {
   while (savep != nullptr) {
     trx_named_savept_t *next_savep;
 
@@ -629,7 +628,7 @@ static void trx_rollback_active(trx_t *trx) /*!< in/out: transaction */
  lock if it does a clean up or rollback.
  @return true if the transaction was cleaned up or rolled back
  and trx_sys->mutex was released. */
-static ibool trx_rollback_resurrected(
+static ibool trx_rollback_or_clean_resurrected(
     trx_t *trx, /*!< in: transaction to rollback or clean */
     ibool all)  /*!< in: FALSE=roll back dictionary transactions;
                 TRUE=roll back all non-PREPARED transactions */
@@ -637,8 +636,7 @@ static ibool trx_rollback_resurrected(
   ut_ad(trx_sys_mutex_own());
 
   /* The trx->is_recovered flag and trx->state are set
-  atomically under the protection of the trx->mutex (and
-  lock_sys->mutex) in lock_trx_release_locks(). We do not want
+  atomically under the protection of the trx->mutex . We do not want
   to accidentally clean up a non-recovered transaction here. */
 
   trx_mutex_enter(trx);
@@ -686,6 +684,8 @@ void trx_rollback_or_clean_recovered(
     ibool all) /*!< in: FALSE=roll back dictionary transactions;
                TRUE=roll back all non-PREPARED transactions */
 {
+  ut_ad(!srv_read_only_mode);
+
   trx_t *trx;
 
   ut_a(srv_force_recovery < SRV_FORCE_NO_TRX_UNDO);
@@ -711,11 +711,32 @@ void trx_rollback_or_clean_recovered(
          trx = UT_LIST_GET_NEXT(trx_list, trx)) {
       assert_trx_in_rw_list(trx);
 
+      /* In case of slow shutdown, we have to wait for the background
+      thread (trx_recovery_rollback) which is doing the rollbacks of
+      recovered transactions. Note that it can add undo to purge.
+      In case of fast shutdown we do not care if we left transactions
+      not rolled back. But still we want to stop the thread, so since
+      certain point of shutdown we might be sure there are no changes
+      to transactions / undo. */
+      if (srv_shutdown_state.load() >= SRV_SHUTDOWN_RECOVERY_ROLLBACK &&
+          srv_fast_shutdown != 0) {
+        ut_a(srv_shutdown_state_matches([](auto state) {
+          return state == SRV_SHUTDOWN_RECOVERY_ROLLBACK ||
+                 state == SRV_SHUTDOWN_EXIT_THREADS;
+        }));
+
+        trx_sys_mutex_exit();
+
+        if (all) {
+          ib::info(ER_IB_MSG_TRX_RECOVERY_ROLLBACK_NOT_COMPLETED);
+        }
+        return;
+      }
+
       /* If this function does a cleanup or rollback
       then it will release the trx_sys->mutex, therefore
       we need to reacquire it before retrying the loop. */
-
-      if (trx_rollback_resurrected(trx, all)) {
+      if (trx_rollback_or_clean_resurrected(trx, all)) {
         trx_sys_mutex_enter();
 
         break;
@@ -727,8 +748,7 @@ void trx_rollback_or_clean_recovered(
   } while (trx != nullptr);
 
   if (all) {
-    ib::info(ER_IB_MSG_1190) << "Rollback of non-prepared transactions"
-                                " completed";
+    ib::info(ER_IB_MSG_TRX_RECOVERY_ROLLBACK_COMPLETED);
   }
 }
 
@@ -746,6 +766,13 @@ void trx_recovery_rollback_thread() {
 #endif /* UNIV_PFS_THREAD */
 
   ut_ad(!srv_read_only_mode);
+
+  while (DBUG_EVALUATE_IF("pause_rollback_on_recovery", true, false)) {
+    if (srv_shutdown_state.load() >= SRV_SHUTDOWN_RECOVERY_ROLLBACK) {
+      break;
+    }
+    os_thread_sleep(1000);
+  }
 
   trx_rollback_or_clean_recovered(TRUE);
 

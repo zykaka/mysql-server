@@ -1,6 +1,6 @@
 /*****************************************************************************
 
-Copyright (c) 1997, 2020, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 1997, 2020, Oracle and/or its affiliates.
 Copyright (c) 2012, Facebook Inc.
 
 This program is free software; you can redistribute it and/or modify it under
@@ -412,9 +412,10 @@ static bool recv_sys_resize_buf() {
 #else  /* !UNIV_HOTBACKUP */
   if ((recv_sys->buf_len >= srv_log_buffer_size) ||
       (recv_sys->len >= srv_log_buffer_size)) {
-    ib::fatal() << "Log parsing buffer overflow. Log parse failed. "
-                << "Please increase --limit-memory above "
-                << srv_log_buffer_size / 1024 / 1024 << " (MB)";
+    ib::fatal(ER_IB_ERR_LOG_PARSING_BUFFER_OVERFLOW)
+        << "Log parsing buffer overflow. Log parse failed. "
+        << "Please increase --limit-memory above "
+        << srv_log_buffer_size / 1024 / 1024 << " (MB)";
   }
 #endif /* !UNIV_HOTBACKUP */
 
@@ -589,8 +590,8 @@ void recv_sys_init(ulint max_mem) {
 
 #ifndef UNIV_HOTBACKUP
   if (!srv_read_only_mode) {
-    recv_sys->flush_start = os_event_create("recv_flush_start");
-    recv_sys->flush_end = os_event_create("recv_flush_end");
+    recv_sys->flush_start = os_event_create();
+    recv_sys->flush_end = os_event_create();
   }
 #else  /* !UNIV_HOTBACKUP */
   recv_is_from_backup = true;
@@ -709,10 +710,9 @@ static recv_sys_t::Space *recv_get_page_map(space_id_t space_id, bool create) {
     heap = mem_heap_create_typed(256, MEM_HEAP_FOR_RECV_SYS);
 
     using Space = recv_sys_t::Space;
-    using value_type = recv_sys_t::Spaces::value_type;
+    using Value = recv_sys_t::Spaces::value_type;
 
-    auto where =
-        recv_sys->spaces->insert(it, value_type(space_id, Space(heap)));
+    auto where = recv_sys->spaces->insert(it, Value{space_id, Space(heap)});
 
     return (&where->second);
   }
@@ -797,6 +797,10 @@ static void recv_writer_thread() {
   mutex_exit(&recv_sys->writer_mutex);
 
   while (srv_shutdown_state.load() == SRV_SHUTDOWN_NONE) {
+    ut_a(srv_shutdown_state_matches([](auto state) {
+      return state == SRV_SHUTDOWN_NONE || state == SRV_SHUTDOWN_EXIT_THREADS;
+    }));
+
     os_thread_sleep(100000);
 
     mutex_enter(&recv_sys->writer_mutex);
@@ -821,12 +825,15 @@ static void recv_writer_thread() {
   }
 }
 
+#endif /* !UNIV_HOTBACKUP */
+
 /** Frees the recovery system. */
 void recv_sys_free() {
   mutex_enter(&recv_sys->mutex);
 
   recv_sys_finish();
 
+#ifndef UNIV_HOTBACKUP
   /* wake page cleaner up to progress */
   if (!srv_read_only_mode) {
     ut_ad(!recv_recovery_on);
@@ -836,6 +843,7 @@ void recv_sys_free() {
     }
     os_event_set(recv_sys->flush_start);
   }
+#endif /* !UNIV_HOTBACKUP */
 
   /* Free encryption data structures. */
   if (recv_sys->keys != nullptr) {
@@ -859,6 +867,8 @@ void recv_sys_free() {
 
   mutex_exit(&recv_sys->mutex);
 }
+
+#ifndef UNIV_HOTBACKUP
 
 /** Copy of the LOG_HEADER_CREATOR field. */
 static char log_header_creator[LOG_HEADER_CREATOR_END - LOG_HEADER_CREATOR + 1];
@@ -937,7 +947,7 @@ static dberr_t recv_log_recover_pre_8_0_4(log_t &log,
 
   /* We are not going to rewrite the block, but just in case we prefer to
   have first_rec_group which points on checkpoint_lsn (instead of pointing
-  on mini transactions from earlier formats). This is extra safety if one
+  on mini-transactions from earlier formats). This is extra safety if one
   day this block would become rewritten because of some new bug (using new
   format). */
   log_block_set_first_rec_group(buf, checkpoint_lsn % OS_FILE_LOG_BLOCK_SIZE);
@@ -1012,6 +1022,25 @@ static MY_ATTRIBUTE((warn_unused_result)) dberr_t
       ib::error(ER_IB_MSG_705, ulong{log.format}, REFMAN);
 
       return (DB_ERROR);
+  }
+
+  log.m_first_file_lsn = mach_read_from_8(buf + LOG_HEADER_START_LSN);
+
+  uint32_t flags = mach_read_from_4(buf + LOG_HEADER_FLAGS);
+
+  if (LOG_HEADER_CHECK_FLAG(flags, LOG_HEADER_FLAG_NO_LOGGING)) {
+    /* Exit if server is crashed while running without redo logging. */
+    if (LOG_HEADER_CHECK_FLAG(flags, LOG_HEADER_FLAG_CRASH_UNSAFE)) {
+      ib::error(ER_IB_ERR_RECOVERY_REDO_DISABLED);
+      /* Allow to proceed with SRV_FORCE_NO_LOG_REDO[6] */
+      if (srv_force_recovery < SRV_FORCE_NO_LOG_REDO) {
+        return (DB_ERROR);
+      }
+    }
+    auto err = mtr_t::s_logging.disable(nullptr);
+    /* Currently never fails. */
+    ut_a(err == 0);
+    srv_redo_log = false;
   }
 
   uint64_t max_no = 0;
@@ -1580,15 +1609,15 @@ void meb_apply_log_recs_via_callback(
 
 /** Try to parse a single log record body and also applies it if
 specified.
-@param[in]	type		redo log entry type
-@param[in]	ptr		redo log record body
-@param[in]	end_ptr		end of buffer
-@param[in]	space_id	tablespace identifier
-@param[in]	page_no		page number
-@param[in,out]	block		buffer block, or nullptr if
+@param[in]	type		Redo log entry type
+@param[in]	ptr		Redo log record body
+@param[in]	end_ptr		End of buffer
+@param[in]	space_id	Tablespace identifier
+@param[in]	page_no		Page number
+@param[in,out]	block		Buffer block, or nullptr if
                                 a page log record should not be applied
                                 or if it is a MLOG_FILE_ operation
-@param[in,out]	mtr		mini-transaction, or nullptr if
+@param[in,out]	mtr		Mini-transaction, or nullptr if
                                 a page log record should not be applied
 @param[in]	parsed_bytes	Number of bytes parsed so far
 @return log record end, nullptr if not a complete record */
@@ -1616,6 +1645,12 @@ static byte *recv_parse_or_apply_log_rec_body(
       return (fil_tablespace_redo_rename(
           ptr, end_ptr, page_id_t(space_id, page_no), parsed_bytes,
           recv_sys->bytes_to_ignore_before_checkpoint != 0));
+
+    case MLOG_FILE_EXTEND:
+
+      return (fil_tablespace_redo_extend(
+          ptr, end_ptr, page_id_t(space_id, page_no), parsed_bytes,
+          recv_sys->bytes_to_ignore_before_checkpoint != 0));
 #else  /* !UNIV_HOTBACKUP */
       // Mysqlbackup does not execute file operations. It cares for all
       // files to be at their final places when it applies the redo log.
@@ -1636,6 +1671,12 @@ static byte *recv_parse_or_apply_log_rec_body(
     case MLOG_FILE_RENAME:
 
       return (fil_tablespace_redo_rename(
+          ptr, end_ptr, page_id_t(space_id, page_no), parsed_bytes,
+          !recv_sys->apply_file_operations));
+
+    case MLOG_FILE_EXTEND:
+
+      return (fil_tablespace_redo_extend(
           ptr, end_ptr, page_id_t(space_id, page_no), parsed_bytes,
           !recv_sys->apply_file_operations));
 #endif /* !UNIV_HOTBACKUP */
@@ -2255,6 +2296,7 @@ static void recv_add_to_hash_table(mlog_id_t type, space_id_t space_id,
   ut_ad(type != MLOG_FILE_DELETE);
   ut_ad(type != MLOG_FILE_CREATE);
   ut_ad(type != MLOG_FILE_RENAME);
+  ut_ad(type != MLOG_FILE_EXTEND);
   ut_ad(type != MLOG_DUMMY_RECORD);
   ut_ad(type != MLOG_INDEX_LOAD);
 
@@ -2288,9 +2330,9 @@ static void recv_add_to_hash_table(mlog_id_t type, space_id_t space_id,
 
     UT_LIST_INIT(recv_addr->rec_list, &recv_t::rec_list);
 
-    using value_type = recv_sys_t::Pages::value_type;
+    using Value = recv_sys_t::Pages::value_type;
 
-    space->m_pages.insert(it, value_type(page_no, recv_addr));
+    space->m_pages.insert(it, Value{page_no, recv_addr});
 
     ++recv_sys->n_addrs;
   }
@@ -2357,9 +2399,11 @@ static void recv_data_copy_to_buf(byte *buf, recv_t *recv) {
 /** Applies the hashed log records to the page, if the page lsn is less than the
 lsn of a log record. This can be called when a buffer page has just been
 read in, or also for a page already in the buffer pool.
+
 @param[in]	just_read_in	true if the IO handler calls this for a freshly
                                 read page
-@param[in,out]	block		Buffer block */
+@param[in,out]	block		buffer block */
+/* TODO(fix Bug#31173032): Remove SUPPRESS_UBSAN_CLANG10. */
 void recv_recover_page_func(
 #ifndef UNIV_HOTBACKUP
     bool just_read_in,
@@ -2736,7 +2780,7 @@ static bool recv_update_bytes_to_ignore_before_checkpoint(
 /** Tracks changes of recovered_lsn and tracks proper values for what
 first_rec_group should be for consecutive blocks. Must be called when
 recv_sys->recovered_lsn is changed to next lsn pointing at boundary
-between consecutive parsed mini transactions. */
+between consecutive parsed mini-transactions. */
 static void recv_track_changes_of_recovered_lsn() {
   if (recv_sys->parse_start_lsn == 0) {
     return;
@@ -2859,6 +2903,7 @@ static bool recv_single_rec(byte *ptr, byte *end_ptr) {
     case MLOG_FILE_DELETE:
     case MLOG_FILE_RENAME:
     case MLOG_FILE_CREATE:
+    case MLOG_FILE_EXTEND:
     case MLOG_TABLE_DYNAMIC_META:
 
       /* These were already handled by
@@ -3000,6 +3045,7 @@ static bool recv_multi_rec(byte *ptr, byte *end_ptr) {
       case MLOG_FILE_DELETE:
       case MLOG_FILE_CREATE:
       case MLOG_FILE_RENAME:
+      case MLOG_FILE_EXTEND:
       case MLOG_TABLE_DYNAMIC_META:
         /* case MLOG_TRUNCATE: Disabled for WL6378 */
         /* These were already handled by
@@ -3331,8 +3377,9 @@ bool meb_scan_log_recs(
             return (true);
           }
 #else  /* !UNIV_HOTBACKUP */
-          ib::fatal() << "Insufficient memory for InnoDB parse buffer; want "
-                      << recv_sys->buf_len;
+          ib::fatal(ER_IB_ERR_NOT_ENOUGH_MEMORY_FOR_PARSE_BUFFER)
+              << "Insufficient memory for InnoDB parse buffer; want "
+              << recv_sys->buf_len;
 #endif /* !UNIV_HOTBACKUP */
         }
       }
@@ -4138,6 +4185,9 @@ const char *get_mlog_string(mlog_id_t type) {
 
     case MLOG_FILE_RENAME:
       return ("MLOG_FILE_RENAME");
+
+    case MLOG_FILE_EXTEND:
+      return ("MLOG_FILE_EXTEND");
 
     case MLOG_PAGE_CREATE_RTREE:
       return ("MLOG_PAGE_CREATE_RTREE");

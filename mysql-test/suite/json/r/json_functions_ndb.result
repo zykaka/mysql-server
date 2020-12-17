@@ -2875,7 +2875,7 @@ EXPLAIN SELECT j, COUNT(*) FROM t GROUP BY j WITH ROLLUP;
 id	select_type	table	partitions	type	possible_keys	key	key_len	ref	rows	filtered	Extra
 1	SIMPLE	t	p0,p1,p2,p3,p4,p5,p6,p7	ALL	NULL	NULL	NULL	NULL	366	100.00	Using filesort
 Warnings:
-Note	1003	/* select#1 */ select `test`.`t`.`j` AS `j`,count(0) AS `COUNT(*)` from `test`.`t` group by `test`.`t`.`j` with rollup
+Note	1003	/* select#1 */ select rollup_group_item(`test`.`t`.`j`,0) AS `j`,rollup_sum_switcher(count(0)) AS `COUNT(*)` from `test`.`t` group by `test`.`t`.`j` with rollup
 SELECT j, COUNT(*) FROM t GROUP BY j ORDER BY j;
 j	COUNT(*)
 NULL	2
@@ -7310,7 +7310,6 @@ NULL	1
 NULL	2
 Warnings:
 Warning	3156	Invalid JSON value for CAST to DATE/TIME/DATETIME/TIMESTAMP from column j at row 3
-Warning	3156	Invalid JSON value for CAST to DATE/TIME/DATETIME/TIMESTAMP from column j at row 4
 UPDATE tt SET j = CAST(CAST('2015-06-19' AS DATE) AS JSON) WHERE j IS NOT NULL;
 SELECT CAST(j AS DATE), COUNT(*) FROM tt GROUP BY j, i WITH ROLLUP;
 CAST(j AS DATE)	COUNT(*)
@@ -7326,11 +7325,16 @@ SET GLOBAL net_buffer_length = 1024;
 SET GLOBAL max_allowed_packet = 1024;
 SELECT REPEAT(j, 2), COUNT(*) FROM tt GROUP BY j, i WITH ROLLUP;
 REPEAT(j, 2)	COUNT(*)
-NULL	1
-NULL	1
+	1
+	1
 NULL	1
 Warnings:
 Warning	1235	This version of MySQL doesn't yet support 'sorting of non-scalar JSON values'
+Warning	1301	Result of j() was larger than max_allowed_packet (1024) - truncated
+SELECT REPEAT(j, 2), COUNT(*) FROM tt GROUP BY j, i;
+REPEAT(j, 2)	COUNT(*)
+	1
+Warnings:
 Warning	1301	Result of j() was larger than max_allowed_packet (1024) - truncated
 SET GLOBAL max_allowed_packet = default;
 SET GLOBAL net_buffer_length = default;
@@ -8600,8 +8604,6 @@ SELECT JSON_QUOTE('table') AS field1;
 field1
 "table"
 CREATE TABLE t SELECT JSON_QUOTE('table') AS field1;
-Warnings:
-Warning	1296	Got error 4502 'Table property is READ_BACKUP=1, but not in comment' from NDB
 SELECT * FROM t;
 field1
 "table"
@@ -8613,8 +8615,6 @@ SELECT JSON_UNQUOTE( '"table"' ) AS field1;
 field1
 table
 CREATE TABLE t1 SELECT JSON_unquote( '"table"' ) AS field1;
-Warnings:
-Warning	1296	Got error 4502 'Table property is READ_BACKUP=1, but not in comment' from NDB
 SELECT * FROM t1;
 field1
 table
@@ -8632,8 +8632,6 @@ SELECT JSON_QUOTE('table') AS field1;
 field1
 "table"
 CREATE TABLE t SELECT JSON_QUOTE('table') AS field1;
-Warnings:
-Warning	1296	Got error 4502 'Table property is READ_BACKUP=1, but not in comment' from NDB
 SELECT * FROM t;
 field1
 "table"
@@ -8645,8 +8643,6 @@ SELECT JSON_UNQUOTE( '"table"' ) AS field1;
 field1
 table
 CREATE TABLE t1 SELECT JSON_unquote( '"table"' ) AS field1;
-Warnings:
-Warning	1296	Got error 4502 'Table property is READ_BACKUP=1, but not in comment' from NDB
 SELECT * FROM t1;
 field1
 table
@@ -9880,34 +9876,23 @@ UPDATE t SET j1 = JSON_SET(j1, '$.a', 'x'),
 j2 = JSON_SET(j2, '$.a', 'y'),
 j1 = JSON_SET(j1, '$.b', 'z');
 SET optimizer_trace="enabled=off";
-SELECT trace FROM INFORMATION_SCHEMA.OPTIMIZER_TRACE;
-trace
-{
-  "steps": [
-    {
-      "update_preparation": {
-        "select#": 1,
-        "json_partial_update": {
-          "rejected_columns": [
-            {
-              "table": "`t`",
-              "column": "j1",
-              "cause": "Storage engine does not support partial update"
-            },
-            {
-              "table": "`t`",
-              "column": "j2",
-              "cause": "Storage engine does not support partial update"
-            }
-          ]
-        },
-        "steps": [
-          "update `t` set `t`.`j1` = json_set(`t`.`j1`,'$.a','x'),`t`.`j2` = json_set(`t`.`j2`,'$.a','y'),`t`.`j1` = json_set(`t`.`j1`,'$.b','z')"
-        ]
-      }
+SELECT REGEXP_SUBSTR(TRACE, '"table".*', 1, 1, 'n') FROM INFORMATION_SCHEMA.OPTIMIZER_TRACE;
+REGEXP_SUBSTR(TRACE, '"table".*', 1, 1, 'n')
+"table": "`t`"
     },
     {
-      "table": "`t`"
+      "rejected_columns": [
+        {
+          "table": "`t`",
+          "column": "j1",
+          "cause": "Storage engine does not support partial update"
+        },
+        {
+          "table": "`t`",
+          "column": "j2",
+          "cause": "Storage engine does not support partial update"
+        }
+      ]
     }
   ]
 }
@@ -9952,34 +9937,23 @@ UPDATE t SET j1 = JSON_SET(j1, '$.a', 's'),
 j2 = JSON_SET(j2, '$.a', 'abcdefghi'),
 j1 = JSON_SET(j1, '$.b', 't');
 SET optimizer_trace="enabled=off";
-SELECT trace FROM INFORMATION_SCHEMA.OPTIMIZER_TRACE;
-trace
-{
-  "steps": [
-    {
-      "update_preparation": {
-        "select#": 1,
-        "json_partial_update": {
-          "rejected_columns": [
-            {
-              "table": "`t`",
-              "column": "j1",
-              "cause": "Storage engine does not support partial update"
-            },
-            {
-              "table": "`t`",
-              "column": "j2",
-              "cause": "Storage engine does not support partial update"
-            }
-          ]
-        },
-        "steps": [
-          "update `t` set `t`.`j1` = json_set(`t`.`j1`,'$.a','s'),`t`.`j2` = json_set(`t`.`j2`,'$.a','abcdefghi'),`t`.`j1` = json_set(`t`.`j1`,'$.b','t')"
-        ]
-      }
+SELECT REGEXP_SUBSTR(TRACE, '"table".*', 1, 1, 'n') FROM INFORMATION_SCHEMA.OPTIMIZER_TRACE;
+REGEXP_SUBSTR(TRACE, '"table".*', 1, 1, 'n')
+"table": "`t`"
     },
     {
-      "table": "`t`"
+      "rejected_columns": [
+        {
+          "table": "`t`",
+          "column": "j1",
+          "cause": "Storage engine does not support partial update"
+        },
+        {
+          "table": "`t`",
+          "column": "j2",
+          "cause": "Storage engine does not support partial update"
+        }
+      ]
     }
   ]
 }
@@ -10020,29 +9994,18 @@ Note	1003	update `test`.`t` set `test`.`t`.`j1` = json_set(`test`.`t`.`j1`,'$.x.
 SET optimizer_trace="enabled=on";
 UPDATE t SET j1 = JSON_SET(j1, '$.x.y.z', 'abc', '$.b', 'X');
 SET optimizer_trace="enabled=off";
-SELECT trace FROM INFORMATION_SCHEMA.OPTIMIZER_TRACE;
-trace
-{
-  "steps": [
-    {
-      "update_preparation": {
-        "select#": 1,
-        "json_partial_update": {
-          "rejected_columns": [
-            {
-              "table": "`t`",
-              "column": "j1",
-              "cause": "Storage engine does not support partial update"
-            }
-          ]
-        },
-        "steps": [
-          "update `t` set `t`.`j1` = json_set(`t`.`j1`,'$.x.y.z','abc','$.b','X')"
-        ]
-      }
+SELECT REGEXP_SUBSTR(TRACE, '"table".*', 1, 1, 'n') FROM INFORMATION_SCHEMA.OPTIMIZER_TRACE;
+REGEXP_SUBSTR(TRACE, '"table".*', 1, 1, 'n')
+"table": "`t`"
     },
     {
-      "table": "`t`"
+      "rejected_columns": [
+        {
+          "table": "`t`",
+          "column": "j1",
+          "cause": "Storage engine does not support partial update"
+        }
+      ]
     }
   ]
 }
@@ -10083,29 +10046,18 @@ Note	1003	update `test`.`t` set `test`.`t`.`j1` = json_replace(`test`.`t`.`j1`,'
 SET optimizer_trace="enabled=on";
 UPDATE t SET j1 = JSON_REPLACE(j1, '$.x', 'abc', '$.b', 'Y');
 SET optimizer_trace="enabled=off";
-SELECT trace FROM INFORMATION_SCHEMA.OPTIMIZER_TRACE;
-trace
-{
-  "steps": [
-    {
-      "update_preparation": {
-        "select#": 1,
-        "json_partial_update": {
-          "rejected_columns": [
-            {
-              "table": "`t`",
-              "column": "j1",
-              "cause": "Storage engine does not support partial update"
-            }
-          ]
-        },
-        "steps": [
-          "update `t` set `t`.`j1` = json_replace(`t`.`j1`,'$.x','abc','$.b','Y')"
-        ]
-      }
+SELECT REGEXP_SUBSTR(TRACE, '"table".*', 1, 1, 'n') FROM INFORMATION_SCHEMA.OPTIMIZER_TRACE;
+REGEXP_SUBSTR(TRACE, '"table".*', 1, 1, 'n')
+"table": "`t`"
     },
     {
-      "table": "`t`"
+      "rejected_columns": [
+        {
+          "table": "`t`",
+          "column": "j1",
+          "cause": "Storage engine does not support partial update"
+        }
+      ]
     }
   ]
 }
@@ -10146,29 +10098,18 @@ Note	1003	update `test`.`t` set `test`.`t`.`j1` = json_set(`test`.`t`.`j1`,'$.x'
 SET optimizer_trace="enabled=on";
 UPDATE t SET j1 = JSON_SET(j1, '$.x', 'abc', '$.b', 'Z');
 SET optimizer_trace="enabled=off";
-SELECT trace FROM INFORMATION_SCHEMA.OPTIMIZER_TRACE;
-trace
-{
-  "steps": [
-    {
-      "update_preparation": {
-        "select#": 1,
-        "json_partial_update": {
-          "rejected_columns": [
-            {
-              "table": "`t`",
-              "column": "j1",
-              "cause": "Storage engine does not support partial update"
-            }
-          ]
-        },
-        "steps": [
-          "update `t` set `t`.`j1` = json_set(`t`.`j1`,'$.x','abc','$.b','Z')"
-        ]
-      }
+SELECT REGEXP_SUBSTR(TRACE, '"table".*', 1, 1, 'n') FROM INFORMATION_SCHEMA.OPTIMIZER_TRACE;
+REGEXP_SUBSTR(TRACE, '"table".*', 1, 1, 'n')
+"table": "`t`"
     },
     {
-      "table": "`t`"
+      "rejected_columns": [
+        {
+          "table": "`t`",
+          "column": "j1",
+          "cause": "Storage engine does not support partial update"
+        }
+      ]
     }
   ]
 }
@@ -10209,29 +10150,18 @@ Note	1003	update `test`.`t` set `test`.`t`.`j1` = json_set(`test`.`t`.`j2`,'$.a'
 SET optimizer_trace="enabled=on";
 UPDATE t SET j1 = JSON_SET(j2, '$.a', 'ABC');
 SET optimizer_trace="enabled=off";
-SELECT trace FROM INFORMATION_SCHEMA.OPTIMIZER_TRACE;
-trace
-{
-  "steps": [
-    {
-      "update_preparation": {
-        "select#": 1,
-        "json_partial_update": {
-          "rejected_columns": [
-            {
-              "table": "`t`",
-              "column": "j1",
-              "cause": "Storage engine does not support partial update"
-            }
-          ]
-        },
-        "steps": [
-          "update `t` set `t`.`j1` = json_set(`t`.`j2`,'$.a','ABC')"
-        ]
-      }
+SELECT REGEXP_SUBSTR(TRACE, '"table".*', 1, 1, 'n') FROM INFORMATION_SCHEMA.OPTIMIZER_TRACE;
+REGEXP_SUBSTR(TRACE, '"table".*', 1, 1, 'n')
+"table": "`t`"
     },
     {
-      "table": "`t`"
+      "rejected_columns": [
+        {
+          "table": "`t`",
+          "column": "j1",
+          "cause": "Storage engine does not support partial update"
+        }
+      ]
     }
   ]
 }
@@ -10272,29 +10202,18 @@ Note	1003	update `test`.`t` set `test`.`t`.`j1` = json_array(`test`.`t`.`j1`,`te
 SET optimizer_trace="enabled=on";
 UPDATE t SET j1 = JSON_ARRAY(j1, j1);
 SET optimizer_trace="enabled=off";
-SELECT trace FROM INFORMATION_SCHEMA.OPTIMIZER_TRACE;
-trace
-{
-  "steps": [
-    {
-      "update_preparation": {
-        "select#": 1,
-        "json_partial_update": {
-          "rejected_columns": [
-            {
-              "table": "`t`",
-              "column": "j1",
-              "cause": "Storage engine does not support partial update"
-            }
-          ]
-        },
-        "steps": [
-          "update `t` set `t`.`j1` = json_array(`t`.`j1`,`t`.`j1`)"
-        ]
-      }
+SELECT REGEXP_SUBSTR(TRACE, '"table".*', 1, 1, 'n') FROM INFORMATION_SCHEMA.OPTIMIZER_TRACE;
+REGEXP_SUBSTR(TRACE, '"table".*', 1, 1, 'n')
+"table": "`t`"
     },
     {
-      "table": "`t`"
+      "rejected_columns": [
+        {
+          "table": "`t`",
+          "column": "j1",
+          "cause": "Storage engine does not support partial update"
+        }
+      ]
     }
   ]
 }
@@ -10337,34 +10256,23 @@ SET optimizer_trace="enabled=on";
 UPDATE t SET j1 = JSON_SET(j2, '$.a', 1),
 j2 = JSON_SET(j2, '$.a', 1);
 SET optimizer_trace="enabled=off";
-SELECT trace FROM INFORMATION_SCHEMA.OPTIMIZER_TRACE;
-trace
-{
-  "steps": [
-    {
-      "update_preparation": {
-        "select#": 1,
-        "json_partial_update": {
-          "rejected_columns": [
-            {
-              "table": "`t`",
-              "column": "j1",
-              "cause": "Storage engine does not support partial update"
-            },
-            {
-              "table": "`t`",
-              "column": "j2",
-              "cause": "Storage engine does not support partial update"
-            }
-          ]
-        },
-        "steps": [
-          "update `t` set `t`.`j1` = json_set(`t`.`j2`,'$.a',1),`t`.`j2` = json_set(`t`.`j2`,'$.a',1)"
-        ]
-      }
+SELECT REGEXP_SUBSTR(TRACE, '"table".*', 1, 1, 'n') FROM INFORMATION_SCHEMA.OPTIMIZER_TRACE;
+REGEXP_SUBSTR(TRACE, '"table".*', 1, 1, 'n')
+"table": "`t`"
     },
     {
-      "table": "`t`"
+      "rejected_columns": [
+        {
+          "table": "`t`",
+          "column": "j1",
+          "cause": "Storage engine does not support partial update"
+        },
+        {
+          "table": "`t`",
+          "column": "j2",
+          "cause": "Storage engine does not support partial update"
+        }
+      ]
     }
   ]
 }
@@ -10780,7 +10688,7 @@ SET optimizer_trace="enabled=off";
 SELECT trace->'$**.json_partial_update'
        FROM INFORMATION_SCHEMA.OPTIMIZER_TRACE;
 trace->'$**.json_partial_update'
-[{"rejected_columns": [{"cause": "Storage engine does not support partial update", "table": "`t1`", "column": "j"}]}]
+NULL
 SELECT *, JSON_STORAGE_SIZE(j) ss,
 JSON_STORAGE_FREE(j) sf FROM t1 ORDER BY id;
 id	j	x	ss	sf
@@ -10893,7 +10801,7 @@ SET optimizer_trace="enabled=off";
 SELECT trace->'$**.json_partial_update'
        FROM INFORMATION_SCHEMA.OPTIMIZER_TRACE;
 trace->'$**.json_partial_update'
-[{"rejected_columns": [{"cause": "Storage engine does not support partial update", "table": "`t1`", "column": "j"}, {"cause": "Storage engine does not support partial update", "table": "`t2`", "column": "j"}]}]
+NULL
 SELECT *, JSON_STORAGE_SIZE(j) ss,
 JSON_STORAGE_FREE(j) sf FROM t1 ORDER BY id;
 id	j	x	ss	sf
@@ -10980,7 +10888,7 @@ SET optimizer_trace="enabled=off";
 SELECT trace->'$**.json_partial_update'
        FROM INFORMATION_SCHEMA.OPTIMIZER_TRACE;
 trace->'$**.json_partial_update'
-[{"rejected_columns": [{"cause": "Storage engine does not support partial update", "table": "`t1`", "column": "j"}, {"cause": "Storage engine does not support partial update", "table": "`t2`", "column": "j"}]}]
+NULL
 SELECT *, JSON_STORAGE_SIZE(j) ss,
 JSON_STORAGE_FREE(j) sf FROM t1 ORDER BY id;
 id	j	x	ss	sf
@@ -11004,7 +10912,7 @@ SET optimizer_trace="enabled=off";
 SELECT trace->'$**.json_partial_update'
        FROM INFORMATION_SCHEMA.OPTIMIZER_TRACE;
 trace->'$**.json_partial_update'
-[{"rejected_columns": [{"cause": "Storage engine does not support partial update", "table": "`t`", "column": "j"}]}]
+NULL
 SELECT j, JSON_STORAGE_SIZE(j), JSON_STORAGE_FREE(j) FROM t;
 j	JSON_STORAGE_SIZE(j)	JSON_STORAGE_FREE(j)
 [1]	8	0

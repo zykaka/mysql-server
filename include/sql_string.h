@@ -1,7 +1,7 @@
 #ifndef SQL_STRING_INCLUDED
 #define SQL_STRING_INCLUDED
 
-/* Copyright (c) 2000, 2020, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2000, 2020, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -228,7 +228,7 @@ class String {
   }
 
   static void operator delete(
-      void *, MEM_ROOT *, const std::nothrow_t &)noexcept { /* never called */
+      void *, MEM_ROOT *, const std::nothrow_t &) noexcept { /* never called */
   }
 
   ~String() { mem_free(); }
@@ -366,9 +366,9 @@ class String {
     m_ptr[m_length] = '\0';
   }
 
-  void mem_claim() {
+  void mem_claim(bool claim) {
     if (m_is_alloced) {
-      my_claim(m_ptr);
+      my_claim(m_ptr, claim);
     }
   }
 

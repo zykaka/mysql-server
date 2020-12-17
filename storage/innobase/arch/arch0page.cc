@@ -759,15 +759,12 @@ bool Arch_File_Ctx::validate(Arch_Group *group, uint file_index,
 
   build_name(file_index, start_lsn, file_name, MAX_ARCH_PAGE_FILE_NAME_LEN);
 
-  os_file_type_t type;
-  bool exists = false;
-  bool success = os_file_status(file_name, &exists, &type);
-
-  if (!success || !exists) {
+  if (!os_file_exists(file_name)) {
     /* Could be the case if files are purged. */
     return (true);
   }
 
+  bool success;
   pfs_os_file_t file;
 
   file = os_file_create(innodb_arch_file_key, file_name, OS_FILE_OPEN,
@@ -1727,7 +1724,7 @@ void Arch_Page_Sys::track_page(buf_page_t *bpage, lsn_t track_lsn,
 
     /* Can possibly loop only two times. */
     if (count >= 2) {
-      if (srv_shutdown_state.load() != SRV_SHUTDOWN_NONE) {
+      if (srv_shutdown_state.load() >= SRV_SHUTDOWN_CLEANUP) {
         arch_oper_mutex_exit();
         return;
       }
@@ -1802,10 +1799,11 @@ void Arch_Page_Sys::track_page(buf_page_t *bpage, lsn_t track_lsn,
 
 /** Get page IDs from a specific position.
 Caller must ensure that read_len doesn't exceed the block.
+@param[in]	group		group whose pages we're interested in
 @param[in]	read_pos	position in archived data
 @param[in]	read_len	amount of data to read
 @param[out]	read_buff	buffer to return the page IDs.
-                                Caller must allocate the buffer.
+@note Caller must allocate the buffer.
 @return true if we could successfully read the block. */
 bool Arch_Page_Sys::get_pages(Arch_Group *group, Arch_Page_Pos *read_pos,
                               uint read_len, byte *read_buff) {
@@ -2124,7 +2122,7 @@ bool Arch_Page_Sys::wait_idle() {
           ut_ad(mutex_own(&m_mutex));
           result = (m_state == ARCH_STATE_PREPARE_IDLE);
 
-          if (srv_shutdown_state.load() != SRV_SHUTDOWN_NONE) {
+          if (srv_shutdown_state.load() >= SRV_SHUTDOWN_CLEANUP) {
             return (ER_QUERY_INTERRUPTED);
           }
 
@@ -2201,7 +2199,13 @@ void Arch_Page_Sys::track_initial_pages() {
     uint page_count;
     uint skip_count;
 
-    bpage = UT_LIST_GET_LAST(buf_pool->flush_list);
+    bpage = buf_pool->oldest_hp.get();
+    if (bpage != nullptr) {
+      ut_ad(bpage->in_flush_list);
+    } else {
+      bpage = UT_LIST_GET_LAST(buf_pool->flush_list);
+    }
+
     page_count = 0;
     skip_count = 0;
 
@@ -2374,7 +2378,7 @@ int Arch_Page_Sys::start(Arch_Group **group, lsn_t *start_lsn,
   if (!wait_idle()) {
     int err = 0;
 
-    if (srv_shutdown_state.load() != SRV_SHUTDOWN_NONE) {
+    if (srv_shutdown_state.load() >= SRV_SHUTDOWN_CLEANUP) {
       err = ER_QUERY_INTERRUPTED;
       my_error(err, MYF(0));
     } else {

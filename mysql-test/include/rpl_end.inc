@@ -2,11 +2,11 @@
 #
 # Shut down replication initialized by include/rpl_init.inc.
 #
-# This syncs all servers, executes STOP SLAVE on all servers, executes
+# This syncs all servers, executes STOP REPLICA on all servers, executes
 # CHANGE MASTER on all servers, and disconnects all connections
 # configured by rpl_init.inc.
 #
-# It does not execute RESET MASTER or RESET SLAVE, because that would
+# It does not execute RESET MASTER or RESET REPLICA, because that would
 # remove binlogs which are possibly useful debug information in case
 # the test case later fails with a result mismatch.  If you need that,
 # source include/rpl_reset.inc before you source this file.
@@ -64,7 +64,7 @@
 #
 #     --source include/wait_for_slave_sql_error.inc
 #     --source include/stop_slave_io.inc
-#     RESET SLAVE;
+#     RESET REPLICA;
 #     --let $rpl_only_running_threads= 1
 #     --source include/rpl_end.inc
 #
@@ -155,6 +155,47 @@ if (!$rpl_group_replication)
   }
 }
 
+# Clear the configuration of privilege_checks_user account
+if (!$rpl_group_replication)
+{
+  --let $_rpl_server= $rpl_server_count
+  while ($_rpl_server)
+  {
+    if ($rpl_privilege_checks_user != '')
+    {
+      --let $rpl_server_number= $_rpl_server
+      --source include/rpl_get_instance_priv_checks_user.inc
+      if ($rpl_instance_privilege_checks_user != NULL)
+      {
+        --disable_query_log
+        --let $rpl_connection_name= server_$_rpl_server
+        --source include/rpl_connection.inc
+
+        if (!$rpl_multi_source)
+        {
+          CHANGE MASTER TO PRIVILEGE_CHECKS_USER=NULL;
+        }
+        if ($rpl_multi_source)
+        {
+          if($rpl_channel_name)
+          {
+            eval CHANGE MASTER TO PRIVILEGE_CHECKS_USER=NULL FOR CHANNEL $rpl_channel_name;
+          }
+          if(!$rpl_channel_name)
+          {
+            CHANGE MASTER TO PRIVILEGE_CHECKS_USER=NULL FOR CHANNEL '';
+          }
+        }
+        --enable_query_log
+        --source include/rpl_clear_priv_checks_user_configuration.inc
+      }
+    }
+    --dec $_rpl_server
+  }
+  --let $rpl_privilege_checks_user=
+  --let $rpl_change_topology_user_created=
+}
+
 # Restore the server state by deleting all channels
 if ($rpl_multi_source)
 {
@@ -199,31 +240,6 @@ while ($_rpl_server)
   --source include/rpl_connection.inc
   --source include/stop_dump_threads.inc
 
-  # Drop applier user, if created
-  --let $_rpl_change_topology_user_created_index= `SELECT LOCATE('$_rpl_server:', "$rpl_change_topology_user_created")`
-  if ($_rpl_change_topology_user_created_index)
-  {
-    --disable_query_log
-    --let $_rpl_change_topology_user_created= `SELECT SUBSTRING_INDEX(SUBSTRING_INDEX(SUBSTRING("$rpl_change_topology_user_created", $_rpl_change_topology_user_created_index), ' ', 1), ':', -1)`
-    --eval DROP USER $_rpl_change_topology_user_created
-    if ($rpl_privilege_checks_use_roles != '')
-    {
-        --eval DROP ROLE 'sql_applier_thread'
-    }
-    --enable_query_log
-  }
-
-  # Restore state for PRIVILEGE_CHECKS_USER
-  if ($rpl_privilege_checks_user)
-  {
-    --disable_query_log
-    SET @@sql_log_bin = 0;
-    # Drop created privileged database
-    DROP DATABASE rpl_priv;
-    SET @@sql_log_bin = 1;
-    CHANGE MASTER TO PRIVILEGE_CHECKS_USER=NULL;
-    --enable_query_log
-  }
   # Restore state for REQUIRE_ROW_FORMAT
   if ($rpl_require_row_format)
   {

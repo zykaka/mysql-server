@@ -365,6 +365,11 @@ static monitor_info_t innodb_counter_info[] = {
      "Number of pages requested for flushing.", MONITOR_NONE,
      MONITOR_DEFAULT_START, MONITOR_FLUSH_N_TO_FLUSH_REQUESTED},
 
+    {"buffer_flush_n_to_flush_by_dirty_page", "buffer",
+     "Number of pages targeted by dirty page percentage for flushing.",
+     MONITOR_NONE, MONITOR_DEFAULT_START,
+     MONITOR_FLUSH_N_TO_FLUSH_BY_DIRTY_PAGE},
+
     {"buffer_flush_n_to_flush_by_age", "buffer",
      "Number of pages targeted by LSN Age for flushing.", MONITOR_NONE,
      MONITOR_DEFAULT_START, MONITOR_FLUSH_N_TO_FLUSH_BY_AGE},
@@ -767,6 +772,9 @@ static monitor_info_t innodb_counter_info[] = {
     {"trx_active_transactions", "transaction", "Number of active transactions",
      MONITOR_NONE, MONITOR_DEFAULT_START, MONITOR_TRX_ACTIVE},
 
+    {"trx_allocations", "transaction", "Number of trx_t allocations",
+     MONITOR_NONE, MONITOR_DEFAULT_START, MONITOR_TRX_ALLOCATIONS},
+
     MONITOR_WAIT_STATS("trx_on_log_", "transaction",
                        "Waits for redo during transaction commits",
                        MONITOR_TRX_ON_LOG_),
@@ -835,32 +843,10 @@ static monitor_info_t innodb_counter_info[] = {
      "Number of times undo truncation was initiated", MONITOR_NONE,
      MONITOR_DEFAULT_START, MONITOR_UNDO_TRUNCATE_COUNT},
 
-    {"undo_truncate_sweep_count", "undo",
-     "Number of times undo truncation invalidates old pages from the buffer "
-     "pool",
-     MONITOR_NONE, MONITOR_DEFAULT_START, MONITOR_UNDO_TRUNCATE_SWEEP_COUNT},
-
-    {"undo_truncate_sweep_usec", "undo",
-     "Time (in microseconds) spent during undo truncation invalidating old "
-     "pages from the buffer pool",
-     MONITOR_NONE, MONITOR_DEFAULT_START,
-     MONITOR_UNDO_TRUNCATE_SWEEP_MICROSECOND},
-
     {"undo_truncate_start_logging_count", "undo",
      "Number of times during undo truncation a log file was started",
      MONITOR_NONE, MONITOR_DEFAULT_START,
      MONITOR_UNDO_TRUNCATE_START_LOGGING_COUNT},
-
-    {"undo_truncate_flush_count", "undo",
-     "Number of times undo truncation flushed new pages from the buffer pool "
-     "to disk",
-     MONITOR_NONE, MONITOR_DEFAULT_START, MONITOR_UNDO_TRUNCATE_FLUSH_COUNT},
-
-    {"undo_truncate_flush_usec", "undo",
-     "Time (in microseconds) spent during undo truncation flushing new pages "
-     "from the buffer pool to disk",
-     MONITOR_NONE, MONITOR_DEFAULT_START,
-     MONITOR_UNDO_TRUNCATE_FLUSH_MICROSECOND},
 
     {"undo_truncate_done_logging_count", "undo",
      "Number of times during undo truncation a log file was deleted",

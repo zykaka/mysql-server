@@ -1,5 +1,5 @@
 /*
-   Copyright (c) 2007, 2019, Oracle and/or its affiliates. All rights reserved.
+   Copyright (c) 2007, 2020, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -65,6 +65,7 @@
 #include "my_sys.h"
 #include "mysql/plugin_audit.h"
 #include "mysql/psi/mysql_mutex.h"
+#include "mysql/psi/mysql_thread.h"
 #include "mysql/service_mysql_alloc.h"
 #include "mysql_com.h"
 #include "mysqld_error.h"
@@ -454,7 +455,9 @@ static int check_connection(THD *thd) {
     char ip[NI_MAXHOST];
     LEX_CSTRING main_sctx_ip;
 
+    /* Set the remote (peer) port for this THD. */
     peer_rc = vio_peer_addr(net->vio, ip, &thd->peer_port, NI_MAXHOST);
+    mysql_thread_set_peer_port(thd->peer_port);
 
     /*
     ===========================================================================
@@ -533,7 +536,7 @@ static int check_connection(THD *thd) {
                                                 main_sctx_ip.length);
     if (!(specialflag & SPECIAL_NO_RESOLVE)) {
       int rc;
-      char *host;
+      char *host = nullptr;
       LEX_CSTRING main_sctx_host;
 
 #ifdef HAVE_SETNS
@@ -584,6 +587,11 @@ static int check_connection(THD *thd) {
               min<size_t>(main_sctx_host.length, HOSTNAME_LENGTH));
         thd->m_main_security_ctx.set_host_or_ip_ptr(main_sctx_host.str,
                                                     main_sctx_host.length);
+      }
+
+      if (rc == RC_LONG_HOSTNAME) {
+        my_error(ER_HOSTNAME_TOO_LONG, MYF(0), HOSTNAME_LENGTH);
+        return 1;
       }
 
       if (rc == RC_BLOCKED_HOST) {

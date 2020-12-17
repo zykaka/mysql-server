@@ -1008,6 +1008,9 @@ Dblqh::define_backup(Signal* signal)
   req->backupKey[0] = 0;
   req->backupKey[1] = 0;
   req->backupDataLen = ~0;
+  req->nodes.clear(); // Use nodes in section
+  req->flags = 0;
+  req->senderData = 0;
 
   NdbNodeBitmask nodes;
   nodes.set(getOwnNodeId());
@@ -7086,7 +7089,7 @@ Dblqh::handle_nr_copy(Signal* signal, Ptr<TcConnectionrec> regTcPtr)
   Uint32 fragPtr = fragptr.p->tupFragptr;
   Uint32 op = regTcPtr.p->operation;
 
-  const bool copy = LqhKeyReq::getNrCopyFlag(regTcPtr.p->reqinfo);
+  const bool nrCopyFlag = LqhKeyReq::getNrCopyFlag(regTcPtr.p->reqinfo);
 
   if (!LqhKeyReq::getRowidFlag(regTcPtr.p->reqinfo))
   {
@@ -7138,7 +7141,7 @@ Dblqh::handle_nr_copy(Signal* signal, Ptr<TcConnectionrec> regTcPtr)
    * restoring changes in an LCP. In this we set the NrCopyFlag.
    */
   TcConnectionrecPtr tcConnectptr = regTcPtr;
-  if (copy)
+  if (nrCopyFlag)
   {
     /**
      * This is a copy row sent from live node to starting node.
@@ -7282,10 +7285,58 @@ Dblqh::handle_nr_copy(Signal* signal, Ptr<TcConnectionrec> regTcPtr)
   else
   {
     /**
+     * nrCopyFlag == false
      * This is a normal operation in a starting node which is currently being
      * synchronised with the live node.
      */
-    if (!match && op != ZINSERT)
+
+    /**
+     * match used for NrCopy operations above is based on a binary
+     * comparison, but char keys with certain collations can be
+     * equivalent but not binary equal.
+     * We check for this case now if no match found so far
+     * This assumes that there is no case where
+     * binary equality does not imply collation equality.
+     */
+    bool xfrmMatch = match;
+    const Uint32 tableId = regTcPtr.p->tableref;
+    if (!match &&
+        g_key_descriptor_pool.getPtr(tableId)->hasCharAttr)
+    {
+      Uint64 reqKey[ MAX_KEY_SIZE_IN_WORDS >> 1 ];
+      Uint64 dbXfrmKey[ (MAX_KEY_SIZE_IN_WORDS*MAX_XFRM_MULTIPLY) >> 1 ];
+      Uint64 reqXfrmKey[ (MAX_KEY_SIZE_IN_WORDS*MAX_XFRM_MULTIPLY) >> 1 ];
+      Uint32 keyPartLen[MAX_ATTRIBUTES_IN_INDEX];
+
+      jam();
+
+      /* Transform db table key read from DB above into dbXfrmKey */
+      const int dbXfrmKeyLen = xfrm_key_hash(tableId,
+                                             &signal->theData[24],
+                                             (Uint32*)dbXfrmKey,
+                                             sizeof(dbXfrmKey) >> 2,
+                                             keyPartLen);
+
+      /* Copy request key into linear space */
+      copy((Uint32*) reqKey, regTcPtr.p->keyInfoIVal);
+
+      /* Transform request key */
+      const int reqXfrmKeyLen = xfrm_key_hash(tableId,
+                                              (Uint32*)reqKey,
+                                              (Uint32*)reqXfrmKey,
+                                              sizeof(reqXfrmKey) >> 2,
+                                              keyPartLen);
+      /* Check for a match between the xfrmd keys */
+      if (dbXfrmKeyLen > 0 &&
+          dbXfrmKeyLen == reqXfrmKeyLen)
+      {
+        jam();
+        /* Binary compare xfrm'd representations */
+        xfrmMatch = (memcmp(dbXfrmKey, reqXfrmKey, dbXfrmKeyLen << 2) == 0);
+      }
+    }
+
+    if (!xfrmMatch && op != ZINSERT)
     {
       /**
        * We are performing an UPDATE or a DELETE and the row id position
@@ -7300,7 +7351,7 @@ Dblqh::handle_nr_copy(Signal* signal, Ptr<TcConnectionrec> regTcPtr)
 	TRACENR(" IGNORE " << endl); 
       goto ignore;
     }
-    if (match)
+    if (xfrmMatch)
     {
       /**
        * An INSERT/UPDATE/DELETE/REFRESH on a record where we have the correct
@@ -7330,7 +7381,7 @@ Dblqh::handle_nr_copy(Signal* signal, Ptr<TcConnectionrec> regTcPtr)
      * same manner as if it was a copy row coming. It might be redone later
      * but this is not a problem with consistency.
      */
-    ndbassert(!match && op == ZINSERT);
+    ndbassert(!xfrmMatch && op == ZINSERT);
 
     /**
      * Perform the following action (same as above for copy row case)
@@ -10337,6 +10388,17 @@ void Dblqh::execLQHKEYCONF(Signal* signal)
     return;
   case TcConnectionrec::COPY_CONNECTED:
     jam();
+    if (ERROR_INSERTED(5106) &&
+        signal->getSendersBlockRef() != reference())
+    {
+      g_eventLogger->info("LQH %u delaying copy LQHKEYCONF", instance());
+      sendSignalWithDelay(reference(),
+                          GSN_LQHKEYCONF,
+                          signal,
+                          500,
+                          7);
+      return;
+    }
     setup_scan_pointers_from_tc_con(tcConnectptr);
     copyCompletedLab(signal, tcConnectptr);
     return;
@@ -13061,7 +13123,7 @@ void Dblqh::scanLockReleasedLab(Signal* signal,
       /*
        * We came here after releasing locks after 
        * receiving SCAN_NEXTREQ from TC. We only come here 
-       * when scanHoldLock == ZTRUE
+       * when scanLockHold == ZTRUE
        */
       scanPtr->m_curr_batch_size_rows = 0;
       scanPtr->m_curr_batch_size_bytes = 0;
@@ -15208,15 +15270,19 @@ void Dblqh::scanTupkeyRefLab(Signal* signal,
     scanReleaseLocksLab(signal, tcConnectptr.p);
     return;
   }//if
-  Uint32 time_passed = cLqhTimeOutCount - tcConnectptr.p->tcTimer;
-  if (unlikely(rows && time_passed > 1))
+
+  // 'time_passed' is in slices of 10ms
+  const Uint32 time_passed = cLqhTimeOutCount - tcConnectptr.p->tcTimer;
+  if (unlikely(rows && time_passed > 1) &&
+      (refToMain(scanPtr->scanApiBlockref) != DBSPJ || time_passed > 10 ))
   {
-  /* -----------------------------------------------------------------------
-   *  WE NEED TO ENSURE THAT WE DO NOT SEARCH FOR THE NEXT TUPLE FOR A 
-   *  LONG TIME WHILE WE KEEP A LOCK ON A FOUND TUPLE. WE RATHER REPORT 
-   *  THE FOUND TUPLE IF FOUND TUPLES ARE RARE. If more than 10 ms passed we
-   *  send the found tuples to the API.
-   * ----------------------------------------------------------------------- */
+    /* -----------------------------------------------------------------------
+     *  WE NEED TO ENSURE THAT WE DO NOT SEARCH FOR THE NEXT TUPLE FOR A
+     *  LONG TIME WHILE WE KEEP A LOCK ON A FOUND TUPLE. WE RATHER REPORT
+     *  THE FOUND TUPLE IF FOUND TUPLES ARE RARE. If more than 10 ms passed we
+     *  send the found tuples to the API. For requests comming from SPJ we allow
+     *  scans to go on for an extended periode of 100ms
+     * ----------------------------------------------------------------------- */
     scanPtr->scanReleaseCounter = rows + 1;
     scanReleaseLocksLab(signal, tcConnectptr.p);
     return;
@@ -24003,6 +24069,7 @@ Dblqh::write_local_sysfile(Signal *signal, Uint32 type, Uint32 gci)
 void
 Dblqh::execWRITE_LOCAL_SYSFILE_CONF(Signal *signal)
 {
+  jam();
   WriteLocalSysfileConf *conf = (WriteLocalSysfileConf*)signal->getDataPtr();
   ndbrequire(is_first_instance());
   c_outstanding_write_local_sysfile = false;
@@ -24020,6 +24087,7 @@ Dblqh::execWRITE_LOCAL_SYSFILE_CONF(Signal *signal)
       if (c_start_phase_9_waiting)
       {
         jam();
+        GcpRecordPtr localGcpPtr;
         /**
          * We have reached phase 9 during writing of the local sysfile.
          * We proceed immediately to update the local sysfile with the
@@ -24027,6 +24095,35 @@ Dblqh::execWRITE_LOCAL_SYSFILE_CONF(Signal *signal)
          * the GCP and report GCP_SAVECONF.
          */
         c_send_gcp_saveref_needed = false;
+
+        if (ccurrentGcprec == RNIL)
+        {
+          jam();
+          /**
+           * Setup GCP record values from local record as we will
+           * send a GCP_SAVECONF later
+           */
+          localGcpPtr.i = 0;
+          ptrCheckGuard(localGcpPtr, cgcprecFileSize, gcpRecord);
+
+          localGcpPtr.p->gcpBlockref = c_local_sysfile.m_dihRef;
+          localGcpPtr.p->gcpUserptr = c_local_sysfile.m_dihPtr;
+          localGcpPtr.p->gcpId = c_local_sysfile.m_save_gci;
+          ndbrequire(refToMain(localGcpPtr.p->gcpBlockref) == DBDIH ||
+                     refToMain(localGcpPtr.p->gcpBlockref) == DBLQH);
+        }
+        else
+        {
+          jam();
+          /**
+           * Check that the GCP record is sane
+           */
+          localGcpPtr.i = ccurrentGcprec;
+          ptrCheckGuard(localGcpPtr, cgcprecFileSize, gcpRecord);
+          ndbrequire(refToMain(localGcpPtr.p->gcpBlockref) == DBDIH ||
+                     refToMain(localGcpPtr.p->gcpBlockref) == DBLQH);
+        }
+
         write_local_sysfile_restart_complete(signal);
       }
       else

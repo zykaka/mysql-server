@@ -1,6 +1,6 @@
 /*****************************************************************************
 
-Copyright (c) 1994, 2019, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 1994, 2020, Oracle and/or its affiliates. All Rights Reserved.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License, version 2.0, as published by the
@@ -108,11 +108,11 @@ node_seq_t page_get_ssn_id(const page_t *page) {
 }
 
 /** Sets the RTREE SPLIT SEQUENCE NUMBER field value
-@param[in,out]	block		page
-@param[in,out]	page_zip	compressed page whose uncompressed part will
+@param[in,out]	block		Page
+@param[in,out]	page_zip	Compressed page whose uncompressed part will
                                 be updated, or NULL
-@param[in]	ssn_id		transaction id
-@param[in,out]	mtr		mini-transaction */
+@param[in]	ssn_id		Transaction id
+@param[in,out]	mtr		Mini-transaction */
 UNIV_INLINE
 void page_set_ssn_id(buf_block_t *block, page_zip_des_t *page_zip,
                      node_seq_t ssn_id, mtr_t *mtr) {
@@ -512,6 +512,11 @@ space_id_t page_get_space_id(const page_t *page) /*!< in: page */
 {
   ut_ad(page == page_align((page_t *)page));
   return (mach_read_from_4(page + FIL_PAGE_ARCH_LOG_NO_OR_SPACE_ID));
+}
+
+UNIV_INLINE
+page_id_t page_get_page_id(const page_t *page) {
+  return page_id_t{page_get_space_id(page), page_get_page_no(page)};
 }
 
 /** Gets the number of user records on page (infimum and supremum records

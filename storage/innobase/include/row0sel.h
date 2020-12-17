@@ -170,7 +170,7 @@ dberr_t row_search_for_mysql(byte *buf, page_cur_mode_t mode,
     MY_ATTRIBUTE((warn_unused_result));
 
 /** Searches for rows in the database using cursor.
-function is meant for temporary table that are not shared accross connection
+Function is for temporary tables that are not shared accross connections
 and so lot of complexity is reduced especially locking and transaction related.
 The cursor is an iterator over the table/index.
 
@@ -460,15 +460,22 @@ function is row_mysql_store_col_in_innobase_format() in row0mysql.cc.
 @param[in]	templ		MySQL column template. Its following fields
                                 are referenced: type, is_unsigned,
 mysql_col_len, mbminlen, mbmaxlen
-@param[in]	index		InnoDB index
+@param[in]	index		InnoDB index */
+#ifdef UNIV_DEBUG
+/**
 @param[in]	field_no	templ->rec_field_no or templ->clust_rec_field_no
-                                or templ->icp_rec_field_no
+                                or templ->icp_rec_field_no */
+#endif /* UNIV_DEBUG */
+/**
 @param[in]	data		data to store
-@param[in]	len		length of the data
+@param[in]	len		length of the data */
+#ifdef UNIV_DEBUG
+/**
 @param[in]	sec_field	secondary index field no if the secondary index
                                 record but the prebuilt template is in
                                 clustered index format and used only for end
                                 range comparison. */
+#endif /* UNIV_DEBUG */
 void row_sel_field_store_in_mysql_format_func(byte *dest,
                                               const mysql_row_templ_t *templ,
                                               const dict_index_t *index,

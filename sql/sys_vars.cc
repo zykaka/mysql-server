@@ -1,4 +1,4 @@
-/* Copyright (c) 2009, 2020, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2009, 2020, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -85,7 +85,6 @@
 #include "my_thread_local.h"
 #include "my_time.h"
 #include "myisam.h"  // myisam_flush
-#include "mysql/components/services/log_builtins.h"
 #include "mysql/plugin_group_replication.h"
 #include "mysql/psi/mysql_mutex.h"
 #include "mysql_version.h"
@@ -128,7 +127,7 @@
 #include "sql/sql_locale.h"     // my_locale_by_number
 #include "sql/sql_parse.h"      // killall_non_super_threads
 #include "sql/sql_tmp_table.h"  // internal_tmp_mem_storage_engine_names
-#include "sql/ssl_acceptor_context.h"
+#include "sql/ssl_acceptor_context_operator.h"
 #include "sql/system_variables.h"
 #include "sql/table_cache.h"  // Table_cache_manager
 #include "sql/transaction.h"  // trans_commit_stmt
@@ -392,6 +391,14 @@ static Sys_var_charptr Sys_pfs_instrument(
     READ_ONLY NOT_VISIBLE GLOBAL_VAR(pfs_param.m_pfs_instrument),
     CMD_LINE(OPT_ARG, OPT_PFS_INSTRUMENT), IN_FS_CHARSET, DEFAULT(""),
     PFS_TRAILING_PROPERTIES);
+
+static Sys_var_bool Sys_pfs_processlist(
+    "performance_schema_show_processlist",
+    "Default startup value to enable SHOW PROCESSLIST "
+    "in the performance schema.",
+    GLOBAL_VAR(pfs_processlist_enabled), CMD_LINE(OPT_ARG), DEFAULT(false),
+    NO_MUTEX_GUARD, NOT_IN_BINLOG, ON_CHECK(nullptr), ON_UPDATE(nullptr),
+    nullptr, sys_var::PARSE_NORMAL);
 
 static Sys_var_bool Sys_pfs_consumer_events_stages_current(
     "performance_schema_consumer_events_stages_current",
@@ -1607,6 +1614,25 @@ static Sys_var_charptr Sys_character_sets_dir(
     READ_ONLY NON_PERSIST GLOBAL_VAR(charsets_dir), CMD_LINE(REQUIRED_ARG),
     IN_FS_CHARSET, DEFAULT(nullptr));
 
+static Sys_var_ulong Sys_select_into_buffer_size(
+    "select_into_buffer_size", "Buffer size for SELECT INTO OUTFILE/DUMPFILE.",
+    HINT_UPDATEABLE SESSION_VAR(select_into_buffer_size), CMD_LINE(OPT_ARG),
+    VALID_RANGE(IO_SIZE * 2, INT_MAX32), DEFAULT(128 * 1024),
+    BLOCK_SIZE(IO_SIZE));
+
+static Sys_var_bool Sys_select_into_disk_sync(
+    "select_into_disk_sync",
+    "Synchronize flushed buffer with disk for SELECT INTO OUTFILE/DUMPFILE.",
+    HINT_UPDATEABLE SESSION_VAR(select_into_disk_sync), CMD_LINE(OPT_ARG),
+    DEFAULT(false));
+
+static Sys_var_uint Sys_select_into_disk_sync_delay(
+    "select_into_disk_sync_delay",
+    "The delay in milliseconds after each buffer sync "
+    "for SELECT INTO OUTFILE/DUMPFILE. Requires select_into_sync_disk = ON.",
+    HINT_UPDATEABLE SESSION_VAR(select_into_disk_sync_delay), CMD_LINE(OPT_ARG),
+    VALID_RANGE(0, LONG_TIMEOUT), DEFAULT(0), BLOCK_SIZE(1));
+
 static bool check_not_null(sys_var *, THD *, set_var *var) {
   return var->value && var->value->is_null();
 }
@@ -1749,7 +1775,10 @@ static Sys_var_struct<CHARSET_INFO, Get_csname> Sys_character_set_database(
 static bool check_cs_client(sys_var *self, THD *thd, set_var *var) {
   if (check_charset_not_null(self, thd, var)) return true;
 
-  // Currently, UCS-2 cannot be used as a client character set
+  // We don't currently support any variable-width character set with a minumum
+  // length greater than 1. If we ever do, we have to revisit
+  // is_supported_parser_charset(). See Item_func_statement_digest::val_str()
+  // and Item_func_statement_digest_text::val_str().
   return (static_cast<const CHARSET_INFO *>(var->save_result.ptr))->mbminlen >
          1;
 }
@@ -2385,20 +2414,39 @@ static Sys_var_charptr Sys_log_error(
 static bool check_log_error_services(sys_var *self, THD *thd, set_var *var) {
   // test whether syntax is OK and services exist
   size_t pos;
+  log_error_stack_error ret;
 
   if (var->save_result.string_value.str == nullptr) return true;
 
-  if (log_builtins_error_stack(var->save_result.string_value.str, true, &pos) <
-      0) {
-    push_warning_printf(
-        thd, Sql_condition::SL_WARNING, ER_CANT_SET_ERROR_LOG_SERVICE,
-        ER_THD(thd, ER_CANT_SET_ERROR_LOG_SERVICE), self->name.str,
-        &((char *)var->save_result.string_value.str)[pos]);
-    return true;
-  } else if (strlen(var->save_result.string_value.str) < 1) {
+  ret = log_builtins_error_stack(var->save_result.string_value.str, true, &pos);
+
+  if (strlen(var->save_result.string_value.str) < 1) {
     push_warning_printf(
         thd, Sql_condition::SL_WARNING, ER_EMPTY_PIPELINE_FOR_ERROR_LOG_SERVICE,
         ER_THD(thd, ER_EMPTY_PIPELINE_FOR_ERROR_LOG_SERVICE), self->name.str);
+  } else if (ret != LOG_ERROR_STACK_SUCCESS) {
+    int err_code = 0;
+    switch (ret) {
+      case LOG_ERROR_STACK_NO_PFS_SUPPORT:
+        err_code = ER_DA_ERROR_LOG_TABLE_DISABLED;
+        break;
+      case LOG_ERROR_STACK_NO_LOG_PARSER:
+        err_code = ER_DA_NO_ERROR_LOG_PARSER_CONFIGURED;
+        break;
+      case LOG_ERROR_MULTIPLE_FILTERS:
+        err_code = ER_DA_ERROR_LOG_MULTIPLE_FILTERS;
+        break;
+      default:
+        push_warning_printf(
+            thd, Sql_condition::SL_WARNING, ER_CANT_SET_ERROR_LOG_SERVICE,
+            ER_THD(thd, ER_CANT_SET_ERROR_LOG_SERVICE), self->name.str,
+            &((char *)var->save_result.string_value.str)[pos]);
+        return true;
+    }
+
+    push_warning(thd, Sql_condition::SL_NOTE, err_code,
+                 ER_THD_NONCONST(thd, err_code));
+    return false;
   }
 
   return false;
@@ -2407,27 +2455,52 @@ static bool check_log_error_services(sys_var *self, THD *thd, set_var *var) {
 static bool fix_log_error_services(sys_var *self MY_ATTRIBUTE((unused)),
                                    THD *thd,
                                    enum_var_type type MY_ATTRIBUTE((unused))) {
+  bool ret = false;
   // syntax is OK and services exist; try to initialize them!
   size_t pos;
+
+  /*
+    There is a theoretical race/deadlock here:
+
+    SET GLOBAL log_error_services=... first acquires
+    LOCK_global_system_variables (on account of being a system variable),
+    and then will try to obtain THR_LOCK_log_stack (to update the
+    error logging stack).
+
+    If FLUSH ERROR LOGS is also executed, it will first obtain
+    THR_LOCK_log_stack (as it will call the flush functions in all
+    configured sinks, and cannot allow people to change the config
+    or UNINSTALL COMPONENTs while that happens), and then one of
+    those log-components may try to re-install its pluggable
+    system variables on flush.
+
+    Due to the reverse locking order, this may deadlock here.
+    We could temporarily release LOCK_global_system_variables
+    while updating the error-logging stack (after first making
+    a copy of opt_log_error_services), but the better option
+    is to not have log-services' pluggable system variables
+    appear/disappear during FLUSH.
+  */
+
   if (log_builtins_error_stack(opt_log_error_services, false, &pos) < 0) {
     if (pos < strlen(opt_log_error_services)) /* purecov: begin inspected */
       push_warning_printf(
           thd, Sql_condition::SL_WARNING, ER_CANT_START_ERROR_LOG_SERVICE,
           ER_THD(thd, ER_CANT_START_ERROR_LOG_SERVICE), self->name.str,
           &((char *)opt_log_error_services)[pos]);
-    return true; /* purecov: end */
+    ret = true; /* purecov: end */
   }
 
-  return false;
+  return ret;
 }
 
 static Sys_var_charptr Sys_log_error_services(
     "log_error_services",
     "Services that should be called when an error event is received",
-    GLOBAL_VAR(opt_log_error_services), CMD_LINE(REQUIRED_ARG),
-    IN_SYSTEM_CHARSET, DEFAULT(LOG_ERROR_SERVICES_DEFAULT), NO_MUTEX_GUARD,
-    NOT_IN_BINLOG, ON_CHECK(check_log_error_services),
-    ON_UPDATE(fix_log_error_services));
+    PERSIST_AS_READONLY GLOBAL_VAR(opt_log_error_services),
+    CMD_LINE(REQUIRED_ARG), IN_SYSTEM_CHARSET,
+    DEFAULT(LOG_ERROR_SERVICES_DEFAULT), NO_MUTEX_GUARD, NOT_IN_BINLOG,
+    ON_CHECK(check_log_error_services), ON_UPDATE(fix_log_error_services));
 
 static bool check_log_error_suppression_list(sys_var *self, THD *thd,
                                              set_var *var) {
@@ -2466,9 +2539,9 @@ static Sys_var_charptr Sys_log_error_suppression_list(
     "or Error severity will always be included. Requires the filter "
     "\'log_filter_internal\' to be set in @@global.log_error_services, which "
     "is the default.",
-    GLOBAL_VAR(opt_log_error_suppression_list), CMD_LINE(REQUIRED_ARG),
-    IN_SYSTEM_CHARSET, DEFAULT(""), NO_MUTEX_GUARD, NOT_IN_BINLOG,
-    ON_CHECK(check_log_error_suppression_list),
+    PERSIST_AS_READONLY GLOBAL_VAR(opt_log_error_suppression_list),
+    CMD_LINE(REQUIRED_ARG), IN_SYSTEM_CHARSET, DEFAULT(""), NO_MUTEX_GUARD,
+    NOT_IN_BINLOG, ON_CHECK(check_log_error_suppression_list),
     ON_UPDATE(fix_log_error_suppression_list));
 
 static Sys_var_bool Sys_log_queries_not_using_indexes(
@@ -2523,9 +2596,9 @@ static Sys_var_ulong Sys_log_error_verbosity(
     "2, log errors and warnings. "
     "3, log errors, warnings, and notes. "
     "Messages sent to the client are unaffected by this setting.",
-    GLOBAL_VAR(log_error_verbosity), CMD_LINE(REQUIRED_ARG), VALID_RANGE(1, 3),
-    DEFAULT(2), BLOCK_SIZE(1), NO_MUTEX_GUARD, NOT_IN_BINLOG, ON_CHECK(nullptr),
-    ON_UPDATE(update_log_error_verbosity));
+    PERSIST_AS_READONLY GLOBAL_VAR(log_error_verbosity), CMD_LINE(REQUIRED_ARG),
+    VALID_RANGE(1, 3), DEFAULT(2), BLOCK_SIZE(1), NO_MUTEX_GUARD, NOT_IN_BINLOG,
+    ON_CHECK(nullptr), ON_UPDATE(update_log_error_verbosity));
 
 static Sys_var_enum Sys_log_timestamps(
     "log_timestamps",
@@ -2535,7 +2608,10 @@ static Sys_var_enum Sys_log_timestamps(
     "This affects only log files, not log tables, as the timestamp columns "
     "of the latter can be converted at will.",
     GLOBAL_VAR(opt_log_timestamps), CMD_LINE(REQUIRED_ARG),
-    timestamp_type_names, DEFAULT(0), NO_MUTEX_GUARD, NOT_IN_BINLOG);
+    timestamp_type_names, DEFAULT(0), NO_MUTEX_GUARD, NOT_IN_BINLOG,
+    ON_CHECK(nullptr), ON_UPDATE(nullptr), nullptr,
+    /* log_error is an early option, so its timestamp format should be, too. */
+    sys_var::PARSE_EARLY);
 
 static Sys_var_bool Sys_log_statements_unsafe_for_binlog(
     "log_statements_unsafe_for_binlog",
@@ -3089,6 +3165,36 @@ export void update_parser_max_mem_size() {
   global_system_variables.parser_max_mem_size = new_val;
 }
 
+static bool check_optimizer_switch(sys_var *, THD *thd MY_ATTRIBUTE((unused)),
+                                   set_var *var) {
+  const bool current_hypergraph_optimizer =
+      thd->optimizer_switch_flag(OPTIMIZER_SWITCH_HYPERGRAPH_OPTIMIZER);
+  const bool want_hypergraph_optimizer =
+      var->save_result.ulonglong_value & OPTIMIZER_SWITCH_HYPERGRAPH_OPTIMIZER;
+
+  if (current_hypergraph_optimizer && !want_hypergraph_optimizer) {
+    // Don't turn off the hypergraph optimizer on set optimizer_switch=DEFAULT.
+    // This is so that mtr --hypergraph should not be easily cancelled in the
+    // middle of a test, unless the test explicitly meant it.
+    if (var->value == nullptr) {
+      var->save_result.ulonglong_value |= OPTIMIZER_SWITCH_HYPERGRAPH_OPTIMIZER;
+    }
+  } else if (!current_hypergraph_optimizer && want_hypergraph_optimizer) {
+#ifndef DBUG_OFF
+    // Allow, with a warning.
+    push_warning(thd, Sql_condition::SL_WARNING, ER_WARN_DEPRECATED_SYNTAX,
+                 ER_THD(thd, ER_WARN_HYPERGRAPH_EXPERIMENTAL));
+    return false;
+#else
+    // Disallow; the hypergraph optimizer is not ready for production yet.
+    my_error(ER_HYPERGRAPH_NOT_SUPPORTED_YET, MYF(0),
+             "use in non-debug builds");
+    return true;
+#endif
+  }
+  return false;
+}
+
 /**
   @note
   @b BEWARE! These must have the same order as the \#defines in sql_const.h!
@@ -3116,6 +3222,10 @@ static const char *optimizer_switch_names[] = {
     "use_invisible_indexes",
     "skip_scan",
     "hash_join",
+    "subquery_to_derived",
+    "prefer_ordering_index",
+    "hypergraph_optimizer",  // Deliberately not documented below.
+    "derived_condition_pushdown",
     "default",
     NullS};
 static Sys_var_flagset Sys_optimizer_switch(
@@ -3125,13 +3235,15 @@ static Sys_var_flagset Sys_optimizer_switch(
     "index_merge_intersection, engine_condition_pushdown, "
     "index_condition_pushdown, mrr, mrr_cost_based"
     ", materialization, semijoin, loosescan, firstmatch, duplicateweedout,"
-    " subquery_materialization_cost_based, skip_scan"
-    ", block_nested_loop, batched_key_access, use_index_extensions,"
-    " condition_fanout_filter, derived_merge, hash_join} and val is one of "
+    " subquery_materialization_cost_based, skip_scan,"
+    " block_nested_loop, batched_key_access, use_index_extensions,"
+    " condition_fanout_filter, derived_merge, hash_join,"
+    " subquery_to_derived, prefer_ordering_index,"
+    " derived_condition_pushdown} and val is one of "
     "{on, off, default}",
     HINT_UPDATEABLE SESSION_VAR(optimizer_switch), CMD_LINE(REQUIRED_ARG),
     optimizer_switch_names, DEFAULT(OPTIMIZER_SWITCH_DEFAULT), NO_MUTEX_GUARD,
-    NOT_IN_BINLOG, ON_CHECK(nullptr), ON_UPDATE(nullptr));
+    NOT_IN_BINLOG, ON_CHECK(check_optimizer_switch), ON_UPDATE(nullptr));
 
 static Sys_var_bool Sys_var_end_markers_in_json(
     "end_markers_in_json",
@@ -3268,7 +3380,7 @@ static bool check_require_secure_transport(
   */
 
   if (!var->save_result.ulonglong_value) return false;
-  if (SslAcceptorContext::have_ssl() || opt_enable_shared_memory) return false;
+  if (have_ssl() || opt_enable_shared_memory) return false;
   /* reject if SSL and shared memory are both disabled: */
   my_error(ER_NO_SECURE_TRANSPORTS_CONFIGURED, MYF(0));
   return true;
@@ -3923,15 +4035,15 @@ bool Sys_var_gtid_set::session_update(THD *thd, set_var *var) {
 
 */
 static void issue_deprecation_warnings_gtid_mode(
-    THD *thd, enum_gtid_mode oldmode MY_ATTRIBUTE((unused)),
-    enum_gtid_mode newmode) {
+    THD *thd, Gtid_mode::value_type oldmode MY_ATTRIBUTE((unused)),
+    Gtid_mode::value_type newmode) {
   channel_map.assert_some_lock();
 
   /*
     Check that if changing to gtid_mode=on no channel is configured
     to ignore server ids. If it is, issue a deprecation warning.
   */
-  if (newmode == GTID_MODE_ON) {
+  if (newmode == Gtid_mode::ON) {
     for (mi_map::iterator it = channel_map.begin(); it != channel_map.end();
          it++) {
       Master_info *mi = it->second;
@@ -3985,16 +4097,16 @@ bool Sys_var_gtid_mode::global_update(THD *thd, set_var *var) {
     Hold global_sid_lock.wrlock so that:
     - other transactions cannot acquire ownership of any gtid.
 
-    Hold gtid_mode_lock so that all places that don't want to hold
+    Hold Gtid_mode::lock so that all places that don't want to hold
     any of the other locks, but want to read gtid_mode, don't need
     to take the other locks.
   */
 
-  enum_gtid_mode new_gtid_mode =
-      (enum_gtid_mode)var->save_result.ulonglong_value;
+  auto new_gtid_mode =
+      static_cast<Gtid_mode::value_type>(var->save_result.ulonglong_value);
 
-  if (gtid_mode_lock->trywrlock()) {
-    my_error(ER_CANT_SET_GTID_MODE, MYF(0), get_gtid_mode_string(new_gtid_mode),
+  if (Gtid_mode::lock.trywrlock()) {
+    my_error(ER_CANT_SET_GTID_MODE, MYF(0), Gtid_mode::to_string(new_gtid_mode),
              "there is a concurrent operation that disallows changes to "
              "@@GLOBAL.GTID_MODE");
     return ret;
@@ -4005,8 +4117,8 @@ bool Sys_var_gtid_mode::global_update(THD *thd, set_var *var) {
   global_sid_lock->wrlock();
   int lock_count = 4;
 
-  enum_gtid_mode old_gtid_mode = get_gtid_mode(GTID_MODE_LOCK_SID);
-  DBUG_ASSERT(new_gtid_mode <= GTID_MODE_ON);
+  auto old_gtid_mode = global_gtid_mode.get();
+  DBUG_ASSERT(new_gtid_mode <= Gtid_mode::ON);
 
   DBUG_PRINT("info", ("old_gtid_mode=%d new_gtid_mode=%d", old_gtid_mode,
                       new_gtid_mode));
@@ -4026,28 +4138,28 @@ bool Sys_var_gtid_mode::global_update(THD *thd, set_var *var) {
 
   // Not allowed with slave_sql_skip_counter
   DBUG_PRINT("info", ("sql_slave_skip_counter=%d", sql_slave_skip_counter));
-  if (new_gtid_mode == GTID_MODE_ON && sql_slave_skip_counter > 0) {
+  if (new_gtid_mode == Gtid_mode::ON && sql_slave_skip_counter > 0) {
     my_error(ER_CANT_SET_GTID_MODE, MYF(0), "ON",
              "@@GLOBAL.SQL_SLAVE_SKIP_COUNTER is greater than zero");
     goto err;
   }
 
-  if (new_gtid_mode != GTID_MODE_ON && replicate_same_server_id &&
+  if (new_gtid_mode != Gtid_mode::ON && replicate_same_server_id &&
       opt_log_slave_updates && opt_bin_log) {
-    std::string mode = get_gtid_mode_string(new_gtid_mode);
     std::stringstream ss;
 
     ss << "replicate_same_server_id is set together with log_slave_updates"
-       << " and log_bin. Thus, setting @@global.GTID_MODE = " << mode
-       << " would lead to infinite loops in case this server is part of a"
+       << " and log_bin. Thus, any anonymous transactions"
+       << " would circulate infinitely in case this server is part of a"
        << " circular replication topology";
 
-    my_error(ER_CANT_SET_GTID_MODE, MYF(0), mode.c_str(), ss.str().c_str());
+    my_error(ER_CANT_SET_GTID_MODE, MYF(0), Gtid_mode::to_string(new_gtid_mode),
+             ss.str().c_str());
     goto err;
   }
 
   // Cannot set OFF when some channel uses AUTO_POSITION.
-  if (new_gtid_mode == GTID_MODE_OFF) {
+  if (new_gtid_mode == Gtid_mode::OFF) {
     for (mi_map::iterator it = channel_map.begin(); it != channel_map.end();
          it++) {
       Master_info *mi = it->second;
@@ -4068,11 +4180,27 @@ bool Sys_var_gtid_mode::global_update(THD *thd, set_var *var) {
     }
   }
 
+  /*
+    Cannot set OFF when source_connection_auto_failover is enabled for any
+    channel.
+  */
+  if (new_gtid_mode != Gtid_mode::ON) {
+    for (mi_map::iterator it = channel_map.begin(); it != channel_map.end();
+         it++) {
+      Master_info *mi = it->second;
+      if (mi != nullptr && mi->is_source_connection_auto_failover()) {
+        my_error(ER_DISABLE_GTID_MODE_REQUIRES_ASYNC_RECONNECT_OFF, MYF(0),
+                 Gtid_mode::to_string(new_gtid_mode));
+        goto err;
+      }
+    }
+  }
+
   // Can't set GTID_MODE != ON when group replication is enabled.
   if (is_group_replication_running()) {
-    DBUG_ASSERT(old_gtid_mode == GTID_MODE_ON);
-    DBUG_ASSERT(new_gtid_mode == GTID_MODE_ON_PERMISSIVE);
-    my_error(ER_CANT_SET_GTID_MODE, MYF(0), get_gtid_mode_string(new_gtid_mode),
+    DBUG_ASSERT(old_gtid_mode == Gtid_mode::ON);
+    DBUG_ASSERT(new_gtid_mode == Gtid_mode::ON_PERMISSIVE);
+    my_error(ER_CANT_SET_GTID_MODE, MYF(0), Gtid_mode::to_string(new_gtid_mode),
              "group replication requires @@GLOBAL.GTID_MODE=ON");
     goto err;
   }
@@ -4082,7 +4210,7 @@ bool Sys_var_gtid_mode::global_update(THD *thd, set_var *var) {
                       gtid_state->get_anonymous_ownership_count(),
                       gtid_state->get_owned_gtids()->is_empty()));
   gtid_state->get_owned_gtids()->dbug_print("global owned_gtids");
-  if (new_gtid_mode == GTID_MODE_ON &&
+  if (new_gtid_mode == Gtid_mode::ON &&
       gtid_state->get_anonymous_ownership_count() > 0) {
     my_error(ER_CANT_SET_GTID_MODE, MYF(0), "ON",
              "there are ongoing, anonymous transactions. Before "
@@ -4096,7 +4224,7 @@ bool Sys_var_gtid_mode::global_update(THD *thd, set_var *var) {
     goto err;
   }
 
-  if (new_gtid_mode == GTID_MODE_OFF &&
+  if (new_gtid_mode == Gtid_mode::OFF &&
       !gtid_state->get_owned_gtids()->is_empty()) {
     my_error(ER_CANT_SET_GTID_MODE, MYF(0), "OFF",
              "there are ongoing transactions that have a GTID. "
@@ -4113,7 +4241,7 @@ bool Sys_var_gtid_mode::global_update(THD *thd, set_var *var) {
   DBUG_PRINT("info",
              ("automatic_gtid_violating_transaction_count=%d",
               gtid_state->get_automatic_gtid_violating_transaction_count()));
-  if (new_gtid_mode >= GTID_MODE_ON_PERMISSIVE &&
+  if (new_gtid_mode >= Gtid_mode::ON_PERMISSIVE &&
       gtid_state->get_automatic_gtid_violating_transaction_count() > 0) {
     my_error(ER_CANT_SET_GTID_MODE, MYF(0), "ON_PERMISSIVE",
              "there are ongoing transactions that use "
@@ -4127,7 +4255,7 @@ bool Sys_var_gtid_mode::global_update(THD *thd, set_var *var) {
   }
 
   // Compatible with ENFORCE_GTID_CONSISTENCY.
-  if (new_gtid_mode == GTID_MODE_ON &&
+  if (new_gtid_mode == Gtid_mode::ON &&
       get_gtid_consistency_mode() != GTID_CONSISTENCY_MODE_ON) {
     my_error(ER_CANT_SET_GTID_MODE, MYF(0), "ON",
              "ENFORCE_GTID_CONSISTENCY is not ON");
@@ -4139,7 +4267,8 @@ bool Sys_var_gtid_mode::global_update(THD *thd, set_var *var) {
   // WAIT_UNTIL_SQL_THREAD_AFTER_GTIDS.
   DBUG_PRINT("info",
              ("gtid_wait_count=%d", gtid_state->get_gtid_wait_count() > 0));
-  if (new_gtid_mode == GTID_MODE_OFF && gtid_state->get_gtid_wait_count() > 0) {
+  if (new_gtid_mode == Gtid_mode::OFF &&
+      gtid_state->get_gtid_wait_count() > 0) {
     my_error(ER_CANT_SET_GTID_MODE, MYF(0), "OFF",
              "there are ongoing calls to "
              "WAIT_FOR_EXECUTED_GTID_SET or "
@@ -4152,13 +4281,14 @@ bool Sys_var_gtid_mode::global_update(THD *thd, set_var *var) {
 
   // Update the mode
   global_var(ulong) = new_gtid_mode;
-  gtid_mode_counter++;
+  global_gtid_mode.set(new_gtid_mode);
   global_sid_lock->unlock();
   lock_count = 3;
 
   // Generate note in log
-  LogErr(SYSTEM_LEVEL, ER_CHANGED_GTID_MODE, gtid_mode_names[old_gtid_mode],
-         gtid_mode_names[new_gtid_mode]);
+  LogErr(SYSTEM_LEVEL, ER_CHANGED_GTID_MODE,
+         Gtid_mode::to_string(old_gtid_mode),
+         Gtid_mode::to_string(new_gtid_mode));
 
   // Rotate
   {
@@ -4177,7 +4307,7 @@ err:
   if (lock_count == 4) global_sid_lock->unlock();
   mysql_mutex_unlock(mysql_bin_log.get_log_lock());
   channel_map.unlock();
-  gtid_mode_lock->unlock();
+  Gtid_mode::lock.unlock();
   return ret;
 }
 
@@ -4196,7 +4326,7 @@ bool Sys_var_enforce_gtid_consistency::global_update(THD *thd, set_var *var) {
   enum_gtid_consistency_mode new_mode =
       (enum_gtid_consistency_mode)var->save_result.ulonglong_value;
   enum_gtid_consistency_mode old_mode = get_gtid_consistency_mode();
-  enum_gtid_mode gtid_mode = get_gtid_mode(GTID_MODE_LOCK_SID);
+  auto gtid_mode = global_gtid_mode.get();
 
   DBUG_ASSERT(new_mode <= GTID_CONSISTENCY_MODE_WARN);
 
@@ -4208,7 +4338,7 @@ bool Sys_var_enforce_gtid_consistency::global_update(THD *thd, set_var *var) {
   if (new_mode == old_mode) goto end;
 
   // Can't turn off GTID-consistency when GTID_MODE=ON.
-  if (new_mode != GTID_CONSISTENCY_MODE_ON && gtid_mode == GTID_MODE_ON) {
+  if (new_mode != GTID_CONSISTENCY_MODE_ON && gtid_mode == Gtid_mode::ON) {
     my_error(ER_GTID_MODE_ON_REQUIRES_ENFORCE_GTID_CONSISTENCY_ON, MYF(0));
     goto err;
   }
@@ -5397,8 +5527,7 @@ static Sys_var_have Sys_have_geometry(
     READ_ONLY NON_PERSIST GLOBAL_VAR(have_geometry), NO_CMD_LINE);
 
 static SHOW_COMP_OPTION have_ssl_func(THD *thd MY_ATTRIBUTE((unused))) {
-  return SslAcceptorContext::have_ssl() ? SHOW_OPTION_YES
-                                        : SHOW_OPTION_DISABLED;
+  return have_ssl() ? SHOW_OPTION_YES : SHOW_OPTION_DISABLED;
 }
 
 enum SHOW_COMP_OPTION Sys_var_have_func::dummy_;
@@ -5679,11 +5808,11 @@ static Sys_var_uint Sys_slave_net_timeout(
 static bool check_slave_skip_counter(sys_var *, THD *, set_var *) {
   /*
     @todo: move this check into the set function and hold the lock on
-    gtid_mode_lock until the operation has completed, so that we are
+    Gtid_mode::lock until the operation has completed, so that we are
     sure a concurrent connection does not change gtid_mode between
     check and fix.
   */
-  if (get_gtid_mode(GTID_MODE_LOCK_NONE) == GTID_MODE_ON) {
+  if (global_gtid_mode.get() == Gtid_mode::ON) {
     my_error(ER_SQL_SLAVE_SKIP_COUNTER_NOT_SETTABLE_IN_GTID_MODE, MYF(0));
     return true;
   }
@@ -5979,11 +6108,11 @@ static bool check_gtid_next_list(sys_var *self, THD *thd, set_var *var) {
     return true;
   /*
     @todo: move this check into the set function and hold the lock on
-    gtid_mode_lock until the operation has completed, so that we are
+    Gtid_mode::lock until the operation has completed, so that we are
     sure a concurrent connection does not change gtid_mode between
     check and fix - if we ever implement this variable.
   */
-  if (get_gtid_mode(GTID_MODE_LOCK_NONE) == GTID_MODE_OFF &&
+  if (global_gtid_mode.get() == Gtid_mode::OFF &&
       var->save_result.string_value.str != NULL)
     my_error(ER_CANT_SET_GTID_NEXT_LIST_TO_NON_NULL_WHEN_GTID_MODE_IS_OFF,
              MYF(0));
@@ -6034,8 +6163,7 @@ static bool check_gtid_purged(sys_var *self, THD *thd, set_var *var) {
     return true;
   }
 
-  if (!var->value ||
-      check_session_admin_outside_trx_outside_sf_outside_sp(self, thd, var))
+  if (!var->value || check_session_admin_outside_trx_outside_sf(self, thd, var))
     return true;
 
   if (var->value->result_type() != STRING_RESULT ||
@@ -6129,8 +6257,9 @@ static Sys_var_gtid_mode Sys_gtid_mode(
     "ON_PERMISSIVE, then wait for all transactions without a GTID to "
     "be replicated and executed on all servers, and finally set all "
     "servers to GTID_MODE = ON.",
-    PERSIST_AS_READONLY GLOBAL_VAR(_gtid_mode), CMD_LINE(REQUIRED_ARG),
-    gtid_mode_names, DEFAULT(DEFAULT_GTID_MODE), NO_MUTEX_GUARD, NOT_IN_BINLOG,
+    PERSIST_AS_READONLY GLOBAL_VAR(Gtid_mode::sysvar_mode),
+    CMD_LINE(REQUIRED_ARG), Gtid_mode::names, DEFAULT(Gtid_mode::DEFAULT),
+    NO_MUTEX_GUARD, NOT_IN_BINLOG,
     ON_CHECK(check_session_admin_outside_trx_outside_sf_outside_sp));
 
 static Sys_var_uint Sys_gtid_executed_compression_period(

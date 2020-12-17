@@ -1,6 +1,6 @@
 /*****************************************************************************
 
-Copyright (c) 1995, 2019, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 1995, 2020, Oracle and/or its affiliates. All Rights Reserved.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License, version 2.0, as published by the
@@ -97,7 +97,7 @@ static bool buf_lru_switched_on_innodb_mon = false;
  the regular LRU, we will evict the entire block (i.e.: both the
  uncompressed and compressed data), which must be clean. */
 
-/* @{ */
+/** @{ */
 
 /** Number of intervals for which we keep the history of these stats.
 Each interval is 1 second, defined by the rate at which
@@ -123,13 +123,14 @@ buf_LRU_stat_t buf_LRU_stat_cur;
 Updated by buf_LRU_stat_update().  Not Protected by any mutex. */
 buf_LRU_stat_t buf_LRU_stat_sum;
 
-/* @} */
+/** @} */
 
-/** @name Heuristics for detecting index scan @{ */
+/** @name Heuristics for detecting index scan
+@{ */
 /** Move blocks to "new" LRU list only if the first access was at
 least this many milliseconds ago.  Not protected by any mutex or latch. */
 uint buf_LRU_old_threshold_ms;
-/* @} */
+/** @} */
 
 /** Takes a block out of the LRU list and page hash table.
 If the block is compressed-only (BUF_BLOCK_ZIP_PAGE),
@@ -863,35 +864,24 @@ static void buf_LRU_remove_pages(
         os_aio_wait_until_no_pending_writes();
         fil_flush(id);
       }
+      break;
 
+    case BUF_REMOVE_NONE:
+      ut_error;
       break;
   }
 }
 
-/** Flushes all dirty pages or removes all pages belonging
- to a given tablespace. A PROBLEM: if readahead is being started, what
- guarantees that it will not try to read in pages after this operation
- has completed? */
-void buf_LRU_flush_or_remove_pages(
-    space_id_t id,           /*!< in: space id */
-    buf_remove_t buf_remove, /*!< in: remove or flush strategy */
-    const trx_t *trx,        /*!< to check if the operation must
-                             be interrupted */
-    bool strict)             /*!< in: true if no page from tablespace
-                             can be in buffer pool just after flush */
-{
-  ulint i;
-
+void buf_LRU_flush_or_remove_pages(space_id_t id, buf_remove_t buf_remove,
+                                   const trx_t *trx, bool strict) {
   /* Before we attempt to drop pages one by one we first
   attempt to drop page hash index entries in batches to make
   it more efficient. The batching attempt is a best effort
   attempt and does not guarantee that all pages hash entries
   will be dropped. We get rid of remaining page hash entries
   one by one below. */
-  for (i = 0; i < srv_buf_pool_instances; i++) {
-    buf_pool_t *buf_pool;
-
-    buf_pool = buf_pool_from_array(i);
+  for (ulint i = 0; i < srv_buf_pool_instances; i++) {
+    auto buf_pool = buf_pool_from_array(i);
 
     switch (buf_remove) {
       case BUF_REMOVE_ALL_NO_WRITE:
@@ -906,6 +896,10 @@ void buf_LRU_flush_or_remove_pages(
       case BUF_REMOVE_FLUSH_WRITE:
         /* We allow read-only queries against the
         table, there is no need to drop the AHI entries. */
+        break;
+
+      case BUF_REMOVE_NONE:
+        ut_error;
         break;
     }
 
@@ -1449,10 +1443,10 @@ static void buf_unzip_LRU_remove_block_if_needed(buf_page_t *bpage) {
   }
 }
 
-/** Adjust LRU hazard pointers if needed. */
-void buf_LRU_adjust_hp(buf_pool_t *buf_pool,    /*!< in: buffer pool instance */
-                       const buf_page_t *bpage) /*!< in: control block */
-{
+/** Adjust LRU hazard pointers if needed.
+@param[in] buf_pool Buffer pool instance
+@param[in] bpage Control block */
+void buf_LRU_adjust_hp(buf_pool_t *buf_pool, const buf_page_t *bpage) {
   buf_pool->lru_hp.adjust(bpage);
   buf_pool->lru_scan_itr.adjust(bpage);
   buf_pool->single_scan_itr.adjust(bpage);
@@ -1643,10 +1637,21 @@ void buf_LRU_make_block_young(buf_page_t *bpage) {
   buf_LRU_add_block_low(bpage, FALSE);
 }
 
+/** Moves a block to the end of the LRU list.
+@param[in]	bpage	control block */
+void buf_LRU_make_block_old(buf_page_t *bpage) {
+  ut_d(buf_pool_t *buf_pool =) buf_pool_from_bpage(bpage);
+
+  ut_ad(mutex_own(&buf_pool->LRU_list_mutex));
+
+  buf_LRU_remove_block(bpage);
+  buf_LRU_add_block_low(bpage, TRUE);
+}
+
 /** Try to free a block.  If bpage is a descriptor of a compressed-only
 page, the descriptor object will be freed as well.
 NOTE: this function may temporarily release and relock the
-buf_page_get_get_mutex(). Furthermore, the page frame will no longer be
+buf_page_get_mutex(). Furthermore, the page frame will no longer be
 accessible via bpage. If this function returns true, it will also release
 the LRU list mutex.
 The caller must hold the LRU list and buf_page_get_mutex() mutexes.

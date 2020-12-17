@@ -1,4 +1,4 @@
-/* Copyright (c) 2006, 2019, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2006, 2020, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -25,6 +25,7 @@
 #include <string.h>
 #include <iterator>
 #include <new>
+#include <regex>
 #include <utility>
 
 #include "lex_string.h"
@@ -346,12 +347,14 @@ static bool can_convert_field_to(Field *field, enum_field_types source_type,
       The length comparison check will do the correct job of comparing
       the field lengths (in bytes) of two integer types.
     */
+    case MYSQL_TYPE_BOOL:
     case MYSQL_TYPE_TINY:
     case MYSQL_TYPE_SHORT:
     case MYSQL_TYPE_INT24:
     case MYSQL_TYPE_LONG:
     case MYSQL_TYPE_LONGLONG:
       switch (field->real_type()) {
+        case MYSQL_TYPE_BOOL:
         case MYSQL_TYPE_TINY:
         case MYSQL_TYPE_SHORT:
         case MYSQL_TYPE_INT24:
@@ -417,13 +420,14 @@ static bool can_convert_field_to(Field *field, enum_field_types source_type,
     case MYSQL_TYPE_DATETIME:
     case MYSQL_TYPE_YEAR:
     case MYSQL_TYPE_NEWDATE:
-    case MYSQL_TYPE_NULL:
     case MYSQL_TYPE_ENUM:
     case MYSQL_TYPE_SET:
     case MYSQL_TYPE_TIMESTAMP2:
     case MYSQL_TYPE_DATETIME2:
     case MYSQL_TYPE_TIME2:
     case MYSQL_TYPE_TYPED_ARRAY:
+    case MYSQL_TYPE_NULL:
+    case MYSQL_TYPE_INVALID:
       return false;
   }
   return false;  // To keep GCC happy
@@ -1088,14 +1092,14 @@ uint Hash_slave_rows::make_hash_key(TABLE *table, MY_BITMAP *cols) {
     DBUG_PRINT("debug", ("make_hash_entry: hash after null_flags: %u", crc));
   }
 
-  for (Field **ptr = table->field; *ptr && ((*ptr)->field_index < cols->n_bits);
-       ptr++) {
+  for (Field **ptr = table->field;
+       *ptr && ((*ptr)->field_index() < cols->n_bits); ptr++) {
     Field *f = (*ptr);
 
     /*
       Field is set in the read_set and is isn't NULL.
      */
-    if (bitmap_is_set(cols, f->field_index) &&
+    if (bitmap_is_set(cols, f->field_index()) &&
         !f->is_virtual_gcol() &&  // Avoid virtual generated columns on hashes
         !f->is_null()) {
       /*
@@ -1116,7 +1120,7 @@ uint Hash_slave_rows::make_hash_key(TABLE *table, MY_BITMAP *cols) {
           break;
         }
         default:
-          crc = checksum_crc32(crc, f->ptr, f->data_length());
+          crc = checksum_crc32(crc, f->field_ptr(), f->data_length());
           break;
       }
 #ifndef DBUG_OFF
@@ -1251,6 +1255,33 @@ bool evaluate_command_row_only_restrictions(THD *thd) {
   }
 
   return false;
+}
+
+void rename_fields_use_old_replica_source_terms(
+    THD *thd, mem_root_deque<Item *> &field_list) {
+  static const std::regex replica(
+      "(.*)(Replica_)(.*)",
+      std::regex_constants::icase | std::regex_constants::optimize);
+  static const std::regex master(
+      "(.*)(Source)(.*)",
+      std::regex_constants::icase | std::regex_constants::optimize);
+
+  for (auto &item : field_list) {
+    std::string name{item->full_name()};
+    name = std::regex_replace(name, replica, "$1Slave_$3");
+    name = std::regex_replace(name, master, "$1Master$3");
+
+    // fix for the fact that one of the fields had a field starting
+    // with a lower case character :/
+    if (name.compare("Get_Master_public_key") == 0)
+      name = "Get_master_public_key";
+
+    if (name.compare("Master_Id") == 0) name = "Master_id";
+
+    if (name.compare("Server_Id") == 0) name = "Server_id";
+
+    item->rename(thd->mem_strdup(name.c_str()));
+  }
 }
 
 #endif  // MYSQL_SERVER

@@ -30,7 +30,6 @@
 #include "my_io.h"
 #include "plugin/group_replication/include/autorejoin.h"
 #include "plugin/group_replication/include/consistency_manager.h"
-#include "plugin/group_replication/include/hold_transactions.h"
 #include "plugin/group_replication/include/mysql_version_gcs_protocol_map.h"
 #include "plugin/group_replication/include/observer_server_actions.h"
 #include "plugin/group_replication/include/observer_server_state.h"
@@ -38,6 +37,7 @@
 #include "plugin/group_replication/include/pipeline_stats.h"
 #include "plugin/group_replication/include/plugin.h"
 #include "plugin/group_replication/include/plugin_variables.h"
+#include "plugin/group_replication/include/plugin_variables/recovery_endpoints.h"
 #include "plugin/group_replication/include/services/message_service/message_service.h"
 #include "plugin/group_replication/include/sql_service/sql_service_interface.h"
 #include "plugin/group_replication/include/udf/udf_registration.h"
@@ -108,14 +108,14 @@ Blocked_transaction_handler *blocked_transaction_handler = nullptr;
 Group_action_coordinator *group_action_coordinator = nullptr;
 /** The primary election handler */
 Primary_election_handler *primary_election_handler = nullptr;
-/** Hold transaction mechanism */
-Hold_transactions *hold_transactions = nullptr;
 /** The thread that handles the auto-rejoin process */
 Autorejoin_thread *autorejoin_module = nullptr;
 /** The handler to invoke clone */
 Remote_clone_handler *remote_clone_handler = nullptr;
 /** The thread that handles the message service process */
 Message_service_handler *message_service_handler = nullptr;
+/** Handle validation of advertised recovery endpoints */
+Advertised_recovery_endpoints *advertised_recovery_endpoints = nullptr;
 
 Plugin_gcs_events_handler *events_handler = nullptr;
 Plugin_gcs_view_modification_notifier *view_change_notifier = nullptr;
@@ -126,6 +126,10 @@ Group_member_info *local_member_info = nullptr;
 
 /*Compatibility management*/
 Compatibility_module *compatibility_mgr = nullptr;
+
+/* Runtime error service */
+SERVICE_TYPE_NO_CONST(mysql_runtime_error) *mysql_runtime_error_service =
+    nullptr;
 
 /*
   Internal auxiliary functions signatures.
@@ -173,6 +177,34 @@ int terminate_recovery_module();
 void terminate_asynchronous_channels_observer();
 void set_auto_increment_handler_values();
 
+static void option_deprecation_warning(MYSQL_THD thd, const char *old_name,
+                                       const char *new_name) {
+  push_deprecated_warn(thd, old_name, new_name);
+}
+
+static void check_deprecated_variables() {
+  MYSQL_THD thd = lv.plugin_is_auto_starting_on_install ? nullptr : current_thd;
+  if (ov.ip_whitelist_var != nullptr &&
+      strcmp(ov.ip_whitelist_var, "AUTOMATIC")) {
+    option_deprecation_warning(thd, "group_replication_ip_whitelist",
+                               "group_replication_ip_allowlist");
+  }
+}
+
+static const char *get_ip_allowlist() {
+  std::string whitelist(ov.ip_whitelist_var);
+  std::string allowlist(ov.ip_allowlist_var);
+  std::transform(whitelist.begin(), whitelist.end(), whitelist.begin(),
+                 ::tolower);
+  std::transform(allowlist.begin(), allowlist.end(), allowlist.begin(),
+                 ::tolower);
+
+  return allowlist.compare("automatic")
+             ? ov.ip_allowlist_var  // ip_allowlist_var is set
+             : whitelist.compare("automatic")
+                   ? ov.ip_whitelist_var   // ip_whitelist_var is set
+                   : ov.ip_allowlist_var;  // both are not set
+}
 /*
   Auxiliary public functions.
 */
@@ -385,8 +417,16 @@ bool plugin_get_group_member_stats(
                                 applier_module, gcs_module, channel_name);
 }
 
-int plugin_group_replication_start(char **) {
+int plugin_group_replication_start(char **error_message) {
   DBUG_TRACE;
+
+  if (lv.plugin_is_being_uninstalled) {
+    std::string err_msg("Group Replication plugin is being uninstalled.");
+    *error_message =
+        (char *)my_malloc(PSI_NOT_INSTRUMENTED, err_msg.length() + 1, MYF(0));
+    strcpy(*error_message, err_msg.c_str());
+    return GROUP_REPLICATION_COMMAND_FAILURE;
+  }
 
   MUTEX_LOCK(lock, &lv.plugin_running_mutex);
   int error = 0;
@@ -467,6 +507,17 @@ int plugin_group_replication_start(char **) {
     goto err;
   }
 
+  if (advertised_recovery_endpoints->check(
+          ov.advertise_recovery_endpoints_var,
+          !server_engine_initialized()
+              ? Advertised_recovery_endpoints::enum_log_context::ON_BOOT
+              : Advertised_recovery_endpoints::enum_log_context::ON_START)) {
+    error = GROUP_REPLICATION_CONFIGURATION_ERROR;
+    goto err;
+  }
+
+  LogPluginErr(SYSTEM_LEVEL, ER_GRP_RPL_IS_STARTING);
+
   DBUG_EXECUTE_IF("register_gms_listener_example",
                   { register_listener_service_gr_example(); });
 
@@ -483,6 +534,8 @@ int plugin_group_replication_start(char **) {
     error = GROUP_REPLICATION_CONFIGURATION_ERROR; /* purecov: inspected */
     goto err;
   }
+
+  check_deprecated_variables();
 
   DBUG_ASSERT(transactions_latch->empty());
 
@@ -534,26 +587,6 @@ int initialize_plugin_and_join(
   // Avoid unnecessary operations
   bool enabled_super_read_only = false;
   bool read_only_mode = false, super_read_only_mode = false;
-
-  /*
-    When restarting after a clone we need to fix the channels since
-    their information is cloned but not any of the associated files.
-    The applier channel is purged of all info.
-    The recovery channel is reinitialized so only access credentials remain.
-  */
-  bool is_restart_after_clone = is_server_restarting_after_clone();
-  if (is_restart_after_clone) {
-    Replication_thread_api gr_channel("group_replication_applier");
-    gr_channel.purge_logs(false);
-
-    gr_channel.set_channel_name("group_replication_recovery");
-    gr_channel.purge_logs(false);
-    gr_channel.initialize_channel(const_cast<char *>("<NULL>"), 0, nullptr,
-                                  nullptr, false, nullptr, nullptr, nullptr,
-                                  nullptr, nullptr, nullptr, nullptr, false,
-                                  DEFAULT_THREAD_PRIORITY, 1, false, nullptr,
-                                  false, nullptr, 0, nullptr, nullptr);
-  }
 
   Sql_service_command_interface *sql_command_interface =
       new Sql_service_command_interface();
@@ -684,9 +717,8 @@ err:
     DBUG_ASSERT(transactions_latch->empty());
     // Inform the transaction observer that we won't apply any further backlog
     // (because we are erroring out).
-    hold_transactions->disable();
     if (primary_election_handler) {
-      primary_election_handler->unregister_transaction_observer();
+      primary_election_handler->notify_election_end();
       delete primary_election_handler;
       primary_election_handler = nullptr;
     }
@@ -704,8 +736,9 @@ int configure_group_member_manager() {
   char *uuid = nullptr;
   uint port = 0U;
   uint server_version = 0U;
+  uint admin_port = 0U;
 
-  get_server_parameters(&hostname, &port, &uuid, &server_version);
+  get_server_parameters(&hostname, &port, &uuid, &server_version, &admin_port);
 
   /*
     Ensure that group communication interfaces are initialized
@@ -762,7 +795,8 @@ int configure_group_member_manager() {
         local_member_plugin_version, ov.gtid_assignment_block_size_var,
         Group_member_info::MEMBER_ROLE_SECONDARY, ov.single_primary_mode_var,
         ov.enforce_update_everywhere_checks_var, ov.member_weight_var,
-        lv.gr_lower_case_table_names, lv.gr_default_table_encryption);
+        lv.gr_lower_case_table_names, lv.gr_default_table_encryption,
+        ov.advertise_recovery_endpoints_var);
   } else {
     local_member_info = new Group_member_info(
         hostname, port, uuid, lv.write_set_extraction_algorithm,
@@ -770,7 +804,8 @@ int configure_group_member_manager() {
         local_member_plugin_version, ov.gtid_assignment_block_size_var,
         Group_member_info::MEMBER_ROLE_SECONDARY, ov.single_primary_mode_var,
         ov.enforce_update_everywhere_checks_var, ov.member_weight_var,
-        lv.gr_lower_case_table_names, lv.gr_default_table_encryption);
+        lv.gr_lower_case_table_names, lv.gr_default_table_encryption,
+        ov.advertise_recovery_endpoints_var);
   }
 
 #ifndef DBUG_OFF
@@ -1012,7 +1047,7 @@ int plugin_group_replication_stop(char **error_message) {
 
   DBUG_EXECUTE_IF("group_replication_hold_stop_before_leave_the_group", {
     const char act[] =
-        "now signal signal.reached_stop_before_leave_the_group "
+        "now signal signal.stopping_before_leave_the_group "
         "wait_for signal.resume_stop_before_leave_the_group";
     DBUG_ASSERT(!debug_sync_set_action(current_thd, STRING_WITH_LEN(act)));
   });
@@ -1029,6 +1064,8 @@ int plugin_group_replication_stop(char **error_message) {
 
   int error = leave_group_and_terminate_plugin_modules(gr_modules::all_modules,
                                                        error_message);
+  /* Delete of credentials is safe now from recovery thread. */
+  Replication_thread_api::delete_credential("group_replication_recovery");
 
   lv.group_replication_running = false;
   lv.group_member_mgr_configured = false;
@@ -1037,7 +1074,7 @@ int plugin_group_replication_stop(char **error_message) {
                   { unregister_listener_service_gr_example(); });
 
   shared_plugin_stop_lock->release_write_lock();
-  LogPluginErr(INFORMATION_LEVEL, ER_GRP_RPL_IS_STOPPED);
+  LogPluginErr(SYSTEM_LEVEL, ER_GRP_RPL_IS_STOPPED);
 
   // Enable super_read_only.
   if (!lv.server_shutdown_status && !lv.plugin_is_being_uninstalled &&
@@ -1052,9 +1089,8 @@ int plugin_group_replication_stop(char **error_message) {
   }
 
   // plugin is stopping, resume hold connections
-  hold_transactions->disable();
   if (primary_election_handler) {
-    primary_election_handler->unregister_transaction_observer();
+    primary_election_handler->notify_election_end();
     delete primary_election_handler;
     primary_election_handler = nullptr;
   }
@@ -1453,7 +1489,7 @@ bool attempt_rejoin() {
   if ((state == Gcs_operations::NOW_LEAVING ||
        state == Gcs_operations::ALREADY_LEAVING) &&
       vc_notifier.wait_for_view_modification())
-    LogPluginErr(WARNING_LEVEL, ER_GRP_RPL_TIMEOUT_RECEIVED_VC_ON_REJOIN);
+    LogPluginErr(WARNING_LEVEL, ER_GRP_RPL_TIMEOUT_RECEIVED_VC_LEAVE_ON_REJOIN);
 
   gcs_module->remove_view_notifer(&vc_notifier);
   gcs_module->finalize();
@@ -1543,6 +1579,21 @@ bool attempt_rejoin() {
   }
 
 end:
+  if (ret) {
+    /*
+      Even when we do not belong to the group we invoke leave()
+      to prevent the following situation:
+      1) Server joins group;
+      2) Server leaves group before receiving the view on which
+      it joined the group.
+      If we do not leave preemptively, the server will only leave
+      the group when the communication layer failure detector
+      detects that it left.
+    */
+    gcs_module->leave(nullptr);
+    gcs_module->finalize();
+  }
+
   gcs_module->remove_view_notifer(view_change_notifier);
   return ret;
 }
@@ -1557,6 +1608,15 @@ int plugin_group_replication_init(MYSQL_PLUGIN plugin_info) {
   if (init_logging_service_for_plugin(&lv.reg_srv, &log_bi, &log_bs)) return 1;
 
   if (Charset_service::init(lv.reg_srv)) return 1;
+
+  // Initialize runtime error service.
+  my_h_service h_mysql_runtime_error_service = nullptr;
+  if (lv.reg_srv->acquire("mysql_runtime_error",
+                          &h_mysql_runtime_error_service))
+    return 1; /* purecov: inspected */
+  mysql_runtime_error_service =
+      reinterpret_cast<SERVICE_TYPE_NO_CONST(mysql_runtime_error) *>(
+          h_mysql_runtime_error_service);
 
 // Register all PSI keys at the time plugin init
 #ifdef HAVE_PSI_INTERFACE
@@ -1586,7 +1646,7 @@ int plugin_group_replication_init(MYSQL_PLUGIN plugin_info) {
   shared_plugin_stop_lock = new Shared_writelock(lv.plugin_stop_lock);
   transactions_latch = new Wait_ticket<my_thread_id>();
   transaction_consistency_manager = new Transaction_consistency_manager();
-  hold_transactions = new Hold_transactions();
+  advertised_recovery_endpoints = new Advertised_recovery_endpoints();
 
   lv.plugin_info_ptr = plugin_info;
 
@@ -1767,7 +1827,7 @@ int plugin_group_replication_deinit(void *p) {
   unregister_udfs();
   sql_service_interface_deinit();
 
-  if (hold_transactions) delete hold_transactions;
+  if (advertised_recovery_endpoints) delete advertised_recovery_endpoints;
   delete transaction_consistency_manager;
   transaction_consistency_manager = nullptr;
   delete transactions_latch;
@@ -1786,6 +1846,12 @@ int plugin_group_replication_deinit(void *p) {
   lv.online_wait_mutex = nullptr;
 
   lv.plugin_info_ptr = nullptr;
+
+  // Deinitialize runtime error service.
+  my_h_service h_mysql_runtime_error_service =
+      reinterpret_cast<my_h_service>(mysql_runtime_error_service);
+  lv.reg_srv->release(h_mysql_runtime_error_service);
+  mysql_runtime_error_service = nullptr;
 
   Charset_service::deinit(lv.reg_srv);
 
@@ -1932,7 +1998,10 @@ int build_gcs_parameters(Gcs_interface_parameters &gcs_module_parameters) {
   st_server_ssl_variables sv;
 
   sv.init();
-  get_server_ssl_parameters(&sv);
+  if (TLS_SOURCE_MYSQL_ADMIN == ov.tls_source_var)
+    get_server_admin_ssl_parameters(&sv);
+  else
+    get_server_main_ssl_parameters(&sv);
 
   gcs_module_parameters.add_parameter("group_name",
                                       std::string(ov.group_name_var));
@@ -2052,8 +2121,8 @@ int build_gcs_parameters(Gcs_interface_parameters &gcs_module_parameters) {
     LogPluginErr(INFORMATION_LEVEL, ER_GRP_RPL_SSL_DISABLED, ssl_mode.c_str());
   }
 
-  if (ov.ip_whitelist_var != nullptr) {
-    std::string v(ov.ip_whitelist_var);
+  if (ov.ip_whitelist_var != nullptr || ov.ip_allowlist_var != nullptr) {
+    std::string v(get_ip_allowlist());
     v.erase(std::remove(v.begin(), v.end(), ' '), v.end());
     std::transform(v.begin(), v.end(), v.begin(), ::tolower);
 
@@ -2061,8 +2130,8 @@ int build_gcs_parameters(Gcs_interface_parameters &gcs_module_parameters) {
     // then we need to pass it to the GCS, otherwise we
     // do nothing and let GCS scan for the proper IPs
     if (v.find("automatic") == std::string::npos) {
-      gcs_module_parameters.add_parameter("ip_whitelist",
-                                          std::string(ov.ip_whitelist_var));
+      gcs_module_parameters.add_parameter("ip_allowlist",
+                                          std::string(get_ip_allowlist()));
     }
   }
 
@@ -2100,7 +2169,7 @@ int configure_group_communication() {
       INFORMATION_LEVEL, ER_GRP_RPL_GRP_COMMUNICATION_INIT_WITH_CONF,
       ov.group_name_var, ov.local_address_var, ov.group_seeds_var,
       ov.bootstrap_group_var ? "true" : "false", ov.poll_spin_loops_var,
-      ov.compression_threshold_var, ov.ip_whitelist_var,
+      ov.compression_threshold_var, get_ip_allowlist(),
       ov.communication_debug_options_var, ov.member_expel_timeout_var,
       ov.communication_max_message_size_var, ov.message_cache_size_var);
 
@@ -2233,7 +2302,6 @@ SERVICE_TYPE(registry) * get_plugin_registry() { return lv.reg_srv; }
 
   It currently verifies:
   - Binlog enabled
-  - Binlog checksum mode
   - Binlog format
   - Gtid mode
   - LOG_SLAVE_UPDATES
@@ -2249,17 +2317,10 @@ static int check_if_server_properly_configured() {
   // Struct that holds startup and runtime requirements
   Trans_context_info startup_pre_reqs;
 
-  get_server_startup_prerequirements(startup_pre_reqs,
-                                     !lv.plugin_is_auto_starting_on_install);
+  get_server_startup_prerequirements(startup_pre_reqs);
 
   if (!startup_pre_reqs.binlog_enabled) {
     LogPluginErr(ERROR_LEVEL, ER_GRP_RPL_BINLOG_DISABLED);
-    return 1;
-  }
-
-  if (startup_pre_reqs.binlog_checksum_options !=
-      binary_log::BINLOG_CHECKSUM_ALG_OFF) {
-    LogPluginErr(ERROR_LEVEL, ER_GRP_RPL_BINLOG_CHECKSUM_SET);
     return 1;
   }
 
@@ -2268,7 +2329,7 @@ static int check_if_server_properly_configured() {
     return 1;
   }
 
-  if (startup_pre_reqs.gtid_mode != GTID_MODE_ON) {
+  if (startup_pre_reqs.gtid_mode != Gtid_mode::ON) {
     LogPluginErr(ERROR_LEVEL, ER_GRP_RPL_GTID_MODE_OFF);
     return 1;
   }
@@ -2363,7 +2424,9 @@ static int check_group_name_string(const char *str, bool is_var_update) {
     if (!is_var_update)
       LogPluginErr(ERROR_LEVEL, ER_GRP_RPL_GRP_NAME_OPTION_MANDATORY);
     else
-      my_message(ER_WRONG_VALUE_FOR_VAR, "The group name option is mandatory",
+      my_message(ER_WRONG_VALUE_FOR_VAR,
+                 "The group_replication_group_name "
+                 "option is mandatory",
                  MYF(0)); /* purecov: inspected */
     return 1;
   }
@@ -2374,7 +2437,8 @@ static int check_group_name_string(const char *str, bool is_var_update) {
       LogPluginErr(ERROR_LEVEL, ER_GRP_RPL_GRP_NAME_IS_TOO_LONG, str);
     else
       my_message(ER_WRONG_VALUE_FOR_VAR,
-                 "The group name is not a valid UUID, its length is too big",
+                 "The group_replication_group_name is not a valid UUID, its "
+                 "length is too big",
                  MYF(0));
     return 1;
   }
@@ -2383,7 +2447,9 @@ static int check_group_name_string(const char *str, bool is_var_update) {
     if (!is_var_update) {
       LogPluginErr(ERROR_LEVEL, ER_GRP_RPL_GRP_NAME_IS_NOT_VALID_UUID, str);
     } else
-      my_message(ER_WRONG_VALUE_FOR_VAR, "The group name is not a valid UUID",
+      my_message(ER_WRONG_VALUE_FOR_VAR,
+                 "The group_replication_group_name is "
+                 "not a valid UUID",
                  MYF(0));
     return 1;
   }
@@ -2402,10 +2468,10 @@ static int check_group_name(MYSQL_THD thd, SYS_VAR *, void *save,
 
   if (plugin_is_group_replication_running()) {
     mysql_mutex_unlock(&lv.plugin_running_mutex);
-    my_message(
-        ER_GROUP_REPLICATION_RUNNING,
-        "The group name cannot be changed when Group Replication is running",
-        MYF(0));
+    my_message(ER_GROUP_REPLICATION_RUNNING,
+               "The group_replication_group_name cannot be changed when Group "
+               "Replication is running",
+               MYF(0));
     return 1;
   }
 
@@ -2863,8 +2929,8 @@ static int check_auto_increment_increment(MYSQL_THD, SYS_VAR *, void *save,
   if (plugin_is_group_replication_running()) {
     mysql_mutex_unlock(&lv.plugin_running_mutex);
     my_message(ER_GROUP_REPLICATION_RUNNING,
-               "The group auto_increment_increment cannot be changed"
-               " when Group Replication is running",
+               "The group group_replication_auto_increment_increment cannot be"
+               " changed when Group Replication is running",
                MYF(0));
     return 1;
   }
@@ -2890,24 +2956,27 @@ static int check_auto_increment_increment(MYSQL_THD, SYS_VAR *, void *save,
 }
 
 // Communication layer options.
-
-static int check_ip_whitelist_preconditions(MYSQL_THD thd, SYS_VAR *,
+static int check_ip_allowlist_preconditions(MYSQL_THD thd, SYS_VAR *var,
                                             void *save,
                                             struct st_mysql_value *value) {
   DBUG_TRACE;
-
-  char buff[IP_WHITELIST_STR_BUFFER_LENGTH];
+  char buff[IP_ALLOWLIST_STR_BUFFER_LENGTH];
   const char *str;
   int length = sizeof(buff);
+  if (!strcmp(var->name, "group_replication_ip_whitelist")) {
+    option_deprecation_warning(thd, "group_replication_ip_whitelist",
+                               "group_replication_ip_allowlist");
+  }
 
   if (plugin_running_mutex_trylock()) return 1;
 
   if (plugin_is_group_replication_running()) {
     mysql_mutex_unlock(&lv.plugin_running_mutex);
-    my_message(ER_GROUP_REPLICATION_RUNNING,
-               "The IP whitelist cannot be set while Group Replication "
-               "is running",
-               MYF(0));
+    std::string msg;
+    msg.append("The ");
+    msg.append(var->name);
+    msg.append(" cannot be set while Group Replication is running");
+    my_message(ER_GROUP_REPLICATION_RUNNING, msg.c_str(), MYF(0));
     return 1;
   }
 
@@ -2927,11 +2996,13 @@ static int check_ip_whitelist_preconditions(MYSQL_THD thd, SYS_VAR *,
   std::transform(v.begin(), v.end(), v.begin(), ::tolower);
   if (v.find("automatic") != std::string::npos && v.size() != 9) {
     mysql_mutex_unlock(&lv.plugin_running_mutex);
-    my_message(ER_GROUP_REPLICATION_CONFIGURATION,
-               "The IP whitelist is invalid. Make sure that AUTOMATIC "
-               "when specifying \"AUTOMATIC\" the list contains no "
-               "other values.",
-               MYF(0));
+    std::string msg;
+    msg.append("The ");
+    msg.append(var->name);
+    msg.append(
+        " is invalid. Make sure that when specifying \"AUTOMATIC\" the list "
+        "contains no other values.");
+    my_message(ER_GROUP_REPLICATION_CONFIGURATION, msg.c_str(), MYF(0));
     return 1;
   }
 
@@ -2952,10 +3023,11 @@ static int check_compression_threshold(MYSQL_THD, SYS_VAR *, void *save,
 
   if (plugin_is_group_replication_running()) {
     mysql_mutex_unlock(&lv.plugin_running_mutex);
-    my_message(ER_GROUP_REPLICATION_RUNNING,
-               "The compression threshold cannot be set while "
-               "Group Replication is running",
-               MYF(0));
+    my_message(
+        ER_GROUP_REPLICATION_RUNNING,
+        "The group_replication_compression_threshold cannot be set while "
+        "Group Replication is running",
+        MYF(0));
     return 1;
   }
 
@@ -2964,7 +3036,8 @@ static int check_compression_threshold(MYSQL_THD, SYS_VAR *, void *save,
     std::stringstream ss;
     ss << "The value " << in_val
        << " is not within the range of "
-          "accepted values for the option compression_threshold!";
+          "accepted values for the option "
+          "group_replication_compression_threshold!";
     my_message(ER_WRONG_VALUE_FOR_VAR, ss.str().c_str(), MYF(0));
     return 1;
   }
@@ -2989,8 +3062,8 @@ static int check_communication_max_message_size(MYSQL_THD, SYS_VAR *,
     mysql_mutex_unlock(&lv.plugin_running_mutex);
     my_message(
         ER_GROUP_REPLICATION_RUNNING,
-        "The communication_max_message_size option cannot be set while Group "
-        "Replication is running",
+        "The group_replication_communication_max_message_size option cannot be "
+        "set while Group Replication is running",
         MYF(0));
     return 1;
   }
@@ -3001,8 +3074,8 @@ static int check_communication_max_message_size(MYSQL_THD, SYS_VAR *,
     std::stringstream ss;
     ss << "The value " << in_val
        << " is not within the range of accepted values for the "
-          "communication_max_message_size option. Use 0 to disable message "
-          "fragmentation, or specify a value up to "
+          "group_replication_communication_max_message_size option. Use 0 to "
+          "disable message fragmentation, or specify a value up to "
        << MAX_COMMUNICATION_MAX_MESSAGE_SIZE << ".";
     my_message(ER_WRONG_VALUE_FOR_VAR, ss.str().c_str(), MYF(0));
     return 1;
@@ -3082,10 +3155,11 @@ static int check_gtid_assignment_block_size(MYSQL_THD, SYS_VAR *, void *save,
   value->val_int(value, &in_val);
 
   if (plugin_is_group_replication_running()) {
-    my_message(ER_GROUP_REPLICATION_RUNNING,
-               "The GTID assignment block size cannot be set while "
-               "Group Replication is running",
-               MYF(0));
+    my_message(
+        ER_GROUP_REPLICATION_RUNNING,
+        "The group_replication_gtid_assignment_block size cannot be set while "
+        "Group Replication is running",
+        MYF(0));
     return 1;
   }
 
@@ -3093,9 +3167,9 @@ static int check_gtid_assignment_block_size(MYSQL_THD, SYS_VAR *, void *save,
       in_val < MIN_GTID_ASSIGNMENT_BLOCK_SIZE) {
     std::stringstream ss;
     ss << "The value " << in_val
-       << " is not within the range of "
-          "accepted values for the option gtid_assignment_block_size. "
-          "The value must be between "
+       << " is not within the range of accepted values for the option "
+          "group_replication_gtid_assignment_block_size.The value must be "
+          "between "
        << MIN_GTID_ASSIGNMENT_BLOCK_SIZE << " and "
        << MAX_GTID_ASSIGNMENT_BLOCK_SIZE << " inclusive.";
     my_message(ER_WRONG_VALUE_FOR_VAR, ss.str().c_str(), MYF(0));
@@ -3170,8 +3244,8 @@ static int check_single_primary_mode(MYSQL_THD, SYS_VAR *, void *save,
     mysql_mutex_unlock(&lv.plugin_running_mutex);
     my_message(
         ER_GROUP_REPLICATION_RUNNING,
-        "Cannot modify group replication mode by changing system variable. "
-        "Please use the "
+        "Cannot modify group replication mode by changing "
+        "group_replication_single_primary_mode system variable. Please use the "
         "group_replication_switch_to_single_primary_mode([member_uuid]) OR "
         "group_replication_switch_to_multi_primary_mode() UDF.",
         MYF(0));
@@ -3181,8 +3255,9 @@ static int check_single_primary_mode(MYSQL_THD, SYS_VAR *, void *save,
   if (single_primary_mode_val && ov.enforce_update_everywhere_checks_var) {
     mysql_mutex_unlock(&lv.plugin_running_mutex);
     my_message(ER_WRONG_VALUE_FOR_VAR,
-               "Cannot turn ON single_primary_mode while "
-               "enforce_update_everywhere_checks is enabled.",
+               "Cannot turn ON group_replication_single_primary_mode while "
+               "group_replication_enforce_update_everywhere_checks is "
+               "enabled.",
                MYF(0));
     return 1;
   }
@@ -3207,7 +3282,8 @@ static int check_enforce_update_everywhere_checks(
   if (plugin_is_group_replication_running()) {
     mysql_mutex_unlock(&lv.plugin_running_mutex);
     my_message(ER_GROUP_REPLICATION_RUNNING,
-               "Cannot turn ON/OFF update everywhere checks mode while "
+               "Cannot turn ON/OFF "
+               "group_replication_enforce_update_everywhere_checks mode while "
                "Group Replication is running.",
                MYF(0));
     return 1;
@@ -3216,8 +3292,9 @@ static int check_enforce_update_everywhere_checks(
   if (ov.single_primary_mode_var && enforce_update_everywhere_checks_val) {
     mysql_mutex_unlock(&lv.plugin_running_mutex);
     my_message(ER_WRONG_VALUE_FOR_VAR,
-               "Cannot enable enforce_update_everywhere_checks while "
-               "single_primary_mode is enabled.",
+               "Cannot enable "
+               "group_replication_enforce_update_everywhere_checks while "
+               "group_replication_single_primary_mode is enabled.",
                MYF(0));
     return 1;
   }
@@ -3352,7 +3429,7 @@ static void update_member_expel_timeout(MYSQL_THD, SYS_VAR *, void *var_ptr,
   member_expel_timeout_stream_buffer << in_val;
   gcs_module_parameters.add_parameter("member_expel_timeout",
                                       member_expel_timeout_stream_buffer.str());
-  gcs_module_parameters.add_parameter("reconfigure_ip_whitelist", "false");
+  gcs_module_parameters.add_parameter("reconfigure_ip_allowlist", "false");
 
   if (gcs_module != nullptr) {
     gcs_module->reconfigure(gcs_module_parameters);
@@ -3968,8 +4045,8 @@ static MYSQL_SYSVAR_ULONG(
     ov.auto_increment_increment_var, /* var */
     PLUGIN_VAR_OPCMDARG | PLUGIN_VAR_NODEFAULT |
         PLUGIN_VAR_PERSIST_AS_READ_ONLY, /* optional var | no set default */
-    "The group replication auto_increment_increment determines interval "
-    "between successive column values",
+    "The group replication group_replication_auto_increment_increment "
+    "determines interval between successive column values",
     check_auto_increment_increment,   /* check func. */
     nullptr,                          /* update by update_func_long func. */
     DEFAULT_AUTO_INCREMENT_INCREMENT, /* default */
@@ -4049,10 +4126,31 @@ static MYSQL_SYSVAR_STR(
     "also set as input the value 'AUTOMATIC', in which case "
     "active interfaces on the host will be scanned and "
     "those with addresses on private subnetworks will be "
-    "automatically added to the IP whitelist. The address "
+    "automatically added to the IP allowlist. The address "
     "127.0.0.1 is always added if not specified explicitly "
-    "in the whitelist. Default: 'AUTOMATIC'.",
-    check_ip_whitelist_preconditions, /* check func*/
+    "in the allowlist. Default: 'AUTOMATIC'.",
+    check_ip_allowlist_preconditions, /* check func*/
+    nullptr,                          /* update func*/
+    "AUTOMATIC");                     /* default*/
+
+static MYSQL_SYSVAR_STR(
+    ip_allowlist,        /* name */
+    ov.ip_allowlist_var, /* var */
+    /* optional var | malloc string | no set default */
+    PLUGIN_VAR_OPCMDARG | PLUGIN_VAR_MEMALLOC | PLUGIN_VAR_NODEFAULT |
+        PLUGIN_VAR_PERSIST_AS_READ_ONLY,
+    "This option can be used to specify which members "
+    "are allowed to connect to this member. The input "
+    "takes the form of a comma separated list of IPv4 "
+    "addresses or subnet CIDR notation. For example: "
+    "192.168.1.0/24,10.0.0.1. In addition, the user can "
+    "also set as input the value 'AUTOMATIC', in which case "
+    "active interfaces on the host will be scanned and "
+    "those with addresses on private subnetworks will be "
+    "automatically added to the IP allowlist. The address "
+    "127.0.0.1 is always added if not specified explicitly "
+    "in the allowlist. Default: 'AUTOMATIC'.",
+    check_ip_allowlist_preconditions, /* check func*/
     nullptr,                          /* update func*/
     "AUTOMATIC");                     /* default*/
 
@@ -4165,7 +4263,7 @@ static MYSQL_SYSVAR_UINT(autorejoin_tries,        /* name */
                          "procedure.",
                          check_autorejoin_tries,  /* check func */
                          update_autorejoin_tries, /* update func */
-                         0U,                      /* default */
+                         3U,                      /* default */
                          0U,                      /* min */
                          lv.MAX_AUTOREJOIN_TRIES, /* max */
                          0);                      /* block */
@@ -4337,6 +4435,66 @@ static MYSQL_SYSVAR_UINT(
     0                                       /* block */
 );
 
+static int check_advertise_recovery_endpoints(MYSQL_THD thd, SYS_VAR *,
+                                              void *save,
+                                              struct st_mysql_value *value) {
+  DBUG_TRACE;
+
+  if (plugin_running_mutex_trylock()) return 1;
+
+  char buff[STRING_BUFFER_USUAL_SIZE];
+  const char *str = nullptr;
+
+  *static_cast<const char **>(save) = nullptr;
+
+  int length = sizeof(buff);
+  if ((str = value->val_str(value, buff, &length)))
+    str = thd->strmake(str, length);
+  else {
+    mysql_mutex_unlock(&lv.plugin_running_mutex); /* purecov: inspected */
+    return 1;                                     /* purecov: inspected */
+  }
+
+  if (str) {
+    if (advertised_recovery_endpoints->check(
+            str, Advertised_recovery_endpoints::enum_log_context::ON_SET)) {
+      mysql_mutex_unlock(&lv.plugin_running_mutex);
+      return 1;
+    }
+  }
+  if (local_member_info != nullptr) {
+    local_member_info->set_recovery_endpoints(str);
+  }
+  *static_cast<const char **>(save) = str;
+
+  mysql_mutex_unlock(&lv.plugin_running_mutex);
+  return 0;
+}
+
+static MYSQL_SYSVAR_STR(
+    advertise_recovery_endpoints,        /* name */
+    ov.advertise_recovery_endpoints_var, /* var */
+    PLUGIN_VAR_OPCMDARG | PLUGIN_VAR_MEMALLOC |
+        PLUGIN_VAR_PERSIST_AS_READ_ONLY, /* optional var | malloc string */
+    "Recovery list of endpoints for joiner connection",
+    check_advertise_recovery_endpoints, /* check func */
+    nullptr,                            /* update func */
+    "DEFAULT"                           /* default */
+);
+
+static MYSQL_SYSVAR_ENUM(
+    tls_source,                                            /* name */
+    ov.tls_source_var,                                     /* var */
+    PLUGIN_VAR_OPCMDARG | PLUGIN_VAR_PERSIST_AS_READ_ONLY, /* optional var */
+    "The source of TLS configuration of the connection between "
+    "Group Replication members. Possible values are MYSQL_MAIN "
+    "and MYSQL_ADMIN. Default: MYSQL_MAIN", /* values */
+    nullptr,                                /* check func. */
+    nullptr,                                /* update func. */
+    0,                                      /* default */
+    &ov.tls_source_values_typelib_t         /* type lib */
+);
+
 static SYS_VAR *group_replication_system_vars[] = {
     MYSQL_SYSVAR(group_name),
     MYSQL_SYSVAR(start_on_boot),
@@ -4369,6 +4527,7 @@ static SYS_VAR *group_replication_system_vars[] = {
     MYSQL_SYSVAR(gtid_assignment_block_size),
     MYSQL_SYSVAR(ssl_mode),
     MYSQL_SYSVAR(ip_whitelist),
+    MYSQL_SYSVAR(ip_allowlist),
     MYSQL_SYSVAR(single_primary_mode),
     MYSQL_SYSVAR(enforce_update_everywhere_checks),
     MYSQL_SYSVAR(flow_control_mode),
@@ -4392,6 +4551,8 @@ static SYS_VAR *group_replication_system_vars[] = {
     MYSQL_SYSVAR(clone_threshold),
     MYSQL_SYSVAR(recovery_tls_version),
     MYSQL_SYSVAR(recovery_tls_ciphersuites),
+    MYSQL_SYSVAR(advertise_recovery_endpoints),
+    MYSQL_SYSVAR(tls_source),
     nullptr,
 };
 

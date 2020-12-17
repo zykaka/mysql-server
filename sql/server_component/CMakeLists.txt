@@ -31,6 +31,9 @@ SET(MYSQL_SERVER_COMPONENT_SOURCES
   keyring_iterator_service_imp.cc
   log_builtins.cc
   log_builtins_filter.cc
+  log_sink_buffer.cc
+  log_sink_perfschema.cc
+  log_sink_trad.cc
   mysql_cond_service.cc
   mysql_connection_attributes_iterator_imp.cc
   mysql_current_thread_reader_imp.cc
@@ -48,6 +51,7 @@ SET(MYSQL_SERVER_COMPONENT_SOURCES
   server_component.cc
   system_variable_source_imp.cc
   udf_metadata_imp.cc
+  audit_api_connection_service_imp.cc
   )
 
 # This static library is used to build mysqld binary and in some unit test cases

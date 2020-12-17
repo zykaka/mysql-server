@@ -1,4 +1,4 @@
-/* Copyright (c) 2000, 2020, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2000, 2020, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -667,7 +667,7 @@ bool net_send_error(NET *net, uint sql_errno, const char *err) {
   @page page_protocol_basic_ok_packet OK_Packet
 
   An OK packet is sent from the server to the client to signal successful
-  completion of a command. As of MySQL 5.7.5, OK packes are also used to
+  completion of a command. As of MySQL 5.7.5, OK packets are also used to
   indicate EOF, and EOF packets are deprecated.
 
   if ::CLIENT_PROTOCOL_41 is set, the packet contains a warning count.
@@ -1360,8 +1360,8 @@ bool Protocol_classic::init_net(Vio *vio) {
   return my_net_init(&m_thd->net, vio);
 }
 
-void Protocol_classic::claim_memory_ownership() {
-  net_claim_memory_ownership(&m_thd->net);
+void Protocol_classic::claim_memory_ownership(bool claim) {
+  net_claim_memory_ownership(&m_thd->net, claim);
 }
 
 void Protocol_classic::end_net() {
@@ -2565,6 +2565,11 @@ int Protocol_classic::read_packet() {
 
   Fetches the requested amount of rows from
   a resultset produced by ::COM_STMT_EXECUTE
+*/
+MY_COMPILER_DIAGNOSTIC_PUSH()
+MY_COMPILER_CLANG_WORKAROUND_REF_DOCBUG()
+/**
+  @page page_protocol_com_stmt_fetch COM_STMT_FETCH
 
   @return @ref sect_protocol_com_stmt_fetch_response
   <table>
@@ -2581,11 +2586,16 @@ int Protocol_classic::read_packet() {
       <td>max number of rows to return</td></tr>
   </table>
 
-  @sa ::mysqld_stmt_fetch, ::mysql_stmt_fetch
+  @sa @ref mysqld_stmt_fetch
+  @sa @ref mysql_stmt_fetch
+*/
+MY_COMPILER_DIAGNOSTIC_POP()
+/**
+  @page page_protocol_com_stmt_fetch COM_STMT_FETCH
 
   @section sect_protocol_com_stmt_fetch_response COM_STMT_FETCH Response
 
-  ::COM_STMT_FETCH may return one of:
+  @ref COM_STMT_FETCH may return one of:
     - @ref sect_protocol_command_phase_sp_multi_resultset
     - @ref page_protocol_basic_err_packet
 */
@@ -2697,10 +2707,16 @@ bool Protocol_classic::parse_packet(union COM_DATA *data,
           continue;
         }
         enum enum_field_types type =
-            has_new_types ? params[i].type : stmt->param_array[i]->data_type();
-        if (stmt->param_array[i]->state == Item_param::LONG_DATA_VALUE) {
+            has_new_types ? params[i].type
+                          : stmt->param_array[i]->data_type_actual();
+        if (type == MYSQL_TYPE_BOOL)
+          goto malformed;  // unsupported in this version of the Server
+        if (stmt->param_array[i]->param_state() ==
+            Item_param::LONG_DATA_VALUE) {
           DBUG_PRINT("info", ("long data"));
-          if (!((type >= MYSQL_TYPE_TINY_BLOB) && (type <= MYSQL_TYPE_STRING)))
+          if (!(type >= MYSQL_TYPE_TINY_BLOB && type <= MYSQL_TYPE_STRING))
+            goto malformed;
+          if (type == MYSQL_TYPE_BOOL || type == MYSQL_TYPE_INVALID)
             goto malformed;
           data->com_stmt_execute.parameter_count++;
 
@@ -3087,6 +3103,8 @@ bool Protocol_classic::send_field_metadata(Send_field *field,
   char *pos;
   const CHARSET_INFO *cs = system_charset_info;
   const CHARSET_INFO *thd_charset = m_thd->variables.character_set_results;
+
+  DBUG_ASSERT(field->type != MYSQL_TYPE_BOOL);
 
   /* Keep things compatible for old clients */
   if (field->type == MYSQL_TYPE_VARCHAR) field->type = MYSQL_TYPE_VAR_STRING;
@@ -3481,18 +3499,17 @@ bool Protocol_binary::send_parameters(List<Item_param> *parameters,
     // The client does not support OUT-parameters.
     return false;
 
-  List<Item> out_param_lst;
+  mem_root_deque<Item *> out_param_lst(current_thd->mem_root);
   Item_param *item_param;
   while ((item_param = item_param_it++)) {
     // Skip it as it's just an IN-parameter.
     if (!item_param->get_out_param_info()) continue;
 
-    if (out_param_lst.push_back(item_param))
-      return true; /* purecov: inspected */
+    out_param_lst.push_back(item_param);
   }
 
   // Empty list
-  if (!out_param_lst.elements) return false;
+  if (out_param_lst.empty()) return false;
 
   /*
     We have to set SERVER_PS_OUT_PARAMS in THD::server_status, because it
@@ -3501,13 +3518,13 @@ bool Protocol_binary::send_parameters(List<Item_param> *parameters,
   m_thd->server_status |= SERVER_PS_OUT_PARAMS | SERVER_MORE_RESULTS_EXISTS;
 
   // Send meta-data.
-  if (m_thd->send_result_metadata(&out_param_lst,
+  if (m_thd->send_result_metadata(out_param_lst,
                                   Protocol::SEND_NUM_ROWS | Protocol::SEND_EOF))
     return true;
 
   // Send data.
   start_row();
-  if (m_thd->send_result_set_row(&out_param_lst)) return true;
+  if (m_thd->send_result_set_row(out_param_lst)) return true;
   if (end_row()) return true;
 
   // Restore THD::server_status.
@@ -3550,7 +3567,7 @@ bool Protocol_text::send_parameters(List<Item_param> *parameters, bool) {
     if (!item_param->get_out_param_info()) continue;
 
     Item_func_set_user_var *suv =
-        new Item_func_set_user_var(*user_var_name, item_param, false);
+        new Item_func_set_user_var(*user_var_name, item_param);
     /*
       Item_func_set_user_var is not fixed after construction,
       call fix_fields().
@@ -3883,6 +3900,7 @@ static ulong get_ps_param_len(enum enum_field_types type, uchar *packet,
   *header_len = 0;
 
   switch (type) {
+    case MYSQL_TYPE_BOOL:
     case MYSQL_TYPE_TINY:
       *err = (packet_left_len < 1);
       return 1;

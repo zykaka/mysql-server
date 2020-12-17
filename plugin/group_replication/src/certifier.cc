@@ -1,4 +1,4 @@
-/* Copyright (c) 2014, 2019, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2014, 2020, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -800,7 +800,19 @@ rpl_gno Certifier::certify(Gtid_set *snapshot_version,
     Update parallel applier indexes.
   */
   if (!local_transaction) {
-    if (!has_write_set) {
+    /*
+      'CREATE TABLE ... AS SELECT' is considered a DML, though in reality it
+      is DDL + DML, which write-sets do not capture all dependencies.
+      It is flagged through gle->last_committed and gle->sequence_number so
+      that it is only executed on parallel applier after all precedent
+      transactions like any other DDL.
+    */
+    bool update_parallel_applier_last_committed_global = false;
+    if (0 == gle->last_committed && 0 == gle->sequence_number) {
+      update_parallel_applier_last_committed_global = true;
+    }
+
+    if (!has_write_set || update_parallel_applier_last_committed_global) {
       /*
         DDL does not have write-set, so we need to ensure that it
         is applied without any other transaction in parallel.
@@ -814,7 +826,8 @@ rpl_gno Certifier::certify(Gtid_set *snapshot_version,
     DBUG_ASSERT(gle->sequence_number > 0);
     DBUG_ASSERT(gle->last_committed < gle->sequence_number);
 
-    increment_parallel_applier_sequence_number(!has_write_set);
+    increment_parallel_applier_sequence_number(
+        !has_write_set || update_parallel_applier_last_committed_global);
   }
 
 end:
@@ -1049,6 +1062,16 @@ int Certifier::get_group_stable_transactions_set_string(char **buffer,
   DBUG_TRACE;
   int error = 1;
 
+  /*
+    Stable transactions set may not be accurate during recovery,
+    thence we do not externalize it on
+    performance_schema.replication_group_member_stats table.
+  */
+  if (local_member_info->get_recovery_status() ==
+      Group_member_info::MEMBER_IN_RECOVERY) {
+    return 0;
+  }
+
   char *m_buffer = nullptr;
   int m_length = stable_gtid_set->to_string(&m_buffer, true);
   if (m_length >= 0) {
@@ -1088,6 +1111,14 @@ bool Certifier::set_group_stable_transactions_set(Gtid_set *executed_gtid_set) {
 
 void Certifier::garbage_collect() {
   DBUG_TRACE;
+  /*
+    This debug option works together with
+    `group_replication_certifier_broadcast_thread_big_period`
+    by disabling the manual garbage collection that happens when
+    a View_log_change_event is logged.
+    Applier_module::apply_view_change_packet() does call
+    Certifier::set_group_stable_transactions_set().
+  */
   DBUG_EXECUTE_IF("group_replication_do_not_clear_certification_database",
                   { return; };);
 
@@ -1157,6 +1188,24 @@ int Certifier::handle_certifier_data(
 
   if (!is_initialized()) return 1; /* purecov: inspected */
 
+  /*
+    On members recovering through clone the GTID_EXECUTED is only
+    updated after the server restart that finishes the procedure.
+    During that procedure they will periodically send the GTID_EXECUTED
+    that the server had once joined the group. This will restrain the
+    common set of transactions applied on all members, which in consequence
+    will render the certification garbage collection void.
+    As such, we only consider ONLINE members for the common set of
+    transactions applied on all members.
+    When recovering members change to ONLINE state, their certification
+    info will be updated with the one of the donor at the join, being
+    garbage collect on the future calls of this method.
+  */
+  if (group_member_mgr->get_group_member_status_by_member_id(gcs_member_id) !=
+      Group_member_info::MEMBER_ONLINE) {
+    return 0;
+  }
+
   mysql_mutex_lock(&LOCK_members);
   std::string member_id = gcs_member_id.get_member_id();
 #if !defined(DBUG_OFF)
@@ -1169,7 +1218,9 @@ int Certifier::handle_certifier_data(
   }
 #endif
 
-  if (this->get_members_size() != plugin_get_group_members_number()) {
+  const size_t number_of_members_online =
+      group_member_mgr->get_number_of_members_online();
+  if (this->members.size() != number_of_members_online) {
     /*
       We check for the member_id of the current message if it is present in
       the member vector or not. If it is present, we will need to discard the
@@ -1194,11 +1245,11 @@ int Certifier::handle_certifier_data(
     mysql_mutex_unlock(&LOCK_members);
 
     /*
-      If the incoming message queue size is equal to the number of the
-      members in the group, we are sure that each member has sent their
-      gtid_executed. So we can go ahead with the stable set handling.
+      If the incoming message queue size is equal to the number of the ONLINE
+      members in the group, we are sure that each ONLINE member has sent
+      their gtid_executed. So we can go ahead with the stable set handling.
     */
-    if (plugin_get_group_members_number() == this->incoming->size()) {
+    if (this->incoming->size() == number_of_members_online) {
       int error = stable_set_handle();
       /*
         Clearing the members to proceed with the next round of garbage
@@ -1515,8 +1566,6 @@ void Certifier::get_last_conflict_free_transaction(std::string *value) {
 end:
   mysql_mutex_unlock(&LOCK_certification_info);
 }
-
-size_t Certifier::get_members_size() { return members.size(); }
 
 size_t Certifier::get_local_certified_gtid(
     std::string &local_gtid_certified_string) {

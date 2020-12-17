@@ -1,5 +1,5 @@
 /*
-  Copyright (c) 2018, 2020, Oracle and/or its affiliates. All rights reserved.
+  Copyright (c) 2018, 2020, Oracle and/or its affiliates.
 
   This program is free software; you can redistribute it and/or modify
   it under the terms of the GNU General Public License, version 2.0,
@@ -31,10 +31,6 @@
 #include <Windows.h>
 #include <cstdarg>
 
-using mysql_harness::AppInfo;
-using mysql_harness::ARCHITECTURE_DESCRIPTOR;
-using mysql_harness::Plugin;
-using mysql_harness::PLUGIN_ABI_VERSION;
 using mysql_harness::logging::LogLevel;
 using mysql_harness::logging::LogTimestampPrecision;
 
@@ -166,9 +162,9 @@ void EventlogHandler::do_log(
 }
 
 extern "C" {
-Plugin harness_plugin_eventlog = {
-    PLUGIN_ABI_VERSION,
-    ARCHITECTURE_DESCRIPTOR,
+mysql_harness::Plugin harness_plugin_eventlog = {
+    mysql_harness::PLUGIN_ABI_VERSION,
+    mysql_harness::ARCHITECTURE_DESCRIPTOR,
     "Logging using eventlog",
     VERSION_NUMBER(0, 0, 1),
     0,
@@ -179,5 +175,6 @@ Plugin harness_plugin_eventlog = {
     nullptr,  // deinit,
     nullptr,  // start,
     nullptr,  // stop
+    false,    // declares_readiness
 };
 }

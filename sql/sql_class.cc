@@ -1,5 +1,5 @@
 /*
-   Copyright (c) 2000, 2020, Oracle and/or its affiliates. All rights reserved.
+   Copyright (c) 2000, 2020, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -49,6 +49,8 @@
 #include "mysql/psi/mysql_ps.h"
 #include "mysql/psi/mysql_stage.h"
 #include "mysql/psi/mysql_statement.h"
+#include "mysql/psi/mysql_table.h"
+#include "mysql/psi/psi_table.h"
 #include "mysql/service_mysql_alloc.h"
 #include "mysys_err.h"  // EE_OUTOFMEMORY
 #include "pfs_statement_provider.h"
@@ -97,6 +99,7 @@
 #include "sql/sql_profile.h"
 #include "sql/sql_timer.h"  // thd_timer_destroy
 #include "sql/table.h"
+#include "sql/table_cache.h"  // table_cache_manager
 #include "sql/tc_log.h"
 #include "sql/thr_malloc.h"
 #include "sql/transaction.h"  // trans_rollback
@@ -116,10 +119,6 @@ using std::unique_ptr;
   table name
 */
 char empty_c_string[1] = {0}; /* used for not defined db */
-
-LEX_STRING NULL_STR = {nullptr, 0};
-LEX_CSTRING EMPTY_CSTR = {"", 0};
-LEX_CSTRING NULL_CSTR = {nullptr, 0};
 
 const char *const THD::DEFAULT_WHERE = "field list";
 extern PSI_stage_info stage_waiting_for_disk_space;
@@ -435,6 +434,7 @@ THD::THD(bool enable_plugins)
       debug_sync_control(nullptr),
 #endif /* defined(ENABLED_DEBUG_SYNC) */
       m_enable_plugins(enable_plugins),
+      m_audited(true),
 #ifdef HAVE_GTID_NEXT_LIST
       owned_gtid_set(global_sid_map),
 #endif
@@ -783,7 +783,7 @@ void THD::init(void) {
   user_time.tv_sec = user_time.tv_usec = 0;
   start_time.tv_sec = start_time.tv_usec = 0;
   set_time();
-  auto_inc_intervals_forced.empty();
+  auto_inc_intervals_forced.clear();
   {
     ulong tmp;
     tmp = sql_rnd_with_mutex();
@@ -1422,7 +1422,7 @@ void THD::cleanup_after_query() {
   {
     /* Forget those values, for next binlogger: */
     stmt_depends_on_first_successful_insert_id_in_prev_stmt = false;
-    auto_inc_intervals_in_cur_stmt_for_binlog.empty();
+    auto_inc_intervals_in_cur_stmt_for_binlog.clear();
     rand_used = false;
     binlog_accessed_db_names = nullptr;
 
@@ -1436,7 +1436,7 @@ void THD::cleanup_after_query() {
         SET statements between them).
     */
     if ((rli_slave || rli_fake) && is_update_query(lex->sql_command))
-      auto_inc_intervals_forced.empty();
+      auto_inc_intervals_forced.clear();
   }
 
   /*
@@ -1465,8 +1465,9 @@ void THD::cleanup_after_query() {
   while (Security_context *ctx = it++) {
     ctx->logout();
   }
-  m_view_ctx_list.empty();
-  /* Free Items that were created during this execution */
+  m_view_ctx_list.clear();
+  // Cleanup and free items that were created during this execution
+  cleanup_items(item_list());
   free_items();
   /* Reset where. */
   where = THD::DEFAULT_WHERE;
@@ -1549,7 +1550,7 @@ void THD::update_charset() {
 }
 
 int THD::send_explain_fields(Query_result *result) {
-  List<Item> field_list;
+  mem_root_deque<Item *> field_list(current_thd->mem_root);
   Item *item;
   CHARSET_INFO *cs = system_charset_info;
   field_list.push_back(new Item_return_int("id", 3, MYSQL_TYPE_LONGLONG));
@@ -1619,9 +1620,10 @@ void THD::nocheck_register_item_tree_change(Item **place, Item *new_value) {
   Item_change_record *change;
   /*
     Now we use one node per change, which adds some memory overhead,
-    but still is rather fast as we use alloc_root for allocations.
+    but still is rather fast as we use mem_root->alloc() for allocations.
     A list of item tree changes of an average query should be short.
   */
+
   void *change_mem = mem_root->Alloc(sizeof(*change));
   if (change_mem == nullptr) {
     /*
@@ -1634,86 +1636,6 @@ void THD::nocheck_register_item_tree_change(Item **place, Item *new_value) {
   change_list.push_front(change);
 }
 
-Item *THD::replace_rollback_place(Item **new_place) {
-  I_List_iterator<Item_change_record> it(change_list);
-  Item_change_record *change;
-  while ((change = it++)) {
-    if (change->new_value == *new_place) {
-      DBUG_PRINT("info", ("replace_rollback_place new_value %p place %p",
-                          *new_place, new_place));
-      change->place = new_place;
-      return change->old_value;
-    }
-  }
-  return nullptr;
-}
-
-void THD::alias_rollback(Item **place) {
-  if (stmt_arena->is_regular()) return;
-
-  Item *new_value = *place;
-  Item *old_value = nullptr;
-  I_List_iterator<Item_change_record> it(change_list);
-  Item_change_record *change;
-  while ((change = it++)) {
-    if (change->new_value == new_value) {
-      old_value = change->old_value;
-      break;
-    }
-  }
-  DBUG_ASSERT(old_value != nullptr);
-  *place = old_value;
-  nocheck_register_item_tree_change(place, new_value);
-  *place = new_value;
-}
-
-/**
-  After a permant transformation by SELECT_LEX::transform_grouped_to_derived,
-  a block's from list is moved to a new derived table.
-  We may have fields that originally resolved to tables in orig_block
-  but that now belong to tables in new_block.
-  Such field may be rolled back and thus need their name resolution contexts
-  updated, so they will resolve correctly on EXECUTE a being rolled back at the
-  end of a PREPARE. Can be removed after WL#6570.
-
-  @param orig_block  The query block to which these fields originally belonged
-  @param new_block   The query block they now belong to and whose name
-                     resolution context they need.
-*/
-void THD::update_ident_context(SELECT_LEX *orig_block, SELECT_LEX *new_block) {
-  I_List_iterator<Item_change_record> it(change_list);
-  Item_change_record *change;
-  while ((change = it++)) {
-    Item *old_item = change->old_value;
-    if (old_item->type() == Item::FIELD_ITEM) {
-      Item_field *orig_field = down_cast<Item_field *>(old_item);
-      if (orig_field->context->select_lex == orig_block)
-        orig_field->context = &new_block->context;
-    }
-  }
-}
-
-void THD::cancel_rollback(Item *i) {
-  I_List_iterator<Item_change_record> it(change_list);
-  Item_change_record *change;
-  while ((change = it++)) {
-    if (change->new_value == i) {
-      change->m_cancel = true;
-      // Find any other change records for this location also
-      cancel_rollback_at(change->place);
-    }
-  }
-}
-
-void THD::cancel_rollback_at(Item **place) {
-  I_List_iterator<Item_change_record> it(change_list);
-  Item_change_record *change;
-  while ((change = it++)) {
-    if (change->place == place) {
-      change->m_cancel = true;
-    }
-  }
-}
 void THD::rollback_item_tree_changes() {
   I_List_iterator<Item_change_record> it(change_list);
   Item_change_record *change;
@@ -1728,7 +1650,7 @@ void THD::rollback_item_tree_changes() {
     *change->place = change->old_value;
   }
   /* We can forget about changes memory: it's allocated in runtime memroot */
-  change_list.empty();
+  change_list.clear();
 }
 
 void Query_arena::add_item(Item *item) {
@@ -1763,8 +1685,6 @@ void THD::end_statement() {
   DBUG_TRACE;
   /* Cleanup SQL processing state to reuse this statement in next query. */
   lex_end(lex);
-  //@todo Check lifetime of Query_result objects.
-  // delete lex->result;
   lex->result = nullptr;  // Prepare for next statement
   /* Note that item list is freed in cleanup_after_query() */
 
@@ -1835,9 +1755,9 @@ void Prepared_statement_map::erase(Prepared_statement *statement) {
   mysql_mutex_unlock(&LOCK_prepared_stmt_count);
 }
 
-void Prepared_statement_map::claim_memory_ownership() {
+void Prepared_statement_map::claim_memory_ownership(bool claim) {
   for (const auto &key_and_value : st_hash) {
-    my_claim(key_and_value.second.get());
+    my_claim(key_and_value.second.get(), claim);
   }
 }
 
@@ -2562,20 +2482,18 @@ void THD::vsyntax_error_at(const char *pos_in_lexer_raw_buffer,
                   err.ptr(), lineno);
 }
 
-bool THD::send_result_metadata(List<Item> *list, uint flags) {
+bool THD::send_result_metadata(const mem_root_deque<Item *> &list, uint flags) {
   DBUG_TRACE;
-  List_iterator_fast<Item> it(*list);
-  Item *item;
   uchar buff[MAX_FIELD_WIDTH];
   String tmp((char *)buff, sizeof(buff), &my_charset_bin);
 
-  if (m_protocol->start_result_metadata(list->elements, flags,
+  if (m_protocol->start_result_metadata(CountVisibleFields(list), flags,
                                         variables.character_set_results))
     goto err;
   switch (variables.resultset_metadata) {
     case RESULTSET_METADATA_FULL:
-      /* Sent metadata. */
-      while ((item = it++)) {
+      /* Send metadata. */
+      for (Item *item : VisibleFields(list)) {
         Send_field field;
         item->make_field(&field);
         m_protocol->start_row();
@@ -2603,14 +2521,13 @@ err:
   return true;                           /* purecov: inspected */
 }
 
-bool THD::send_result_set_row(List<Item> *row_items) {
+bool THD::send_result_set_row(const mem_root_deque<Item *> &row_items) {
   char buffer[MAX_FIELD_WIDTH];
   String str_buffer(buffer, sizeof(buffer), &my_charset_bin);
-  List_iterator_fast<Item> it(*row_items);
 
   DBUG_TRACE;
 
-  for (Item *item = it++; item; item = it++) {
+  for (Item *item : VisibleFields(row_items)) {
     if (item->send(m_protocol, &str_buffer) || is_error()) return true;
     /*
       Reset str_buffer to its original state, as it may have been altered in
@@ -2656,37 +2573,37 @@ void THD::send_statement_status() {
   if (!error) da->set_is_sent(true);
 }
 
-void THD::claim_memory_ownership() {
-/*
-  Ownership of the THD object is transfered to this thread.
-  This happens typically:
-  - in the event scheduler,
-    when the scheduler thread creates a work item and
-    starts a worker thread to run it
-  - in the main thread, when the code that accepts a new
-    network connection creates a work item and starts a
-    connection thread to run it.
-  Accounting for memory statistics needs to be told
-  that memory allocated by thread X now belongs to thread Y,
-  so that statistics by thread/account/user/host are accurate.
-  Inspect every piece of memory allocated in THD,
-  and call PSI_MEMORY_CALL(memory_claim)().
-*/
+void THD::claim_memory_ownership(bool claim) {
 #ifdef HAVE_PSI_MEMORY_INTERFACE
-  main_mem_root.Claim();
-  my_claim(m_token_array);
+  /*
+    Ownership of the THD object is transfered to this thread.
+    This happens typically:
+    - in the event scheduler,
+      when the scheduler thread creates a work item and
+      starts a worker thread to run it
+    - in the main thread, when the code that accepts a new
+      network connection creates a work item and starts a
+      connection thread to run it.
+    Accounting for memory statistics needs to be told
+    that memory allocated by thread X now belongs to thread Y,
+    so that statistics by thread/account/user/host are accurate.
+    Inspect every piece of memory allocated in THD,
+    and call PSI_MEMORY_CALL(memory_claim)().
+   */
+  main_mem_root.Claim(claim);
+  my_claim(m_token_array, claim);
   Protocol_classic *p = get_protocol_classic();
-  if (p != nullptr) p->claim_memory_ownership();
-  session_tracker.claim_memory_ownership();
-  session_sysvar_res_mgr.claim_memory_ownership();
+  if (p != nullptr) p->claim_memory_ownership(claim);
+  session_tracker.claim_memory_ownership(claim);
+  session_sysvar_res_mgr.claim_memory_ownership(claim);
   for (const auto &key_and_value : user_vars) {
-    my_claim(key_and_value.second.get());
+    my_claim(key_and_value.second.get(), claim);
   }
 #if defined(ENABLED_DEBUG_SYNC)
-  debug_sync_claim_memory_ownership(this);
+  debug_sync_claim_memory_ownership(this, claim);
 #endif /* defined(ENABLED_DEBUG_SYNC) */
-  get_transaction()->claim_memory_ownership();
-  stmt_map.claim_memory_ownership();
+  get_transaction()->claim_memory_ownership(claim);
+  stmt_map.claim_memory_ownership(claim);
 #endif /* HAVE_PSI_MEMORY_INTERFACE */
 }
 
@@ -2752,28 +2669,6 @@ THD::Transaction_state::Transaction_state()
       m_ha_data(PSI_NOT_INSTRUMENTED, m_ha_data.initial_capacity) {}
 
 THD::Transaction_state::~Transaction_state() { delete m_query_tables_list; }
-
-void THD::change_item_tree(Item **place, Item *new_value) {
-  if (m_permanent_transform) {
-    // Delete any change records for this location
-    I_List_iterator<Item_change_record> it(change_list);
-    Item_change_record *change;
-    while ((change = it++))
-      if (change->place == place) change->m_cancel = true;
-
-    *place = new_value;
-  } else {
-    /* TODO: check for OOM condition here */
-    if (!stmt_arena->is_regular()) {
-      DBUG_PRINT("info", ("change_item_tree place %p old_value %p new_value %p",
-                          place, *place, new_value));
-      if (new_value)
-        new_value->set_runtime_created(); /* Note the change of item tree */
-      nocheck_register_item_tree_change(place, new_value);
-    }
-    *place = new_value;
-  }
-}
 
 bool THD::notify_hton_pre_acquire_exclusive(const MDL_key *mdl_key,
                                             bool *victimized) {
@@ -2848,20 +2743,6 @@ bool THD::secondary_storage_engine_eligible() const {
          sp_runtime_ctx == nullptr;
 }
 
-/**
-  Set the rewritten query (with passwords obfuscated etc.) on the THD.
-  Wraps this in the LOCK_thd_query mutex to protect against race conditions
-  with SHOW PROCESSLIST inspecting that string.
-
-  This uses swap() and therefore changes the argument in the caller.
-  That behavior is expected by (save|restore)_rlb() in sql_prepare.cc,
-  and harmless in sql_rewrite.cc. Using it elsewhere is almost certainly
-  wrong and must be reviewed with extreme prejudice. If in doubt, please
-  check with the runtime team.
-
-  @param query_arg  The rewritten query to use for slow/bin/general logging.
-                    The value will be changed in the caller.
-*/
 void THD::swap_rewritten_query(String &query_arg) {
   DBUG_ASSERT(this == current_thd);
 
@@ -2959,6 +2840,67 @@ void THD::set_time_after_lock() {
 void THD::update_slow_query_status() {
   if (my_micro_time() > utime_after_lock + variables.long_query_time)
     server_status |= SERVER_QUERY_WAS_SLOW;
+}
+
+/**
+  Initialize the transactional ddl context when executing CREATE TABLE ...
+  SELECT command with engine which supports atomic DDL.
+
+  @param db         Schema name in which table is being created.
+  @param tablename  Table name being created.
+  @param hton       Handlerton representing engine used for table.
+
+  @returns void
+*/
+void Transactional_ddl_context::init(dd::String_type db,
+                                     dd::String_type tablename,
+                                     const handlerton *hton) {
+  DBUG_ASSERT(m_hton == nullptr);
+  m_db = db;
+  m_tablename = tablename;
+  m_hton = hton;
+}
+
+/**
+  Remove the table share used while creating the table, if the transaction
+  is being rolledback.
+
+  @returns void
+*/
+void Transactional_ddl_context::rollback() {
+  if (!inited()) return;
+  table_cache_manager.lock_all_and_tdc();
+  TABLE_SHARE *share =
+      get_cached_table_share(m_db.c_str(), m_tablename.c_str());
+  if (share) {
+    tdc_remove_table(m_thd, TDC_RT_REMOVE_ALL, m_db.c_str(),
+                     m_tablename.c_str(), true);
+
+#ifdef HAVE_PSI_TABLE_INTERFACE
+    // quick_rm_table() was not called, so remove the P_S table share here.
+    PSI_TABLE_CALL(drop_table_share)
+    (false, m_db.c_str(), strlen(m_db.c_str()), m_tablename.c_str(),
+     strlen(m_tablename.c_str()));
+#endif
+  }
+  table_cache_manager.unlock_all_and_tdc();
+}
+
+/**
+  End the transactional context created by calling post ddl hook for engine
+  on which table is being created. This is done after transaction rollback
+  and commit.
+
+  @returns void
+*/
+void Transactional_ddl_context::post_ddl() {
+  if (!inited()) return;
+  if (m_hton && m_hton->post_ddl) {
+    m_hton->post_ddl(m_thd);
+  }
+  m_hton = nullptr;
+  m_db = "";
+  m_tablename = "";
 }
 
 void my_ok(THD *thd, ulonglong affected_rows, ulonglong id,

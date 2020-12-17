@@ -1418,3 +1418,38 @@ i
 2
 1
 DROP TABLE t1;
+#
+# Bug #30664660 GCOLS, CRASH AND CORRUPTIONS WITH DELETE IGNORE + JSON
+#
+CREATE TABLE t (
+a JSON NOT NULL,
+b TIMESTAMP GENERATED ALWAYS AS (a) VIRTUAL NOT NULL,
+KEY (b)
+) ENGINE=INNODB;
+INSERT IGNORE INTO t(a) VALUES ('{}');
+Warnings:
+Warning	3156	Invalid JSON value for CAST to DATE/TIME/DATETIME/TIMESTAMP from column a at row 1
+Warning	1264	Out of range value for column 'b' at row 1
+DELETE IGNORE FROM t;
+Warnings:
+Warning	3156	Invalid JSON value for CAST to DATE/TIME/DATETIME/TIMESTAMP from column a at row 1
+Warning	1292	Incorrect datetime value: '0000-00-00 00:00:00' for column 'b' at row 1
+Warning	3156	Invalid JSON value for CAST to DATE/TIME/DATETIME/TIMESTAMP from column a at row 1
+Warning	1292	Incorrect datetime value: '0000-00-00 00:00:00' for column 'b' at row 1
+CHECK TABLE t;
+Table	Op	Msg_type	Msg_text
+test.t	check	status	OK
+DROP TABLE t;
+#
+# Bug #31463511: NATURAL JOIN RETURNS WRONG RESULT WHEN EXPRESSION INDEX IS USED
+#
+CREATE TABLE t1 (a INTEGER);
+CREATE TABLE t2 (a INTEGER);
+CREATE INDEX idx ON t1 ((a+1));
+CREATE INDEX idx ON t2 ((a+2));
+INSERT INTO t1 VALUES (1);
+INSERT INTO t2 VALUES (1);
+SELECT * FROM t1 NATURAL JOIN t2;
+a
+1
+DROP TABLE t1, t2;

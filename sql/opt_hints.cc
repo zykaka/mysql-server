@@ -83,6 +83,7 @@ struct st_opt_hint_info opt_hint_info[] = {
     {"JOIN_INDEX", false, false, false},
     {"GROUP_INDEX", false, false, false},
     {"ORDER_INDEX", false, false, false},
+    {"DERIVED_CONDITION_PUSHDOWN", true, true, false},
     {nullptr, false, false, false}};
 
 /**
@@ -234,7 +235,7 @@ Opt_hints_table *Opt_hints_qb::adjust_table_hints(TABLE_LIST *tr) {
   return tab;
 }
 
-bool Opt_hints_qb::semijoin_enabled(THD *thd) const {
+bool Opt_hints_qb::semijoin_enabled(const THD *thd) const {
   if (subquery_hint)  // SUBQUERY hint disables semi-join
     return false;
 
@@ -265,11 +266,11 @@ uint Opt_hints_qb::sj_enabled_strategies(uint opt_switches) const {
   return opt_switches;
 }
 
-SubqueryExecMethod Opt_hints_qb::subquery_strategy() const {
+Subquery_strategy Opt_hints_qb::subquery_strategy() const {
   if (subquery_hint)
-    return static_cast<SubqueryExecMethod>(subquery_hint->get_args());
+    return static_cast<Subquery_strategy>(subquery_hint->get_args());
 
-  return SubqueryExecMethod::EXEC_UNSPECIFIED;
+  return Subquery_strategy::UNSPECIFIED;
 }
 
 void Opt_hints_qb::print_irregular_hints(const THD *thd, String *str) {
@@ -515,12 +516,6 @@ static bool set_join_hint_deps(JOIN *join,
   return false;
 }
 
-/**
-  Function applies join order hints.
-
-  @param join pointer to JOIN object
-*/
-
 void Opt_hints_qb::apply_join_order_hints(JOIN *join) {
   for (uint hint_idx = 0; hint_idx < join_order_hints.size(); hint_idx++) {
     PT_qb_level_hint *hint = join_order_hints[hint_idx];
@@ -545,8 +540,9 @@ void Opt_hints_table::adjust_key_hints(TABLE_LIST *tr) {
   */
   if (keyinfo_array.size()) return;
 
-  if (tr->is_view_or_derived())
-    return;  // Names of keys are not known for derived tables
+  // Names of keys are not known for
+  // derived/internal temp/table_function tables.
+  if (!tr->is_base_table()) return;
 
   TABLE *table = tr->table;
   keyinfo_array.resize(table->s->keys, nullptr);

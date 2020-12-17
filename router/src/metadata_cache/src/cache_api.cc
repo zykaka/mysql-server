@@ -38,22 +38,28 @@
 static std::mutex g_metadata_cache_m;
 static std::unique_ptr<MetadataCache> g_metadata_cache(nullptr);
 
+using namespace std::chrono_literals;
+
 namespace metadata_cache {
 
-const uint16_t kDefaultMetadataPort = 32275;
-const std::chrono::milliseconds kDefaultMetadataTTL =
-    std::chrono::milliseconds(500);
-const std::chrono::milliseconds kDefaultAuthCacheTTL = std::chrono::seconds(-1);
-const std::chrono::milliseconds kDefaultAuthCacheRefreshInterval =
-    std::chrono::milliseconds(2000);
+const uint16_t kDefaultMetadataPort{32275};
+const std::chrono::milliseconds kDefaultMetadataTTL{500ms};
+const std::chrono::milliseconds kDefaultAuthCacheTTL{-1s};
+const std::chrono::milliseconds kDefaultAuthCacheRefreshInterval{2000ms};
 const std::string kDefaultMetadataAddress{
     "127.0.0.1:" + mysqlrouter::to_string(kDefaultMetadataPort)};
-const std::string kDefaultMetadataUser = "";
-const std::string kDefaultMetadataPassword = "";
-const std::string kDefaultMetadataCluster =
-    "";  // blank cluster name means pick the 1st (and only) cluster
-const unsigned int kDefaultConnectTimeout = 30;
-const unsigned int kDefaultReadTimeout = 30;
+const std::string kDefaultMetadataUser{""};
+const std::string kDefaultMetadataPassword{""};
+const std::string kDefaultMetadataCluster{""};
+// blank cluster name means pick the 1st (and only) cluster
+const unsigned int kDefaultConnectTimeout{30};
+const unsigned int kDefaultReadTimeout{30};
+
+const std::string kNodeTagHidden{"_hidden"};
+const std::string kNodeTagDisconnectWhenHidden{
+    "_disconnect_existing_sessions_when_hidden"};
+const bool kNodeTagHiddenDefault{false};
+const bool kNodeTagDisconnectWhenHiddenDefault{true};
 
 ReplicasetStateListenerInterface::~ReplicasetStateListenerInterface() = default;
 ReplicasetStateNotifierInterface::~ReplicasetStateNotifierInterface() = default;
@@ -195,9 +201,9 @@ void MetadataCacheAPI::mark_instance_reachability(
   g_metadata_cache->mark_instance_reachability(instance_id, status);
 }
 
-bool MetadataCacheAPI::wait_primary_failover(const std::string &replicaset_name,
-                                             int timeout) {
-  LOCK_METADATA_AND_CHECK_INITIALIZED();
+bool MetadataCacheAPI::wait_primary_failover(
+    const std::string &replicaset_name, const std::chrono::seconds &timeout) {
+  { LOCK_METADATA_AND_CHECK_INITIALIZED(); }
 
   return g_metadata_cache->wait_primary_failover(replicaset_name, timeout);
 }

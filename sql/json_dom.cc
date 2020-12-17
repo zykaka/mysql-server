@@ -1,4 +1,4 @@
-/* Copyright (c) 2015, 2019, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2015, 2020, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -151,7 +151,7 @@ void Json_dom::operator delete(void *ptr) noexcept { my_free(ptr); }
   cluttering the test coverage reports.
 */
 /* purecov: begin inspected */
-void Json_dom::operator delete(void *ptr, const std::nothrow_t &)noexcept {
+void Json_dom::operator delete(void *ptr, const std::nothrow_t &) noexcept {
   operator delete(ptr);
 }
 /* purecov: end */
@@ -615,7 +615,7 @@ Json_dom_ptr Json_dom::parse(const char *text, size_t length,
   represent decimal or date/time values. For that, look into the
   Value an retrive field_type.
 
-  @param[in]  bintype
+  @param[in]  bintype type of json_binary
   @returns the JSON_dom JSON type.
 */
 static enum_json_type bjson2json(const json_binary::Value::enum_type bintype) {
@@ -1224,40 +1224,6 @@ static bool escape_character(char c, String *buf) {
          buf->append(_dig_vec_lower[(c & 0x0f)]);
 }
 
-/**
-  Perform quoting on a JSON string to make an external representation
-  of it. It wraps double quotes (text quotes) around the string (cptr)
-  and also performs escaping according to the following table:
-  <pre>
-  @verbatim
-  Common name     C-style  Original unescaped     Transformed to
-                  escape   UTF-8 bytes            escape sequence
-                  notation                        in UTF-8 bytes
-  ---------------------------------------------------------------
-  quote           \"       %x22                    %x5C %x22
-  backslash       \\       %x5C                    %x5C %x5C
-  backspace       \b       %x08                    %x5C %x62
-  formfeed        \f       %x0C                    %x5C %x66
-  linefeed        \n       %x0A                    %x5C %x6E
-  carriage-return \r       %x0D                    %x5C %x72
-  tab             \t       %x09                    %x5C %x74
-  unicode         \uXXXX  A hex number in the      %x5C %x75
-                          range of 00-1F,          followed by
-                          except for the ones      4 hex digits
-                          handled above (backspace,
-                          formfeed, linefeed,
-                          carriage-return,
-                          and tab).
-  ---------------------------------------------------------------
-  @endverbatim
-  </pre>
-
-  @param[in] cptr pointer to string data
-  @param[in] length the length of the string
-  @param[in,out] buf the destination buffer
-  @retval false on success
-  @retval true on error
-*/
 bool double_quote(const char *cptr, size_t length, String *buf) {
   if (reserve(buf, length + 2) || buf->append('"'))
     return true; /* purecov: inspected */
@@ -1394,8 +1360,8 @@ void Json_datetime::from_packed_to_key(const char *from, enum_field_types ft,
       struct timeval tm;
       int warnings = 0;
       TIME_from_longlong_datetime_packed(&ltime, sint8korr(from));
-      datetime_with_no_zero_in_date_to_timeval(current_thd, &ltime, &tm,
-                                               &warnings);
+      datetime_with_no_zero_in_date_to_timeval(
+          &ltime, *current_thd->time_zone(), &tm, &warnings);
       // Assume that since the value was properly stored, there're no warnings
       DBUG_ASSERT(!warnings);
       my_timestamp_to_binary(&tm, to, dec);
@@ -2792,7 +2758,7 @@ int Json_wrapper::compare(const Json_wrapper &other,
   Push a warning/error about a problem encountered when coercing a JSON
   value to some other data type.
 
-  @param[in] cr_error     what to issue: a warning or an error
+  @param[in] cr_error     what to issue: a warning, an error or nothing
   @param[in] target_type  the name of the target type of the coercion
   @param[in] error_code   the error code to use for the warning
   @param[in] msgnam       the name of the field/expression being coerced
@@ -2818,14 +2784,20 @@ static void handle_coercion_error(enum_coercion_error cr_error,
                current_thd->get_stmt_da()->current_row_for_condition());
       return;
     }
+    case CE_IGNORE:
+      // Caller will handle the error
+      return;
   }
 }
 
-longlong Json_wrapper::coerce_int(const char *msgnam, bool *err,
-                                  enum_coercion_error cr_error) const {
+longlong Json_wrapper::coerce_int(const char *msgnam,
+                                  enum_coercion_error cr_error, bool *err,
+                                  bool *unsigned_flag) const {
   if (err) *err = false;
+  if (unsigned_flag != nullptr) *unsigned_flag = false;
   switch (type()) {
     case enum_json_type::J_UINT:
+      if (unsigned_flag != nullptr) *unsigned_flag = true;
       return static_cast<longlong>(get_uint());
     case enum_json_type::J_INT:
       return get_int();
@@ -2837,10 +2809,9 @@ longlong Json_wrapper::coerce_int(const char *msgnam, bool *err,
       const char *start = get_data();
       size_t length = get_data_length();
       const char *end = start + length;
-      const CHARSET_INFO *cs = &my_charset_utf8mb4_bin;
 
       int error;
-      longlong value = cs->cset->strtoll10(cs, start, &end, &error);
+      longlong value = my_strtoll10(start, &end, &error);
 
       if (error > 0 || end != start + length) {
         int code =
@@ -2850,9 +2821,11 @@ longlong Json_wrapper::coerce_int(const char *msgnam, bool *err,
         if (err) *err = true;
       }
 
+      if (unsigned_flag != nullptr) *unsigned_flag = error == 0;
       return value;
     }
     case enum_json_type::J_BOOLEAN:
+      if (unsigned_flag != nullptr) *unsigned_flag = true;
       return get_boolean() ? 1 : 0;
     case enum_json_type::J_DECIMAL: {
       longlong i;
@@ -2864,6 +2837,7 @@ longlong Json_wrapper::coerce_int(const char *msgnam, bool *err,
       */
       my_decimal2int(E_DEC_FATAL_ERROR, &decimal_value, !decimal_value.sign(),
                      &i);
+      if (unsigned_flag != nullptr) *unsigned_flag = !decimal_value.sign();
       return i;
     }
     case enum_json_type::J_DOUBLE: {
@@ -2893,8 +2867,9 @@ longlong Json_wrapper::coerce_int(const char *msgnam, bool *err,
   return 0;
 }
 
-double Json_wrapper::coerce_real(const char *msgnam, bool *err,
-                                 enum_coercion_error cr_error) const {
+double Json_wrapper::coerce_real(const char *msgnam,
+                                 enum_coercion_error cr_error,
+                                 bool *err) const {
   if (err) *err = false;
   switch (type()) {
     case enum_json_type::J_DECIMAL: {
@@ -2943,8 +2918,9 @@ double Json_wrapper::coerce_real(const char *msgnam, bool *err,
 }
 
 my_decimal *Json_wrapper::coerce_decimal(my_decimal *decimal_value,
-                                         const char *msgnam, bool *err,
-                                         enum_coercion_error cr_error) const {
+                                         const char *msgnam,
+                                         enum_coercion_error cr_error,
+                                         bool *err) const {
   if (err) *err = false;
   switch (type()) {
     case enum_json_type::J_DECIMAL:
@@ -3005,7 +2981,8 @@ my_decimal *Json_wrapper::coerce_decimal(my_decimal *decimal_value,
 }
 
 bool Json_wrapper::coerce_date(MYSQL_TIME *ltime, const char *msgnam,
-                               enum_coercion_error cr_error) const {
+                               enum_coercion_error cr_error,
+                               my_time_flags_t date_flags_arg) const {
   switch (type()) {
     case enum_json_type::J_DATETIME:
     case enum_json_type::J_DATE:
@@ -3017,7 +2994,7 @@ bool Json_wrapper::coerce_date(MYSQL_TIME *ltime, const char *msgnam,
       MYSQL_TIME_STATUS status;
       THD *thd = current_thd;
       // @see Field_datetime::date_flags
-      my_time_flags_t date_flags = TIME_FUZZY_DATE;
+      my_time_flags_t date_flags = TIME_FUZZY_DATE | date_flags_arg;
       if (thd->variables.sql_mode & MODE_NO_ZERO_DATE)
         date_flags |= TIME_NO_ZERO_DATE;
       if (thd->variables.sql_mode & MODE_NO_ZERO_IN_DATE)

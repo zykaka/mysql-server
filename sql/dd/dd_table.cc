@@ -1,4 +1,4 @@
-/* Copyright (c) 2015, 2019, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2015, 2020, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -135,6 +135,8 @@ dd::enum_column_types get_new_field_type(enum_field_types type) {
       return dd::enum_column_types::DOUBLE;
 
     case MYSQL_TYPE_NULL:
+    case MYSQL_TYPE_INVALID:
+    case MYSQL_TYPE_BOOL:
       return dd::enum_column_types::TYPE_NULL;
 
     case MYSQL_TYPE_TIMESTAMP:
@@ -271,10 +273,10 @@ static void prepare_default_value_string(uchar *buf, TABLE *table,
       make_field(field, table->s, buf + 1, buf, 0));
   f->init(table);
 
-  if (col_obj->has_no_default()) f->flags |= NO_DEFAULT_VALUE_FLAG;
+  if (col_obj->has_no_default()) f->set_flag(NO_DEFAULT_VALUE_FLAG);
 
   const bool has_default =
-      (f->type() != FIELD_TYPE_BLOB && !(f->flags & NO_DEFAULT_VALUE_FLAG) &&
+      (f->type() != FIELD_TYPE_BLOB && !f->is_flag_set(NO_DEFAULT_VALUE_FLAG) &&
        !(f->auto_flags & Field::NEXT_NUMBER));
 
   if (f->gcol_info || !has_default) return;
@@ -304,7 +306,7 @@ static void prepare_default_value_string(uchar *buf, TABLE *table,
     String type(tmp, sizeof(tmp), f->charset());
     const bool is_binary_type =
         ((f->type() == MYSQL_TYPE_VARCHAR || f->type() == MYSQL_TYPE_STRING) &&
-         (f->flags & BINARY_FLAG) && f->charset() == &my_charset_bin);
+         f->is_flag_set(BINARY_FLAG) && f->charset() == &my_charset_bin);
 
     if (f->type() == MYSQL_TYPE_BIT) {
       longlong dec = f->val_int();
@@ -765,6 +767,8 @@ bool fill_dd_columns_from_create_fields(THD *thd, dd::Abstract_table *tab_obj,
     if (def_val.ptr() != nullptr)
       col_obj->set_default_value_utf8(
           dd::String_type(def_val.ptr(), def_val.length()));
+    col_obj->set_engine_attribute(field.m_engine_attribute);
+    col_obj->set_secondary_engine_attribute(field.m_secondary_engine_attribute);
   }
 
   return false;
@@ -1059,6 +1063,8 @@ static void fill_dd_indexes_from_keyinfo(
     idx_obj->set_engine(tab_obj->engine());
     idx_obj->set_visible(key->is_visible);
 
+    idx_obj->set_engine_attribute(key->engine_attribute);
+    idx_obj->set_secondary_engine_attribute(key->secondary_engine_attribute);
     //
     // Set options
     //
@@ -1490,12 +1496,26 @@ static bool fill_dd_partition_from_create_info(
       // expressions.
       Sql_mode_parse_guard parse_guard(thd);
 
+      /*
+        Because there are lifetime issues with CREATE TABLE and ALTER TABLE
+        when used with prepared statements, the field pointer within an
+        Item_field object may be invalid. However, it is not needed by
+        part_expr->print(), so set it to NULL temporarily.
+        This should be fixed by handling the lifetime issues for DDL operations.
+      */
+      Field *saved = nullptr;
+      if (part_info->part_expr->type() == Item::FIELD_ITEM) {
+        saved = down_cast<Item_field *>(part_info->part_expr)->field;
+        down_cast<Item_field *>(part_info->part_expr)->field = nullptr;
+      }
       // No point in including schema and table name for identifiers
       // since any columns must be in this table.
       part_info->part_expr->print(
           thd, &tmp,
           enum_query_type(QT_TO_SYSTEM_CHARSET | QT_NO_DB | QT_NO_TABLE));
 
+      if (saved != nullptr)
+        down_cast<Item_field *>(part_info->part_expr)->field = saved;
       if (tmp.numchars() > PARTITION_EXPR_CHAR_LEN) {
         my_error(ER_PART_EXPR_TOO_LONG, MYF(0));
         return true;
@@ -2058,9 +2078,6 @@ static bool fill_dd_table_from_create_info(
 
   table_options->set("avg_row_length", create_info->avg_row_length);
 
-  if (create_info->row_type != ROW_TYPE_DEFAULT)
-    table_options->set("row_type", create_info->row_type);
-
   // ROW_FORMAT which was explicitly specified by user (if any).
   if (create_info->row_type != ROW_TYPE_DEFAULT)
     table_options->set("row_type",
@@ -2120,6 +2137,10 @@ static bool fill_dd_table_from_create_info(
   if (create_info->secondary_engine.str != nullptr)
     table_options->set("secondary_engine",
                        make_string_type(create_info->secondary_engine));
+
+  tab_obj->set_engine_attribute(create_info->engine_attribute);
+  tab_obj->set_secondary_engine_attribute(
+      create_info->secondary_engine_attribute);
 
   // TODO-MYSQL_VERSION: We decided not to store MYSQL_VERSION_ID ?
   //
@@ -2714,7 +2735,7 @@ bool is_general_tablespace_and_encrypted(const KEY k, THD *thd,
    the table itself (implicit tablespace), then proceeds to acquire
    and check the "ecryption" option in table's tablespaces.
 
-   @param[in] thd
+   @param[in] thd thread context
    @param[in] t table to check
    @param[out] is_general_tablespace Denotes if we found general tablespace.
 
@@ -2910,6 +2931,108 @@ bool uses_general_tablespace(const Table &t) {
   }
 
   return false;
+}
+
+void warn_on_deprecated_prefix_key_partition(THD *thd, const char *schema_name,
+                                             const char *orig_table_name,
+                                             const Table *table,
+                                             const bool is_upgrade) {
+  DBUG_TRACE;
+  DBUG_ASSERT(table);
+
+  // Check if table is partitioned.
+  const Table::enum_partition_type pt_type = table->partition_type();
+  if (pt_type == Table::enum_partition_type::PT_NONE) return;
+
+  // Check if table is partitioned by [LINEAR] KEY.
+  if (pt_type != Table::PT_KEY_51 && pt_type != Table::PT_KEY_55 &&
+      pt_type != Table::PT_LINEAR_KEY_51 && pt_type != Table::PT_LINEAR_KEY_55)
+    return;
+
+  // Parse the partition expression to get the list of columns used.
+  // NOTE : This is similar to working of set_field_list().
+  std::vector<String_type> part_columns;
+  String_type part_expr = table->partition_expression();
+  String_type::const_iterator it(part_expr.begin());
+  String_type::const_iterator end(part_expr.end());
+  String_type part_column_name;
+  while (it != end) {
+    if (eat_str(part_column_name, it, end, dd::FIELD_NAME_SEPARATOR_CHAR))
+      break; /* purecov: inspected */
+    part_columns.push_back(part_column_name);
+  }
+
+  // We check the list of columns only if columns are explicitly specified in
+  // PARTITION BY KEY (column_list).
+  const bool check_part_columns = !part_columns.empty();
+
+  const Table::Partition_collection *partitions = &table->partitions();
+  DBUG_ASSERT(!partitions->empty());
+
+  // Since the indexes referred by every partition would be the same, we only
+  // need the first partition.
+  const Partition *partition = *partitions->begin();
+
+  // Check each index element of each partition index, and throw a warning if
+  // prefix key index is used in the PARTITION BY KEY() clause.
+  for (const auto *part_index : partition->indexes()) {
+    if (part_index->index().is_hidden()) continue;
+
+    for (const auto *index_element : part_index->index().elements()) {
+      if (index_element->is_hidden()) continue;
+
+      // Index length should not be unset, if the index is visible.
+      DBUG_ASSERT(!index_element->is_length_null());
+
+      // In case PARTITION BY KEY(...) columns are explicitly specified, check
+      // if this column is one of them.
+      const Column *column = &index_element->column();
+      String_type column_name = column->name();
+      if (check_part_columns) {
+        bool found = false;
+        for (auto part_column : part_columns) {
+          if (!my_strcasecmp(system_charset_info, column_name.c_str(),
+                             part_column.c_str())) {
+            found = true;
+            break;
+          }
+        }
+        if (!found) continue;
+      }
+
+      // Check if column is one of the types for which prefixes can be
+      // specified.
+      const enum enum_column_types column_type = column->type();
+      if (column_type !=
+              enum_column_types::VARCHAR &&  // For CHAR/VARCHAR/VARBINARY
+          column_type != enum_column_types::STRING)  // For BINARY
+        continue;
+
+      DBUG_ASSERT(index_element->length() <= column->char_length());
+
+      // Check if the partition index element length differs from the column
+      // length, which indicates that it uses a prefix key.
+      if (index_element->length() == column->char_length()) continue;
+
+      // Calculate prefix key length to be displayed, based on charset.
+      const CHARSET_INFO *cs = dd_get_mysql_charset(column->collation_id());
+      const uint prefix_key_length = index_element->length() / cs->mbmaxlen;
+
+      // In case of UPGRADE from 5.7 or lower 8.0.x version, send warning to the
+      // error log. In case of CREATE|ALTER TABLE, send warning to client.
+      if (is_upgrade)
+        LogErr(WARNING_LEVEL, ER_WARN_LOG_DEPRECATED_PARTITION_PREFIX_KEY,
+               schema_name, orig_table_name, column_name.c_str(),
+               column_name.c_str(), prefix_key_length);
+      else
+        push_warning_printf(
+            thd, Sql_condition::SL_WARNING,
+            ER_WARN_DEPRECATED_SYNTAX_NO_REPLACEMENT,
+            ER_THD(thd, ER_WARN_CLIENT_DEPRECATED_PARTITION_PREFIX_KEY),
+            schema_name, orig_table_name, column_name.c_str(),
+            column_name.c_str(), prefix_key_length);
+    }
+  }
 }
 
 }  // namespace dd

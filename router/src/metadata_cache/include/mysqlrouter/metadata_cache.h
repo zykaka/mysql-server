@@ -1,5 +1,5 @@
 /*
-  Copyright (c) 2016, 2020, Oracle and/or its affiliates. All rights reserved.
+  Copyright (c) 2016, 2020, Oracle and/or its affiliates.
 
   This program is free software; you can redistribute it and/or modify
   it under the terms of the GNU General Public License, version 2.0,
@@ -70,6 +70,11 @@ extern const std::string kDefaultMetadataCluster;
 extern const unsigned int kDefaultConnectTimeout;
 extern const unsigned int kDefaultReadTimeout;
 
+extern const std::string kNodeTagHidden;
+extern const std::string kNodeTagDisconnectWhenHidden;
+extern const bool kNodeTagHiddenDefault;
+extern const bool kNodeTagDisconnectWhenHiddenDefault;
+
 enum class ReplicasetStatus {
   AvailableWritable,
   AvailableReadOnly,
@@ -95,10 +100,8 @@ class METADATA_API ManagedInstance {
   ManagedInstance() = default;
   ManagedInstance(const std::string &p_replicaset_name,
                   const std::string &p_mysql_server_uuid,
-                  const std::string &p_role, const ServerMode p_mode,
-                  const float p_weight, const unsigned int p_version_token,
-                  const std::string &p_host, const uint16_t p_port,
-                  const uint16_t p_xport);
+                  const ServerMode p_mode, const std::string &p_host,
+                  const uint16_t p_port, const uint16_t p_xport);
 
   using TCPAddress = mysql_harness::TCPAddress;
   explicit ManagedInstance(const TCPAddress &addr);
@@ -109,20 +112,20 @@ class METADATA_API ManagedInstance {
   std::string replicaset_name;
   /** @brief The uuid of the MySQL server */
   std::string mysql_server_uuid;
-  /** @brief The role of the server */
-  std::string role;
   /** @brief The mode of the server */
   ServerMode mode;
-  /** @brief The server weight */
-  float weight;
-  /** @brief The version token of the server */
-  unsigned int version_token;
   /** @brief The host name on which the server is running */
   std::string host;
   /** The port number in which the server is running */
   uint16_t port;
   /** The X protocol port number in which the server is running */
   uint16_t xport;
+  /** Should the node be hidden from the application to use it */
+  bool hidden{kNodeTagHiddenDefault};
+  /** Should the Router disconnect existing client sessions to the node when it
+   * is hidden */
+  bool disconnect_existing_sessions_when_hidden{
+      kNodeTagDisconnectWhenHiddenDefault};
 };
 
 /** @class ManagedReplicaSet
@@ -360,15 +363,15 @@ class METADATA_API MetadataCacheAPIBase
 
   /** @brief Wait until there's a primary member in the replicaset
    *
-   * To be called when the master of a single-master replicaset is down and
-   * we want to wait until one becomes elected.
+   * To be called when the primary member of a single-primary replicaset is down
+   * and we want to wait until one becomes elected.
    *
    * @param replicaset_name - the name of the replicaset
    * @param timeout - amount of time to wait for a failover, in seconds
    * @return true if a primary member exists
    */
   virtual bool wait_primary_failover(const std::string &replicaset_name,
-                                     int timeout) = 0;
+                                     const std::chrono::seconds &timeout) = 0;
 
   /**
    * @brief Register observer that is notified when there is a change in the
@@ -378,8 +381,8 @@ class METADATA_API MetadataCacheAPIBase
    * @param listener Observer object that is notified when replicaset nodes
    * state is changed.
    */
-  virtual void add_listener(const std::string &replicaset_name,
-                            ReplicasetStateListenerInterface *listener) = 0;
+  void add_listener(const std::string &replicaset_name,
+                    ReplicasetStateListenerInterface *listener) override = 0;
 
   /**
    * @brief Unregister observer previously registered with add_listener()
@@ -387,8 +390,8 @@ class METADATA_API MetadataCacheAPIBase
    * @param replicaset_name name of the replicaset
    * @param listener Observer object that should be unregistered.
    */
-  virtual void remove_listener(const std::string &replicaset_name,
-                               ReplicasetStateListenerInterface *listener) = 0;
+  void remove_listener(const std::string &replicaset_name,
+                       ReplicasetStateListenerInterface *listener) override = 0;
 
   /** @brief Get authentication data (password hash and privileges) for the
    *  given user.
@@ -429,7 +432,7 @@ class METADATA_API MetadataCacheAPIBase
   // must be explicitly defined though.
   explicit MetadataCacheAPIBase(const MetadataCacheAPIBase &) = delete;
   MetadataCacheAPIBase &operator=(const MetadataCacheAPIBase &) = delete;
-  virtual ~MetadataCacheAPIBase() {}
+  ~MetadataCacheAPIBase() override {}
 
   struct RefreshStatus {
     uint64_t refresh_failed;
@@ -484,7 +487,7 @@ class METADATA_API MetadataCacheAPI : public MetadataCacheAPIBase {
                                   InstanceStatus status) override;
 
   bool wait_primary_failover(const std::string &replicaset_name,
-                             int timeout) override;
+                             const std::chrono::seconds &timeout) override;
 
   void add_listener(const std::string &replicaset_name,
                     ReplicasetStateListenerInterface *listener) override;

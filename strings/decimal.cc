@@ -1,4 +1,4 @@
-/* Copyright (c) 2004, 2019, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2004, 2020, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -1192,12 +1192,6 @@ int decimal2longlong(const decimal_t *from, longlong *to) {
 #define LLDIV_MIN -1000000000000000000LL
 #define LLDIV_MAX 1000000000000000000LL
 
-/**
-  Convert decimal value to lldiv_t value.
-  @param      from  The decimal value to convert from.
-  @param [out]  to    The lldiv_t variable to convert to.
-  @return           0 on success, error code on error.
-*/
 int decimal2lldiv_t(const decimal_t *from, lldiv_t *to) {
   int int_part = ROUND_UP(from->intg);
   int frac_part = ROUND_UP(from->frac);
@@ -1220,17 +1214,6 @@ int decimal2lldiv_t(const decimal_t *from, lldiv_t *to) {
   return 0;
 }
 
-/**
-  Convert double value to lldiv_t valie.
-  @param     nr The double value to convert from.
-  @param [out] lld   The lldit_t variable to convert to.
-  @return         0 on success, error code on error.
-
-  Integer part goes into lld.quot.
-  Fractional part multiplied to 1000000000 (10^9) goes to lld.rem.
-  Typically used in datetime calculations to split seconds
-  and nanoseconds.
-*/
 int double2lldiv_t(double nr, lldiv_t *lld) {
   if (nr > LLDIV_MAX) {
     lld->quot = LLDIV_MAX;
@@ -2011,6 +1994,10 @@ static int do_sub(const decimal_t *from1, const decimal_t *from2,
   return error;
 }
 
+/**
+  Returns the number of decimal digits before the decimal point in a decimal_t,
+  with any insignificant leading zeros removed.
+*/
 int decimal_intg(const decimal_t *from) {
   int res;
   remove_leading_zeroes(from, &res);

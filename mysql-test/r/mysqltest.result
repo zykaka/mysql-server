@@ -456,11 +456,8 @@ here is the sourced script
 "hello"
 "hello"
 mysqltest: At line 2: Invalid argument to sleep "xyz"
-mysqltest: At line 2: Invalid argument to real_sleep "xyz"
 mysqltest: At line 1: Missing required argument 'sleep_delay' to command 'sleep'
-mysqltest: At line 1: Missing required argument 'sleep_delay' to command 'real_sleep'
 mysqltest: At line 1: Invalid argument to sleep "abc"
-mysqltest: At line 1: Invalid argument to real_sleep "abc"
 1
 101
 -99
@@ -519,7 +516,7 @@ anything goes
 0 != string
 mysqltest: At line 2: Only == and != are supported for string values
 mysqltest: At line 2: Found junk '~= 6' after $variable in condition
-mysqltest: At line 2: Expression in if/while must beging with $, ` or a number
+mysqltest: At line 2: Expression in if() must begin with $, ` or a number
 mysqltest: At line 1: Missing right operand in comparison
 mysqltest: At line 1: Missing right operand in comparison
 counter is 2
@@ -2174,3 +2171,6 @@ c1
 abc 456.27
 long_string
 long_string
+CREATE TABLE t1 (i int primary key not null);
+INSERT INTO t1 values(3);
+DROP TABLE t1;

@@ -162,6 +162,9 @@ Handler_update	0
 Handler_write	0
 CREATE TABLE t_nopk(c1 INT NOT NULL , c2 INT NOT NULL)ENGINE=INNODB;
 INSERT INTO t_nopk SELECT c1, c2 FROM t_innodb;
+ANALYZE TABLE t_nopk;
+Table	Op	Msg_type	Msg_text
+test.t_nopk	analyze	status	OK
 SHOW CREATE TABLE t_nopk;
 Table	Create Table
 t_nopk	CREATE TABLE `t_nopk` (
@@ -547,7 +550,7 @@ EXPLAIN
 EXPLAIN FORMAT=tree SELECT COUNT(*) c FROM t_myisam HAVING c > 7;
 EXPLAIN
 -> Filter: (c > 7)
-    -> Rows fetched before execution
+    -> Rows fetched before execution  (cost=0.00 rows=1)
 
 SELECT COUNT(*) c FROM t_innodb LIMIT 10 OFFSET 5;
 c

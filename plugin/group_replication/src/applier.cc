@@ -201,6 +201,15 @@ void Applier_module::set_applier_thread_context() {
     in the process list.
   */
   thd->system_thread = SYSTEM_THREAD_SLAVE_IO;
+
+#ifdef HAVE_PSI_THREAD_INTERFACE
+  {
+    // Attach thread instrumentation
+    struct PSI_thread *psi = PSI_THREAD_CALL(get_thread)();
+    thd->set_psi(psi);
+  }
+#endif /* HAVE_PSI_THREAD_INTERFACE */
+
   // Make the thread have a better description on process list
   thd->set_query(STRING_WITH_LEN("Group replication applier module"));
   thd->set_query_for_display(
@@ -437,6 +446,13 @@ int Applier_module::applier_thread_handle() {
   mysql_mutex_unlock(&run_lock);
 
   fde_evt = new Format_description_log_event();
+  /*
+    Group replication does not use binary log checksumming on contents arriving
+    from certification. So, group replication applier channel shall behave as a
+    replication channel connected to a master that does not add checksum to its
+    binary log files.
+  */
+  fde_evt->common_footer->checksum_alg = binary_log::BINLOG_CHECKSUM_ALG_OFF;
   cont = new Continuation();
 
   // Give the handlers access to the applier THD
@@ -444,6 +460,19 @@ int Applier_module::applier_thread_handle() {
   // To prevent overwrite last error method
   applier_error += pipeline->handle_action(thd_conf_action);
   delete thd_conf_action;
+
+  // Update thread instrumentation
+#ifdef HAVE_PSI_THREAD_INTERFACE
+  {
+    struct PSI_thread *psi = applier_thd->get_psi();
+    PSI_THREAD_CALL(set_thread_id)(psi, applier_thd->thread_id());
+    PSI_THREAD_CALL(set_thread_THD)(psi, applier_thd);
+    PSI_THREAD_CALL(set_thread_command)(applier_thd->get_command());
+    // Restore Info field
+    PSI_THREAD_CALL(set_thread_info)
+    (STRING_WITH_LEN("Group replication applier module"));
+  }
+#endif
 
   // applier main loop
   while (!applier_error && !packet_application_error && !loop_termination) {
@@ -561,6 +590,12 @@ end:
     local_applier_error = applier_error;
 
   applier_killed_status = false;
+
+  // Detach thread instrumentation
+#ifdef HAVE_PSI_THREAD_INTERFACE
+  PSI_THREAD_CALL(set_thread_THD)(applier_thd->get_psi(), nullptr);
+#endif
+
   delete applier_thd;
   applier_thd_state.set_terminated();
   mysql_cond_broadcast(&run_cond);

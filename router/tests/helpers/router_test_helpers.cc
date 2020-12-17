@@ -244,9 +244,11 @@ bool wait_for_port_ready(uint16_t port, std::chrono::milliseconds timeout,
   hints.ai_socktype = SOCK_STREAM;
   hints.ai_flags = AI_PASSIVE;
 
+  auto step_ms = 10ms;
   // Valgrind needs way more time
   if (getenv("WITH_VALGRIND")) {
     timeout *= 10;
+    step_ms *= 10;
   }
 
   int status = getaddrinfo(hostname.c_str(), std::to_string(port).c_str(),
@@ -259,7 +261,6 @@ bool wait_for_port_ready(uint16_t port, std::chrono::milliseconds timeout,
   std::shared_ptr<void> exit_freeaddrinfo(nullptr,
                                           [&](void *) { freeaddrinfo(ainfo); });
 
-  const auto MSEC_STEP = 10ms;
   const auto started = std::chrono::steady_clock::now();
   do {
     auto sock_id =
@@ -292,7 +293,7 @@ bool wait_for_port_ready(uint16_t port, std::chrono::milliseconds timeout,
                                 std::generic_category());
       }
 #endif
-      const auto step = std::min(timeout, MSEC_STEP);
+      const auto step = std::min(timeout, step_ms);
       std::this_thread::sleep_for(std::chrono::milliseconds(step));
       timeout -= step;
     }
@@ -324,7 +325,7 @@ namespace {
 bool real_find_in_file(
     const std::string &file_path,
     const std::function<bool(const std::string &)> &predicate,
-    std::ifstream &in_file, std::ios::streampos &cur_pos) {
+    std::ifstream &in_file, std::streampos &cur_pos) {
   if (!in_file.is_open()) {
     in_file.clear();
     Path file(file_path);
@@ -357,7 +358,7 @@ bool find_in_file(const std::string &file_path,
                   std::chrono::milliseconds sleep_time) {
   const auto STEP = std::chrono::milliseconds(100);
   std::ifstream in_file;
-  std::ios::streampos cur_pos;
+  std::streampos cur_pos;
   do {
     try {
       // This is proxy function to account for the fact that I/O can sometimes

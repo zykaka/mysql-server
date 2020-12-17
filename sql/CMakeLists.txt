@@ -1,4 +1,4 @@
-# Copyright (c) 2006, 2020, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2006, 2020, Oracle and/or its affiliates.
 # 
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License, version 2.0,
@@ -24,13 +24,7 @@ INCLUDE_DIRECTORIES(SYSTEM ${BOOST_PATCHES_DIR} ${BOOST_INCLUDE_DIR})
 
 MY_INCLUDE_SYSTEM_DIRECTORIES(ICU)
 
-IF(MYSQL_MAINTAINER_MODE)
-  IF(MY_COMPILER_IS_GNU AND NOT CMAKE_CXX_COMPILER_VERSION VERSION_LESS 7)
-    ADD_COMPILE_OPTIONS("-Wshadow=local")
-  ELSEIF(MY_COMPILER_IS_CLANG)
-    ADD_COMPILE_OPTIONS("-Wshadow-uncaptured-local")
-  ENDIF()
-ENDIF()
+ADD_WSHADOW_WARNING()
 
 # Array indexing with pland_idx == int8 gives warnings.
 IF(SOLARIS AND MY_COMPILER_IS_GNU)
@@ -155,6 +149,7 @@ SET(DD_SOURCES
   dd/impl/system_views/collations.cc
   dd/impl/system_views/collation_charset_applicability.cc
   dd/impl/system_views/columns.cc
+  dd/impl/system_views/columns_extensions.cc
   dd/impl/system_views/column_statistics.cc
   dd/impl/system_views/enabled_roles.cc
   dd/impl/system_views/events.cc
@@ -175,16 +170,21 @@ SET(DD_SOURCES
   dd/impl/system_views/role_table_grants.cc
   dd/impl/system_views/routines.cc
   dd/impl/system_views/schemata.cc
+  dd/impl/system_views/schemata_extensions.cc
   dd/impl/system_views/statistics.cc
   dd/impl/system_views/st_spatial_reference_systems.cc
   dd/impl/system_views/st_units_of_measure.cc
   dd/impl/system_views/st_geometry_columns.cc
   dd/impl/system_views/tables.cc
+  dd/impl/system_views/tables_extensions.cc
   dd/impl/system_views/table_constraints.cc
+  dd/impl/system_views/table_constraints_extensions.cc
+  dd/impl/system_views/tablespaces_extensions.cc
   dd/impl/system_views/triggers.cc
   dd/impl/system_views/view_routine_usage.cc
   dd/impl/system_views/view_table_usage.cc
   dd/impl/system_views/views.cc
+  dd/impl/system_views/user_attributes.cc
 
   dd/impl/tables/character_sets.cc
   dd/impl/tables/check_constraints.cc
@@ -389,6 +389,8 @@ SET(SQL_SHARED_SOURCES
   item_timefunc.cc 
   item_xmlfunc.cc 
   item_inetfunc.cc
+  join_optimizer/access_path.cc
+  join_optimizer/explain_access_path.cc
   json_binary.cc
   json_diff.cc
   json_dom.cc
@@ -429,6 +431,7 @@ SET(SQL_SHARED_SOURCES
   parse_tree_node_base.cc
   parse_tree_nodes.cc
   parse_tree_partitions.cc
+  parse_tree_window.cc
   select_lex_visitor.cc
   parser_service.cc
   partition_info.cc
@@ -523,6 +526,7 @@ SET(SQL_SHARED_SOURCES
   sql_servers.cc
   sql_show.cc
   sql_show_status.cc
+  sql_show_processlist.cc
   sql_signal.cc
   sql_state.cc
   sql_table.cc
@@ -539,6 +543,10 @@ SET(SQL_SHARED_SOURCES
   sql_union.cc
   sql_update.cc
   sql_view.cc
+  ssl_acceptor_context_iterator.cc
+  ssl_acceptor_context_data.cc
+  ssl_acceptor_context_operator.cc
+  ssl_init_callback.cc
   stateless_allocator.cc
   strfunc.cc
   sys_vars.cc
@@ -558,7 +566,7 @@ SET(SQL_SHARED_SOURCES
   tztime.cc
   uniques.cc
   xa.cc
-  ssl_acceptor_context.cc
+  join_optimizer/hypergraph.cc
 )
 
 # BISON_TARGET(<Name> <YaccInput> <CodeOutput>
@@ -737,13 +745,12 @@ IF(WIN32)
     COMPILE_FLAGS "/bigobj")
 ENDIF()
 
-# Downgrade -Werror to warning for gcc 8.2.x
-IF(MY_COMPILER_IS_GNU
-    AND NOT CMAKE_CXX_COMPILER_VERSION VERSION_LESS 8.2
-    AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 8.3)
+# Downgrade -Werror to warning for gcc
+IF(MY_COMPILER_IS_GNU)
   MY_CHECK_CXX_COMPILER_WARNING("error=maybe-uninitialized" HAS_WARN_FLAG)
   IF(HAS_WARN_FLAG)
     ADD_COMPILE_FLAGS(
+      geometry_rtree.cc
       item_geofunc_relchecks_bgwrap.cc
       COMPILE_FLAGS ${HAS_WARN_FLAG}
       )
@@ -793,6 +800,14 @@ ADD_DEPENDENCIES(sql_gis GenSysSchema)
 ADD_DEPENDENCIES(sql_gis GenError)
 TARGET_LINK_LIBRARIES(sql_gis sql_dd sql_main)
 SET_TARGET_PROPERTIES(sql_gis PROPERTIES LINK_INTERFACE_MULTIPLICITY 3)
+
+# This typically saves a few hundred megabytes of disk space.
+IF(COMPRESS_DEBUG_SECTIONS)
+  MY_CHECK_CXX_COMPILER_FLAG("-gz" HAVE_COMPRESS_GZ_OPTION)
+  IF(HAVE_COMPRESS_GZ_OPTION)
+    TARGET_COMPILE_OPTIONS(sql_gis PRIVATE -gz)
+  ENDIF()
+ENDIF()
 
 # A class with a reference member lacks a user-defined constructor,
 # which can lead to errors.
@@ -865,6 +880,7 @@ SET(BINLOG_SOURCE
   rpl_filter.cc
   rpl_gtid_execution.cc
   rpl_gtid_misc.cc
+  rpl_gtid_mode.cc
   rpl_gtid_mutex_cond_array.cc
   rpl_gtid_owned.cc
   rpl_gtid_persist.cc
@@ -899,7 +915,12 @@ TARGET_LINK_LIBRARIES(master binlog sql_main)
 SET (SLAVE_SOURCE
   dynamic_ids.cc
   rpl_applier_reader.cc
+  rpl_async_conn_failover.cc
+  rpl_async_conn_failover_table_operations.cc
+  rpl_async_conn_failover_add_source_udf.cc
+  rpl_async_conn_failover_delete_source_udf.cc
   rpl_channel_service_interface.cc
+  rpl_channel_credentials.cc
   rpl_info.cc
   rpl_info_dummy.cc
   rpl_info_factory.cc
@@ -917,7 +938,11 @@ SET (SLAVE_SOURCE
   rpl_slave.cc
   rpl_slave_commit_order_manager.cc
   rpl_slave_until_options.cc
+  rpl_sys_key_access.cc
+  rpl_sys_table_access.cc
   rpl_trx_boundary_parser.cc
+  udf_service_impl.cc
+  udf_service_util.cc
   )
 ADD_LIBRARY(slave STATIC ${SLAVE_SOURCE})
 ADD_DEPENDENCIES(slave GenError)
@@ -969,6 +994,15 @@ IF(APPLE)
 ENDIF() 
 
 SET_TARGET_PROPERTIES(mysqld PROPERTIES ENABLE_EXPORTS TRUE)
+
+IF(WITH_LTO OR CMAKE_COMPILER_FLAG_WITH_LTO)
+  # We get ODR violations because of multiple bison parsers.
+  MY_CHECK_CXX_COMPILER_WARNING("error=odr" HAS_WARN_FLAG)
+  IF(HAS_WARN_FLAG)
+    MY_TARGET_LINK_OPTIONS(mysqld "${HAS_WARN_FLAG}")
+  ENDIF()
+ENDIF()
+
 GET_TARGET_PROPERTY(mysqld_link_flags mysqld LINK_FLAGS)
 IF(NOT mysqld_link_flags)
   SET(mysqld_link_flags)
@@ -1000,12 +1034,16 @@ IF(MSVC)
   # Set module definition file.
   SET_TARGET_PROPERTIES(mysqld
     PROPERTIES LINK_FLAGS
-    "${mysqld_link_flags} /DEF:${CMAKE_CURRENT_BINARY_DIR}/mysqld.def")
+    "${mysqld_link_flags} /DEF:${CMAKE_CURRENT_BINARY_DIR}/${CMAKE_CFG_INTDIR}/mysqld.def")
 
   SET(_PLATFORM  x64)
-  ADD_CUSTOM_COMMAND(TARGET mysqld PRE_LINK
-    COMMAND echo ${_PLATFORM} && cscript ARGS //nologo ${PROJECT_SOURCE_DIR}/win/create_def_file.js
-    ${_PLATFORM}
+
+  MYSQL_ADD_EXECUTABLE(create_def create_def.cc SKIP_INSTALL)
+
+  # Build mysql_fix_privilege_tables.h
+  ADD_CUSTOM_COMMAND(
+    OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/${CMAKE_CFG_INTDIR}/mysqld.def
+    COMMAND create_def
     "$<TARGET_FILE:binlog>"
     "$<TARGET_FILE:binlogevents_static>"
     "$<TARGET_FILE:mysys>"
@@ -1016,14 +1054,35 @@ IF(MSVC)
     "$<TARGET_FILE:strings>"
     "$<TARGET_FILE:vio>"
     > mysqld.def
-    WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
+    WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/${CMAKE_CFG_INTDIR}"
+    DEPENDS create_def binlog binlogevents_static mysys mytime rpl slave sql_main strings vio
+  )
+  ADD_CUSTOM_TARGET(GenMysqldDef ALL
+    DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/${CMAKE_CFG_INTDIR}/mysqld.def)
+
   ADD_DEPENDENCIES(sql_main GenError)
+  ADD_DEPENDENCIES(mysqld GenMysqldDef)
 ENDIF()
 
 SET_TARGET_PROPERTIES(mysqld PROPERTIES ENABLE_EXPORTS TRUE) 
 TARGET_LINK_LIBRARIES(mysqld
   sql_main sql_gis binlog rpl master slave sql_dd mysys
   minchassis binlogevents_static ${ICU_LIBRARIES})
+
+# Add dependency on ldap library, to ensure it is not unloaded
+# when we shutdown the authentication plugin.
+# For Valgrind, we need it to enable our suppressions.
+# For OpenSSL in the 1.0.x series, we need it for clean shutdown.
+IF(WITH_VALGRIND)
+  SET(LINK_MYSQLD_LDAP_LIBRARY 1)
+ENDIF()
+IF(WITH_SSL STREQUAL "system" AND
+    "${OPENSSL_MAJOR_VERSION}.${OPENSSL_MINOR_VERSION}" VERSION_LESS "1.1")
+  SET(LINK_MYSQLD_LDAP_LIBRARY 1)
+ENDIF()
+IF(WITH_AUTHENTICATION_LDAP AND LINK_MYSQLD_LDAP_LIBRARY)
+  TARGET_LINK_LIBRARIES(mysqld ${LDAP_LIBRARY})
+ENDIF()
 
 # Remove transitive link dependencies when linking plugins
 SET_TARGET_PROPERTIES(mysqld PROPERTIES INTERFACE_LINK_LIBRARIES "")
@@ -1146,16 +1205,20 @@ ADD_CUSTOM_TARGET(
 )
 
 MYSQL_ADD_PLUGIN(udf_example udf_example.cc
-  MODULE_ONLY TEST_ONLY MODULE_OUTPUT_NAME "udf_example")
-IF(WIN32)
+  MODULE_ONLY TEST_ONLY MODULE_OUTPUT_NAME "udf_example"
+  )
+# MYSQL_ADD_PLUGIN may have decided not to build it.
+IF(WIN32 AND TARGET udf_example)
   SET_TARGET_PROPERTIES(udf_example
     PROPERTIES LINK_FLAGS
     "/DEF:${CMAKE_CURRENT_SOURCE_DIR}/udf_example.def")
 ENDIF()
 
 MYSQL_ADD_PLUGIN(locking_service locking_service_udf.cc
-  MODULE_ONLY MODULE_OUTPUT_NAME "locking_service")
-IF(WIN32)
+  MODULE_ONLY MODULE_OUTPUT_NAME "locking_service"
+  )
+# MYSQL_ADD_PLUGIN may have decided not to build it.
+IF(WIN32 AND TARGET locking_service)
   SET_TARGET_PROPERTIES(locking_service
     PROPERTIES LINK_FLAGS
     "/DEF:${CMAKE_CURRENT_SOURCE_DIR}/locking_service.def")

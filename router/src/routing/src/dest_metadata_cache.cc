@@ -1,5 +1,5 @@
 /*
-  Copyright (c) 2016, 2020, Oracle and/or its affiliates. All rights reserved.
+  Copyright (c) 2016, 2020, Oracle and/or its affiliates.
 
   This program is free software; you can redistribute it and/or modify
   it under the terms of the GNU General Public License, version 2.0,
@@ -25,36 +25,30 @@
 #include "dest_metadata_cache.h"
 
 #include <algorithm>
+#include <cctype>  // toupper
 #include <chrono>
-#include <iostream>
+#include <iterator>  // advance
+#include <memory>
 #include <set>
 #include <stdexcept>
-#ifndef _WIN32
-#include <netdb.h>
-#include <netinet/tcp.h>
-#endif
+#include <string>
+#include <system_error>
 
 #include "mysql/harness/logging/logging.h"
 #include "mysql/harness/plugin.h"
+#include "mysqlrouter/destination.h"
 #include "mysqlrouter/routing.h"
-#include "mysqlrouter/utils.h"
+#include "socket_operations.h"
 #include "tcp_address.h"
-#include "utils.h"
 
-using mysqlrouter::to_string;
-using std::out_of_range;
-using std::runtime_error;
-using std::chrono::duration_cast;
-using std::chrono::seconds;
-using std::chrono::system_clock;
+using namespace std::chrono_literals;
 
-using metadata_cache::ManagedInstance;
 IMPORT_LOG_FUNCTIONS()
 
 // if client wants a PRIMARY and there's none, we can wait up to this amount of
 // seconds until giving up and disconnecting the client
 // TODO: possibly this should be made into a configurable option
-static const int kPrimaryFailoverTimeout = 10;
+static const auto kPrimaryFailoverTimeout = 10s;
 
 static const std::set<std::string> supported_params{
     "role", "allow_primary_reads", "disconnect_on_promoted_to_primary",
@@ -65,7 +59,8 @@ namespace {
 DestMetadataCacheGroup::ServerRole get_server_role_from_uri(
     const mysqlrouter::URIQuery &uri) {
   if (uri.find("role") == uri.end())
-    throw runtime_error("Missing 'role' in routing destination specification");
+    throw std::runtime_error(
+        "Missing 'role' in routing destination specification");
 
   const std::string name = uri.at("role");
   std::string name_uc = name;
@@ -193,8 +188,8 @@ DestMetadataCacheGroup::DestMetadataCacheGroup(
     const mysqlrouter::URIQuery &query, const Protocol::Type protocol,
     const routing::AccessMode access_mode,
     metadata_cache::MetadataCacheAPIBase *cache_api,
-    routing::RoutingSockOpsInterface *routing_sock_ops)
-    : RouteDestination(protocol, routing_sock_ops),
+    mysql_harness::SocketOperationsBase *sock_ops)
+    : RouteDestination(protocol, sock_ops),
       cache_name_(metadata_cache),
       ha_replicaset_(replicaset),
       uri_query_(query),
@@ -237,33 +232,40 @@ DestMetadataCacheGroup::get_available(
   }
 
   for (const auto &it : managed_servers_vec) {
-    if (!(it.role == "HA")) {
-      continue;
+    if (for_new_connections) {
+      // for new connections skip (do not include) the node if it is hidden - it
+      // is not allowed
+      if (it.hidden) continue;
+    } else {
+      // for the existing connections skip (do not include) the node if it is
+      // hidden and disconnect_existing_sessions_when_hidden is true
+      if (it.hidden && it.disconnect_existing_sessions_when_hidden) continue;
     }
+
     auto port = (protocol_ == Protocol::Type::kXProtocol) ? it.xport : it.port;
 
     // role=PRIMARY_AND_SECONDARY
     if ((server_role_ == ServerRole::PrimaryAndSecondary) &&
         (it.mode == metadata_cache::ServerMode::ReadWrite ||
          it.mode == metadata_cache::ServerMode::ReadOnly)) {
-      result.address.push_back(mysql_harness::TCPAddress(it.host, port));
-      result.id.push_back(it.mysql_server_uuid);
+      result.emplace_back(mysql_harness::TCPAddress(it.host, port),
+                          it.mysql_server_uuid);
       continue;
     }
 
     // role=SECONDARY
     if (server_role_ == ServerRole::Secondary &&
         it.mode == metadata_cache::ServerMode::ReadOnly) {
-      result.address.push_back(mysql_harness::TCPAddress(it.host, port));
-      result.id.push_back(it.mysql_server_uuid);
+      result.emplace_back(mysql_harness::TCPAddress(it.host, port),
+                          it.mysql_server_uuid);
       continue;
     }
 
     // role=PRIMARY
     if ((server_role_ == ServerRole::Primary || primary_fallback) &&
         it.mode == metadata_cache::ServerMode::ReadWrite) {
-      result.address.push_back(mysql_harness::TCPAddress(it.host, port));
-      result.id.push_back(it.mysql_server_uuid);
+      result.emplace_back(mysql_harness::TCPAddress(it.host, port),
+                          it.mysql_server_uuid);
       continue;
     }
   }
@@ -278,14 +280,13 @@ DestMetadataCacheGroup::get_available_primaries(
   const auto &managed_servers_vec = managed_servers.instance_vector;
 
   for (const auto &it : managed_servers_vec) {
-    if (!(it.role == "HA")) {
-      continue;
-    }
+    if (it.hidden) continue;
+
     auto port = (protocol_ == Protocol::Type::kXProtocol) ? it.xport : it.port;
 
     if (it.mode == metadata_cache::ServerMode::ReadWrite) {
-      result.address.push_back(mysql_harness::TCPAddress(it.host, port));
-      result.id.push_back(it.mysql_server_uuid);
+      result.emplace_back(mysql_harness::TCPAddress(it.host, port),
+                          it.mysql_server_uuid);
     }
   }
 
@@ -383,163 +384,182 @@ DestMetadataCacheGroup::~DestMetadataCacheGroup() {
   }
 }
 
-size_t DestMetadataCacheGroup::get_next_server(
-    const DestMetadataCacheGroup::AvailableDestinations &available,
-    size_t first_available) {
-  size_t result = 0;
+class MetadataCacheDestination : public Destination {
+ public:
+  MetadataCacheDestination(std::string id, std::string addr, uint16_t port,
+                           DestMetadataCacheGroup *balancer,
+                           std::string server_uuid)
+      : Destination(std::move(id), std::move(addr), port),
+        balancer_{balancer},
+        server_uuid_{std::move(server_uuid)} {}
+
+  void connect_status(std::error_code ec) override {
+    if (ec != std::error_code{}) {
+      balancer_->cache_api()->mark_instance_reachability(
+          server_uuid_, metadata_cache::InstanceStatus::Unreachable);
+
+      // the tests
+      //
+      // - NodeUnavailable/NodeUnavailableTest.NodeUnavailable/1, where
+      //   GetParam() = "round-robin"
+      // - NodeUnavailable/NodeUnavailableTest.NodeUnavailable/2, where
+      //   GetParam() = "round-robin-with-fallback"
+      //
+      // rely on moving the ndx forward in case of failure.
+
+      balancer_->advance(1);
+    }
+  }
+
+ private:
+  DestMetadataCacheGroup *balancer_;
+
+  std::string server_uuid_;
+};
+
+// the first round of destinations didn't succeed.
+//
+// try to fallback.
+stdx::expected<Destinations, void> DestMetadataCacheGroup::refresh_destinations(
+    const Destinations &previous_dests) {
+  if (cache_api_->cluster_type() == mysqlrouter::ClusterType::RS_V2) {
+    // ReplicaSet
+    if (routing_strategy_ ==
+            routing::RoutingStrategy::kRoundRobinWithFallback &&
+        !previous_dests.primary()) {
+      // get the primaries
+      return primary_destinations();
+    }
+  } else {
+    // Group Replication
+    if (server_role() == DestMetadataCacheGroup::ServerRole::Primary) {
+      // if connecting to the primary failed, wait for failover and fetch a new
+      // list of candidates.
+      //
+      // in case of timeout, fail
+
+      if (cache_api_->wait_primary_failover(ha_replicaset_,
+                                            kPrimaryFailoverTimeout)) {
+        return primary_destinations();
+      }
+    }
+  }
+
+  return stdx::make_unexpected();
+}
+
+Destinations DestMetadataCacheGroup::balance(
+    const AvailableDestinations &available, bool primary_fallback) {
+  Destinations dests;
 
   switch (routing_strategy_) {
-    case routing::RoutingStrategy::kFirstAvailable:
-      result = first_available;
-      break;
-    case routing::RoutingStrategy::kRoundRobin:
-    case routing::RoutingStrategy::kRoundRobinWithFallback: {
-      std::lock_guard<std::mutex> lock(mutex_update_);
-      result = current_pos_;
-      if (result >= available.address.size()) {
-        result = 0;
-        current_pos_ = 0;
+    case routing::RoutingStrategy::kFirstAvailable: {
+      for (auto const &dest : available) {
+        dests.push_back(std::make_unique<MetadataCacheDestination>(
+            dest.address.str(), dest.address.addr, dest.address.port, this,
+            dest.id));
       }
-      ++current_pos_;
-      if (current_pos_ >= available.address.size()) {
-        current_pos_ = 0;
-      }
+
       break;
     }
-    default:
+    case routing::RoutingStrategy::kRoundRobinWithFallback:
+    case routing::RoutingStrategy::kRoundRobin: {
+      const auto sz = available.size();
+      const auto end = available.end();
+      const auto begin = available.begin();
+
+      auto cur = begin;
+
+      if (start_pos_ >= sz) start_pos_ = 0;
+
+      // move iterator forward and remember the position as 'last'
+      std::advance(cur, start_pos_);
+      auto last = cur;
+
+      // for start_pos == 2:
+      //
+      // 0 1 2 3 4 x
+      // ^   ^     ^
+      // |   |     `- end
+      // |   `- last|cur
+      // `- begin
+
+      // from last to end;
+      //
+      // dests = [2 3 4]
+      for (; cur != end; ++cur) {
+        dests.push_back(std::make_unique<MetadataCacheDestination>(
+            cur->address.str(), cur->address.addr, cur->address.port, this,
+            cur->id));
+      }
+
+      // from begin to before-last
+      //
+      // dests = [2 3 4] + [0 1]
+      for (cur = begin; cur != last; ++cur) {
+        dests.push_back(std::make_unique<MetadataCacheDestination>(
+            cur->address.str(), cur->address.addr, cur->address.port, this,
+            cur->id));
+      }
+
+      // NOTE: AsyncReplicasetTest.SecondaryAdded from
+      // routertest_component_async_replicaset depends on the start_pos_ is
+      // capped here.
+      //
+      // replacing it with:
+      //
+      //    ++start_pos_;
+      //
+      // would be correct too, but change the order of destinations that the
+      // test expects.
+      if (++start_pos_ >= sz) start_pos_ = 0;
+
+      break;
+    }
+    case routing::RoutingStrategy::kNextAvailable:
+    case routing::RoutingStrategy::kUndefined:
       assert(0);
-      // impossible we verify this in init()
-  }
-
-  return result;
-}
-
-int DestMetadataCacheGroup::get_server_socket(
-    std::chrono::milliseconds connect_timeout, int *error,
-    mysql_harness::TCPAddress *address) noexcept {
-  if (cache_api_->cluster_type() == mysqlrouter::ClusterType::RS_V2)
-    return get_server_socket_rs(connect_timeout, error, address);
-  else
-    return get_server_socket_gr(connect_timeout, error, address);
-}
-
-int DestMetadataCacheGroup::get_server_socket_gr(
-    std::chrono::milliseconds connect_timeout, int *error,
-    mysql_harness::TCPAddress *address) noexcept {
-  while (true) {
-    try {
-      auto available =
-          get_available(
-              cache_api_->lookup_replicaset(ha_replicaset_).instance_vector)
-              .first;
-      if (available.address.empty()) {
-        log_warning(
-            "No available servers found for '%s' %s routing",
-            ha_replicaset_.c_str(),
-            server_role_ == ServerRole::Primary ? "PRIMARY" : "SECONDARY");
-        return -1;
-      }
-
-      size_t next_up = get_next_server(available);
-      int fd = get_mysql_socket(available.address.at(next_up), connect_timeout);
-      if (fd < 0) {
-        // Signal that we can't connect to the instance
-        cache_api_->mark_instance_reachability(
-            available.id.at(next_up),
-            metadata_cache::InstanceStatus::Unreachable);
-        // if we're looking for a primary member, wait for there to be at least
-        // one
-        if (server_role_ == ServerRole::Primary &&
-            cache_api_->wait_primary_failover(ha_replicaset_,
-                                              kPrimaryFailoverTimeout)) {
-          log_info("Retrying connection for '%s' after possible failover",
-                   ha_replicaset_.c_str());
-          continue;  // retry
-        }
-      }
-      if (address) *address = available.address.at(next_up);
-      return fd;
-    } catch (std::runtime_error &re) {
-      log_error("Failed getting managed servers from the Metadata server: %s",
-                re.what());
       break;
-    }
   }
 
-  *error = errno;
-  return -1;
-}
-
-int DestMetadataCacheGroup::get_server_socket_rs(
-    std::chrono::milliseconds connect_timeout, int *error,
-    mysql_harness::TCPAddress *address) noexcept {
-  auto get_alive_node =
-      [&](const DestMetadataCacheGroup::AvailableDestinations &candidate_nodes)
-      -> int {
-    size_t first_available{0};
-
-    const size_t first_tried = get_next_server(candidate_nodes);
-    size_t current_tried{first_tried};
-    do {
-      int fd = get_mysql_socket(candidate_nodes.address.at(current_tried),
-                                connect_timeout);
-
-      if (fd >= 0) {
-        if (address) *address = candidate_nodes.address.at(current_tried);
-        return fd;
-      }
-
-      if (routing_strategy_ == routing::RoutingStrategy::kFirstAvailable) {
-        if (first_available == candidate_nodes.address.size() - 1)
-          first_available = 0;
-        else
-          first_available++;
-      }
-
-      current_tried = get_next_server(candidate_nodes, first_available);
-    } while (current_tried !=
-             first_tried);  // stop when we tried all available servers, could
-                            // not connect to any of them
-
-    *error = errno;
-    return -1;
-  };
-
-  DestMetadataCacheGroup::AvailableDestinations available;
-  bool primary_failover;
-  const auto all_replicaset_nodes =
-      cache_api_->lookup_replicaset(ha_replicaset_).instance_vector;
-
-  try {
-    std::tie(available, primary_failover) = get_available(all_replicaset_nodes);
-  } catch (std::runtime_error &re) {
-    log_error("Failed getting managed servers from the Metadata server: %s",
-              re.what());
-    return -1;
-  }
-
-  if (available.address.empty()) {
+  if (dests.empty()) {
     log_warning("No available servers found for '%s' %s routing",
                 ha_replicaset_.c_str(),
                 server_role_ == ServerRole::Primary ? "PRIMARY" : "SECONDARY");
-    return -1;
+
+    // return an empty list
+    return dests;
   }
 
-  const int result = get_alive_node(available);
-  if (result != -1 ||
-      routing_strategy_ != routing::RoutingStrategy::kRoundRobinWithFallback ||
-      primary_failover) {
-    return result;
+  if (primary_fallback) {
+    // announce that we already use the primaries and don't want to fallback
+    dests.primary(true);
   }
+  return dests;
+}
 
-  // the routing strategy is round-robin-with-fallback, we could not connect to
-  // any of the secondaries even though there were some
-  // (primary_failover==false). now we try to connect to one of the primaries
-  // then.
-  available = get_available_primaries(all_replicaset_nodes);
-  if (available.address.empty()) return result;
+Destinations DestMetadataCacheGroup::destinations() {
+  if (!cache_api_->is_initialized()) return {};
 
-  return get_alive_node(available);
+  AvailableDestinations available;
+  bool primary_failover;
+  const auto &all_replicaset_nodes =
+      cache_api_->lookup_replicaset(ha_replicaset_).instance_vector;
+
+  std::tie(available, primary_failover) = get_available(all_replicaset_nodes);
+
+  return balance(available, primary_failover);
+}
+
+Destinations DestMetadataCacheGroup::primary_destinations() {
+  if (!cache_api_->is_initialized()) return {};
+
+  const auto &all_replicaset_nodes =
+      cache_api_->lookup_replicaset(ha_replicaset_).instance_vector;
+
+  auto available = get_available_primaries(all_replicaset_nodes);
+
+  return balance(available, true);
 }
 
 DestMetadataCacheGroup::AddrVector DestMetadataCacheGroup::get_destinations()
@@ -552,7 +572,12 @@ DestMetadataCacheGroup::AddrVector DestMetadataCacheGroup::get_destinations()
           cache_api_->lookup_replicaset(ha_replicaset_).instance_vector)
           .first;
 
-  return available.address;
+  AddrVector addresses;
+  for (const auto &dest : available) {
+    addresses.emplace_back(dest.address);
+  }
+
+  return addresses;
 }
 
 void DestMetadataCacheGroup::on_instances_change(
@@ -571,11 +596,17 @@ void DestMetadataCacheGroup::on_instances_change(
 
   const auto &available_nodes =
       get_available(instances, /*for_new_connections=*/false).first;
+  AllowedNodes addresses;
+  for (const auto &dest : available_nodes) {
+    addresses.emplace_back(dest.address.str());
+  }
+
   std::lock_guard<std::mutex> lock(allowed_nodes_change_callbacks_mtx_);
+
   // notify all the registered listeners about the list of available nodes
   // change
   for (auto &clb : allowed_nodes_change_callbacks_) {
-    clb(available_nodes.address, reason);
+    clb(addresses, reason);
   }
 }
 
@@ -588,7 +619,7 @@ void DestMetadataCacheGroup::notify(
 void DestMetadataCacheGroup::start(const mysql_harness::PluginFuncEnv *env) {
   // before using metadata-cache we need to wait for it to be initialized
   while (!cache_api_->is_initialized() && (!env || is_running(env))) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    std::this_thread::sleep_for(1ms);
   }
 
   if (!env || is_running(env)) {

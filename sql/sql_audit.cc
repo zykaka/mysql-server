@@ -1,4 +1,4 @@
-/* Copyright (c) 2007, 2020, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2007, 2020, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -99,7 +99,7 @@ class Audit_error_handler : public Internal_error_handler {
   /**
     @brief Destruction.
   */
-  virtual ~Audit_error_handler() {
+  ~Audit_error_handler() override {
     if (m_active) {
       /* Deactivate this handler. */
       m_thd->pop_internal_handler();
@@ -120,9 +120,9 @@ class Audit_error_handler : public Internal_error_handler {
 
     @returns True on error rejection, otherwise false.
   */
-  virtual bool handle_condition(THD *, uint sql_errno, const char *sqlstate,
-                                Sql_condition::enum_severity_level *,
-                                const char *msg) {
+  bool handle_condition(THD *, uint sql_errno, const char *sqlstate,
+                        Sql_condition::enum_severity_level *,
+                        const char *msg) override {
     if (m_active && handle()) {
       /* Error has been rejected. Write warning message. */
       print_warning(m_warning_message, sql_errno, sqlstate, msg);
@@ -324,7 +324,7 @@ class Ignore_event_error_handler : public Audit_error_handler {
     @brief Construction.
 
     @param thd             Current thread data.
-    @param event_name
+    @param event_name      Textual form of the audit event enum.
   */
   Ignore_event_error_handler(THD *thd, const char *event_name)
       : Audit_error_handler(thd, ""), m_event_name(event_name) {}
@@ -334,7 +334,7 @@ class Ignore_event_error_handler : public Audit_error_handler {
 
     @retval True on error rejection, otherwise false.
   */
-  virtual bool handle() { return true; }
+  bool handle() override { return true; }
 
   /**
     @brief Custom warning print routine.
@@ -346,9 +346,9 @@ class Ignore_event_error_handler : public Audit_error_handler {
     @param sqlstate  The SQL state of the underlying error. NULL if none
     @param msg       The text of the underlying error. NULL if none
   */
-  virtual void print_warning(const char *warn_msg MY_ATTRIBUTE((unused)),
-                             uint sql_errno, const char *sqlstate,
-                             const char *msg) {
+  void print_warning(const char *warn_msg MY_ATTRIBUTE((unused)),
+                     uint sql_errno, const char *sqlstate,
+                     const char *msg) override {
     LogErr(WARNING_LEVEL, ER_AUDIT_CANT_ABORT_EVENT, m_event_name, sql_errno,
            sqlstate ? sqlstate : "<NO_STATE>", msg ? msg : "<NO_MESSAGE>");
   }
@@ -414,9 +414,15 @@ int mysql_audit_notify(THD *thd, mysql_event_connection_subclass_t subclass,
                        const char *subclass_name, int errcode) {
   mysql_event_connection event;
 
+  /*
+    Do not take into account m_auditing_activated flag. Always generate
+    events of the MYSQL_AUDIT_CONNECTION_CLASS class.
+  */
   if (mysql_audit_acquire_plugins(thd, MYSQL_AUDIT_CONNECTION_CLASS,
-                                  static_cast<unsigned long>(subclass)))
+                                  static_cast<unsigned long>(subclass),
+                                  false)) {
     return 0;
+  }
 
   event.event_subclass = subclass;
   event.status = errcode;
@@ -497,7 +503,8 @@ inline bool generate_table_access_event(TABLE_LIST *table) {
 
   /* Generate event for SYSTEM and USER tables, which are not temp tables. */
   if ((table->table->s->table_category == TABLE_CATEGORY_SYSTEM ||
-       table->table->s->table_category == TABLE_CATEGORY_USER) &&
+       table->table->s->table_category == TABLE_CATEGORY_USER ||
+       table->table->s->table_category == TABLE_CATEGORY_ACL_TABLE) &&
       table->table->s->tmp_table == NO_TMP_TABLE)
     return true;
 
@@ -779,7 +786,7 @@ class Ignore_command_start_error_handler : public Audit_error_handler {
 
     @param thd     Current thread data.
     @param command Current command that the handler will be active against.
-    @param command_text
+    @param command_text SQL command.
   */
   Ignore_command_start_error_handler(THD *thd, enum_server_command command,
                                      const char *command_text)
@@ -792,7 +799,7 @@ class Ignore_command_start_error_handler : public Audit_error_handler {
 
     @retval True on error rejection, otherwise false.
   */
-  virtual bool handle() { return ignore_command(m_command); }
+  bool handle() override { return ignore_command(m_command); }
 
   /**
     @brief Custom warning print routine.
@@ -804,9 +811,9 @@ class Ignore_command_start_error_handler : public Audit_error_handler {
     @param sqlstate  The SQL state of the underlying error. NULL if none
     @param msg       The text of the underlying error. NULL if none
   */
-  virtual void print_warning(const char *warn_msg MY_ATTRIBUTE((unused)),
-                             uint sql_errno, const char *sqlstate,
-                             const char *msg) {
+  void print_warning(const char *warn_msg MY_ATTRIBUTE((unused)),
+                     uint sql_errno, const char *sqlstate,
+                     const char *msg) override {
     LogErr(WARNING_LEVEL, ER_AUDIT_CANT_ABORT_COMMAND, m_command_text,
            sql_errno, sqlstate ? sqlstate : "<NO_STATE>",
            msg ? msg : "<NO_MESSAGE>");
@@ -1063,14 +1070,20 @@ static bool acquire_plugins(THD *thd, plugin_ref plugin, void *arg) {
   @param thd            MySQL thread handle.
   @param event_class    Audit event class.
   @param event_subclass Audit event subclass.
+  @param check_audited  Take into account m_auditing_activated flag
+                        of the THD.
 
   @return Zero, when there is a plugins interested in the event specified
           by event_class and event_subclass. Otherwise non zero value is
           returned.
 */
 int mysql_audit_acquire_plugins(THD *thd, mysql_event_class_t event_class,
-                                unsigned long event_subclass) {
+                                unsigned long event_subclass,
+                                bool check_audited) {
   DBUG_TRACE;
+
+  if (check_audited && thd && thd->m_audited == false) return 1;
+
   unsigned long global_mask = mysql_global_audit_mask[event_class];
 
   if (thd && !check_audit_mask(global_mask, event_subclass) &&
@@ -1120,7 +1133,7 @@ int mysql_audit_acquire_plugins(THD *thd, mysql_event_class_t event_class,
 /**
   Release any resources associated with the current thd.
 
-  @param[in] thd
+  @param[in] thd Current thread
 
 */
 
@@ -1151,10 +1164,12 @@ void mysql_audit_release(THD *thd) {
   thd->audit_class_mask.resize(MYSQL_AUDIT_CLASS_MASK_SIZE);
 }
 
+void mysql_audit_enable_auditing(THD *thd) { thd->m_audited = true; }
+
 /**
   Initialize thd variables used by Audit
 
-  @param[in] thd
+  @param[in] thd Current thread
 
 */
 
@@ -1212,7 +1227,7 @@ void mysql_audit_finalize() { mysql_mutex_destroy(&LOCK_audit_mask); }
 /**
   Initialize an Audit plug-in
 
-  @param[in] plugin
+  @param[in] plugin Plugin structure pointer to be initialized.
 
   @retval false  OK
   @retval true   There was an error.
@@ -1257,8 +1272,8 @@ int initialize_audit_plugin(st_plugin_int *plugin) {
 /**
   Performs a bitwise OR of the installed plugins event class masks
 
-  @param[in] plugin
-  @param[in] arg
+  @param[in] plugin Source of the audit mask.
+  @param[in] arg    Destination, where the audit mask is copied.
 
   @retval false  always
 */
@@ -1272,7 +1287,7 @@ static bool calc_class_mask(THD *, plugin_ref plugin, void *arg) {
 /**
   Finalize an Audit plug-in
 
-  @param[in] plugin
+  @param[in] plugin Plugin data pointer to be deinitialized.
 
   @retval false  OK
   @retval true   There was an error.
@@ -1309,9 +1324,9 @@ int finalize_audit_plugin(st_plugin_int *plugin) {
 /**
   Dispatches an event by invoking the plugin's event_notify method.
 
-  @param[in] thd
-  @param[in] plugin
-  @param[in] arg
+  @param[in] thd    Session THD containing references to the audit plugins.
+  @param[in] plugin Plugin used for dispatching the event.
+  @param[in] arg    Opaque event data structure.
 
   @retval false  always
 */
@@ -1339,9 +1354,9 @@ static bool plugins_dispatch_bool(THD *thd, plugin_ref plugin, void *arg) {
 /**
   Distributes an audit event to plug-ins
 
-  @param[in] thd
-  @param     event_class
-  @param[in] event
+  @param[in] thd          THD that generated the event.
+  @param     event_class  Audit event class.
+  @param[in] event        Opaque pointer to the event data.
 */
 
 static int event_class_dispatch(THD *thd, mysql_event_class_t event_class,

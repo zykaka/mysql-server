@@ -1,6 +1,6 @@
 /***********************************************************************
 
-Copyright (c) 2019, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 2019, 2020, Oracle and/or its affiliates.
 
 This program is free software; you can redistribute it and/or modify
 it under the terms of the GNU General Public License, version 2.0,
@@ -105,7 +105,7 @@ class Encryption {
   static constexpr size_t INFO_MAX_SIZE = INFO_SIZE + sizeof(uint32);
 
   /** Default master key id for bootstrap */
-  static constexpr size_t DEFAULT_MASTER_KEY_ID = 0;
+  static constexpr uint32_t DEFAULT_MASTER_KEY_ID = 0;
 
   /** (De)Encryption Operation information size */
   static constexpr size_t OPERATION_INFO_SIZE = 1;
@@ -148,40 +148,39 @@ class Encryption {
   /** Check if page is encrypted page or not
   @param[in]  page  page which need to check
   @return true if it is an encrypted page */
-  static bool is_encrypted_page(const byte *page) noexcept MY_ATTRIBUTE(
-      (warn_unused_result));
+  static bool is_encrypted_page(const byte *page) noexcept
+      MY_ATTRIBUTE((warn_unused_result));
 
   /** Check if a log block is encrypted or not
   @param[in]  block block which need to check
   @return true if it is an encrypted block */
-  static bool is_encrypted_log(const byte *block) noexcept MY_ATTRIBUTE(
-      (warn_unused_result));
+  static bool is_encrypted_log(const byte *block) noexcept
+      MY_ATTRIBUTE((warn_unused_result));
 
   /** Check the encryption option and set it
   @param[in]      option      encryption option
   @param[in,out]  type        The encryption type
   @return DB_SUCCESS or DB_UNSUPPORTED */
-  dberr_t set_algorithm(
-      const char *option,
-      Encryption *type) noexcept MY_ATTRIBUTE((warn_unused_result));
+  dberr_t set_algorithm(const char *option, Encryption *type) noexcept
+      MY_ATTRIBUTE((warn_unused_result));
 
   /** Validate the algorithm string.
   @param[in]  option  Encryption option
   @return DB_SUCCESS or error code */
-  static dberr_t validate(const char *option) noexcept MY_ATTRIBUTE(
-      (warn_unused_result));
+  static dberr_t validate(const char *option) noexcept
+      MY_ATTRIBUTE((warn_unused_result));
 
   /** Convert to a "string".
   @param[in]  type  The encryption type
   @return the string representation */
-  static const char *to_string(Type type) noexcept MY_ATTRIBUTE(
-      (warn_unused_result));
+  static const char *to_string(Type type) noexcept
+      MY_ATTRIBUTE((warn_unused_result));
 
   /** Check if the string is "empty" or "none".
   @param[in]  algorithm  Encryption algorithm to check
   @return true if no algorithm requested */
-  static bool is_none(const char *algorithm) noexcept MY_ATTRIBUTE(
-      (warn_unused_result));
+  static bool is_none(const char *algorithm) noexcept
+      MY_ATTRIBUTE((warn_unused_result));
 
   /** Generate random encryption value for key and iv.
   @param[in,out]  value Encryption value */
@@ -195,13 +194,14 @@ class Encryption {
   @param[in]      master_key_id master key id
   @param[in]      srv_uuid      uuid of server instance
   @param[in,out]  master_key    master key */
-  static void get_master_key(ulint master_key_id, char *srv_uuid,
+  static void get_master_key(uint32_t master_key_id, char *srv_uuid,
                              byte **master_key) noexcept;
 
   /** Get current master key and key id.
   @param[in,out]  master_key_id master key id
   @param[in,out]  master_key    master key */
-  static void get_master_key(ulint *master_key_id, byte **master_key) noexcept;
+  static void get_master_key(uint32_t *master_key_id,
+                             byte **master_key) noexcept;
 
   /** Fill the encryption information.
   @param[in]      key           encryption key
@@ -335,7 +335,7 @@ class Encryption {
 
   /** Get master key id
   @return master key id **/
-  static ulint get_master_key_id();
+  static uint32_t get_master_key_id();
 
  private:
   /** Encrypt type */
@@ -351,7 +351,7 @@ class Encryption {
   byte *m_iv;
 
   /** Current master key id */
-  static ulint s_master_key_id;
+  static uint32_t s_master_key_id;
 
   /** Current uuid of server instance */
   static char s_uuid[SERVER_UUID_LEN + 1];

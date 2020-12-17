@@ -145,8 +145,21 @@
   - WL#3549 created binary_log_transaction_compression_stats
   - replication_applier_configuration, added column
   REQUIRE_TABLE_PRIMARY_KEY_CHECK
+
+  80021:
+
+  performance_schema tables changed in MySQL 8.0.21
+  - tls_channel_status (created)
+  - replication_connection_configuration, added column
+  SOURCE_CONNECTION_AUTO_FAILOVER
+
+  80022:
+
+  performance_schema tables changed in MySQL 8.0.22
+  - WL#9090 created processlist
+  - WL#13681 created error_log
 */
 
-static const uint PFS_DD_VERSION = 80020;
+static const uint PFS_DD_VERSION = 80022;
 
 #endif /* PFS_DD_VERSION_H */

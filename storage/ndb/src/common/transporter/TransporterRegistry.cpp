@@ -1,5 +1,5 @@
 /*
-   Copyright (c) 2003, 2019, Oracle and/or its affiliates. All rights reserved.
+   Copyright (c) 2003, 2020, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -95,7 +95,7 @@ private:
 };
 
 
-struct in_addr
+struct in6_addr
 TransporterRegistry::get_connect_address(NodeId node_id) const
 {
   return theNodeIdTransporters[node_id]->m_connect_address;
@@ -666,14 +666,15 @@ TransporterRegistry::connect_server(NDB_SOCKET_TYPE sockfd,
     /**
      * Normal connection setup
      * Sub cases :
-     *   Normal setup from recent version  : multi = 0, instance = 0
-     *   Normal setup from old version     : multi = 0, instance = -1
-     *   Normal setup for multi instance 0 : multi = 1, instance = 0
+     *   Normal setup for non-multi trp        : multi = 0, instance = 0
+     *   Normal setup from non-multi trp from
+     *     old version                         : multi = 0, instance = -1
+     *   Normal setup for multi trp instance 0 : multi = 1, instance = 0
+     *   Normal setup from for multi trp
+     *     from old version                    : multi = 1, instance = -1
      *
      * Not supported :
-     *   multi = 1, instance > 0  : Handled above
-     *   multi = 1, instance < 0  : Do not enable multi transporters before upgrade
-     *   multi = 0, instance > 0  : Invalid
+     *   multi = 0, instance > 0               : Invalid
      */
     if (!multi_trp)
     {
@@ -690,21 +691,11 @@ TransporterRegistry::connect_server(NDB_SOCKET_TYPE sockfd,
     else
     {
       /* multi_trp */
-      if (multi_transporter_instance == 0)
-      {
-        /* Continue connection setup with specific instance 0 */
-        require(multi_trp->get_num_active_transporters() == 1);
-        t = multi_trp->get_active_transporter(0);
-      }
-      else
-      {
-        unlockMultiTransporters();
-        /* Strange, log it */
-        msg.assfmt("Ignored connection attempt from node %u as multi "
-                   "transporter instance %d specified",
-                   nodeId, multi_transporter_instance);
-        DBUG_RETURN(false);
-      }
+      require(multi_transporter_instance <= 0);
+
+      /* Continue connection setup with specific instance 0 */
+      require(multi_trp->get_num_active_transporters() == 1);
+      t = multi_trp->get_active_transporter(0);
     }
 
     /**
@@ -3460,10 +3451,18 @@ TransporterRegistry::start_service(SocketServer& socket_server)
 	 * If it wasn't a dynamically allocated port, or
 	 * our attempts at getting a new dynamic port failed
 	 */
-        g_eventLogger->error("Unable to setup transporter service port: %s:%d!\n"
+
+        char buf[512];
+        char* sockaddr_string =
+            Ndb_combine_address_port(buf,
+                                     sizeof(buf),
+                                     t.m_interface,
+                                     t.m_s_service_port);
+        g_eventLogger->error("Unable to setup transporter service port: %s!\n"
                              "Please check if the port is already used,\n"
                              "(perhaps the node is already running)",
-                             t.m_interface ? t.m_interface : "*", t.m_s_service_port);
+                             sockaddr_string);
+
 	delete transporter_service;
 	DBUG_RETURN(false);
       }
@@ -3678,7 +3677,7 @@ TransporterRegistry::connect_ndb_mgmd(const char* server_name,
    */
   {
     BaseString cs;
-    cs.assfmt("%s:%u", server_name, server_port);
+    cs.assfmt("%s %u", server_name, server_port);
     ndb_mgm_set_connectstring(h, cs.c_str());
   }
 

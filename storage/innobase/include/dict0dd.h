@@ -33,6 +33,7 @@ Data dictionary interface */
 #include "dict0dict.h"
 #include "dict0mem.h"
 #include "dict0types.h"
+#include "my_compiler.h"
 #include "univ.i"
 
 #ifndef UNIV_HOTBACKUP
@@ -84,7 +85,11 @@ enum dd_table_keys {
   DD_TABLE_DATA_DIRECTORY,
   /** Dynamic metadata version */
   DD_TABLE_VERSION,
-  /** Discard flag */
+  /** Discard flag. Please don't use it directly, and instead use
+  dd_is_discarded and dd_set_discarded functions. Discard flag is defined
+  for both dd::Table and dd::Partition and it's easy to confuse.
+  The functions will choose right implementation for you, depending on
+  whether the argument is dd::Table or dd::Partition. */
   DD_TABLE_DISCARD,
   /** Columns before first instant ADD COLUMN */
   DD_TABLE_INSTANT_COLS,
@@ -129,6 +134,12 @@ enum dd_partition_keys {
   newly truncated partition, it can have no instant columns.
   So partition level one should be always >= table level one. */
   DD_PARTITION_INSTANT_COLS,
+  /** Discard flag. Please don't use it directly, and instead use
+  dd_is_discarded and dd_set_discarded functions. Discard flag is defined
+  for both dd::Table and dd::Partition and it's easy to confuse.
+  The functions will choose right implementation for you, depending on
+  whether the argument is dd::Table or dd::Partition. */
+  DD_PARTITION_DISCARD,
   /** Sentinel */
   DD_PARTITION__LAST
 };
@@ -204,7 +215,7 @@ const char *const dd_column_key_strings[DD_COLUMN__LAST] = {"default",
 
 /** InnoDB private key strings for dd::Partition. @see dd_partition_keys */
 const char *const dd_partition_key_strings[DD_PARTITION__LAST] = {
-    "format", "instant_col"};
+    "format", "instant_col", "discard"};
 
 /** InnoDB private keys for dd::Index or dd::Partition_index */
 enum dd_index_keys {
@@ -269,7 +280,7 @@ const innodb_dd_table_t innodb_dd_table[] = {
     INNODB_DD_TABLE("column_statistics", 3),
     INNODB_DD_TABLE("column_type_elements", 1),
     INNODB_DD_TABLE("columns", 5),
-    INNODB_DD_TABLE("events", 5),
+    INNODB_DD_TABLE("events", 6),
     INNODB_DD_TABLE("foreign_key_column_usage", 3),
     INNODB_DD_TABLE("foreign_keys", 4),
     INNODB_DD_TABLE("index_column_usage", 3),
@@ -279,16 +290,16 @@ const innodb_dd_table_t innodb_dd_table[] = {
     INNODB_DD_TABLE("parameter_type_elements", 1),
     INNODB_DD_TABLE("parameters", 3),
     INNODB_DD_TABLE("resource_groups", 2),
-    INNODB_DD_TABLE("routines", 6),
+    INNODB_DD_TABLE("routines", 7),
     INNODB_DD_TABLE("schemata", 3),
     INNODB_DD_TABLE("st_spatial_reference_systems", 3),
     INNODB_DD_TABLE("table_partition_values", 1),
     INNODB_DD_TABLE("table_partitions", 7),
     INNODB_DD_TABLE("table_stats", 1),
-    INNODB_DD_TABLE("tables", 9),
+    INNODB_DD_TABLE("tables", 10),
     INNODB_DD_TABLE("tablespace_files", 2),
     INNODB_DD_TABLE("tablespaces", 2),
-    INNODB_DD_TABLE("triggers", 6),
+    INNODB_DD_TABLE("triggers", 7),
     INNODB_DD_TABLE("view_routine_usage", 2),
     INNODB_DD_TABLE("view_table_usage", 2)};
 
@@ -410,6 +421,84 @@ inline bool dd_table_part_has_instant_cols(const dd::Table &table) {
     }
   }
   return (false);
+}
+
+/** Determine if dd::Table is discarded. Please note that
+in case of partitioned Table, only it's leaf partitions can be marked
+as discarded. However, it's fine to call this function on partitioned
+Table - it will just return false
+
+@param[in] table non-partitioned dd::Table
+@return true if table is marked as discarded
+@return false if table is not marked as discarded */
+inline bool dd_is_discarded(const dd::Table &table) {
+  const dd::Properties &table_private = table.se_private_data();
+  bool is_discarded = false;
+  if (table_private.exists(dd_table_key_strings[DD_TABLE_DISCARD])) {
+    table_private.get(dd_table_key_strings[DD_TABLE_DISCARD], &is_discarded);
+  }
+
+  /* In case of partitioned tables, only partitions/subpartitions can ever
+  be marked as discarded */
+  ut_ad(!is_discarded || !dd_table_is_partitioned(table));
+
+  return is_discarded;
+}
+
+/** Determine if dd::Partition is discarded. Please note that
+only leaf partitions can be marked as discarded (that is, if partition has
+subpartitions, then only subpartitions can be marked as discarded)
+
+Function can be safely called on a partition, even if it has subpartitions -
+it will just return false.
+
+@param[in] partition dd::Partition
+@return true if partition is marked as discarded
+@return false if partition is not marked as discarded */
+inline bool dd_is_discarded(const dd::Partition &partition) {
+  const dd::Properties &partition_private = partition.se_private_data();
+  bool is_discarded = false;
+  if (partition_private.exists(
+          dd_partition_key_strings[DD_PARTITION_DISCARD])) {
+    partition_private.get(dd_partition_key_strings[DD_PARTITION_DISCARD],
+                          &is_discarded);
+  }
+
+  return is_discarded;
+}
+
+/** Sets appropriate discard attribute of dd::Table
+Please note that this function must not be called on partitioned tables
+
+@param[in] table non-partitioned dd::Table
+@param[in] discarded true if Table is discarded, false otherwise */
+inline void dd_set_discarded(dd::Table &table, bool discarded) {
+  ut_ad(!dd_table_is_partitioned(table));
+
+  dd::Properties &p = table.se_private_data();
+  p.set(dd_table_key_strings[DD_TABLE_DISCARD], discarded);
+}
+
+/** Sets appropriate discard attribute of dd::Partition
+
+Please note that this function can be only called on leaf_partitions.
+
+@param[in] partition leaf dd::Partition
+@param[in] discarded true if Table is discarded, false otherwise */
+inline void dd_set_discarded(dd::Partition &partition, bool discarded) {
+#ifdef UNIV_DEBUG
+  bool is_leaf = false;
+  for (const dd::Partition *part : *partition.table().leaf_partitions()) {
+    if (part == &partition) {
+      is_leaf = true;
+      break;
+    }
+  }
+  ut_ad(is_leaf);
+#endif
+
+  dd::Properties &p = partition.se_private_data();
+  p.set(dd_partition_key_strings[DD_PARTITION_DISCARD], discarded);
 }
 
 /** Get the first index of a table or partition.
@@ -596,6 +685,8 @@ when old table has hidden fts doc id without fulltext index
 @param[in]	old_table	Old dd table */
 void dd_add_fts_doc_id_index(dd::Table &new_table, const dd::Table &old_table);
 
+MY_COMPILER_DIAGNOSTIC_PUSH()
+MY_COMPILER_CLANG_WORKAROUND_TPARAM_DOCBUG()
 /** Find the specified dd::Index or dd::Partition_index in an InnoDB table
 @tparam		Index			dd::Index or dd::Partition_index
 @param[in]	table			InnoDB table object
@@ -603,6 +694,7 @@ void dd_add_fts_doc_id_index(dd::Table &new_table, const dd::Table &old_table);
 @return	the dict_index_t object related to the index */
 template <typename Index>
 const dict_index_t *dd_find_index(const dict_table_t *table, Index *dd_index);
+MY_COMPILER_DIAGNOSTIC_POP()
 
 /** Acquire a shared metadata lock.
 @param[in,out]	thd	current thread
@@ -636,7 +728,7 @@ bool dd_mdl_for_undo(const trx_t *trx);
 @param[in]	ignore_err	DICT_ERR_IGNORE_FK_NOKEY or DICT_ERR_IGNORE_NONE
 @param[in]	dict_locked	True if dict_sys->mutex is already held,
                                 otherwise false
-@return DB_SUCESS	if successfully load FK constraint */
+@return DB_SUCCESS	if successfully load FK constraint */
 dberr_t dd_table_load_fk_from_dd(dict_table_t *m_table,
                                  const dd::Table *dd_table,
                                  const char **col_names,
@@ -649,11 +741,11 @@ dberr_t dd_table_load_fk_from_dd(dict_table_t *m_table,
 void dd_set_autoinc(dd::Properties &se_private_data, uint64 autoinc);
 
 /** Scan a new dd system table, like mysql.tables...
-@param[in]	thd		thd
-@param[in,out]	mdl		mdl lock
-@param[in,out]	pcur		persistent cursor
-@param[in]	mtr		the mini-transaction
-@param[in]	system_table_name	which dd system table to open
+@param[in]	thd		THD
+@param[in,out]	mdl		MDL lock
+@param[in,out]	pcur		Persistent cursor
+@param[in,out]	mtr		Mini-transaction
+@param[in]	system_table_name	Which dd system table to open
 @param[in,out]	table		dict_table_t obj of dd system table
 @retval the first rec of the dd system table */
 const rec_t *dd_startscan_system(THD *thd, MDL_ticket **mdl, btr_pcur_t *pcur,
@@ -661,37 +753,38 @@ const rec_t *dd_startscan_system(THD *thd, MDL_ticket **mdl, btr_pcur_t *pcur,
                                  dict_table_t **table);
 
 /** Process one mysql.tables record and get the dict_table_t
-@param[in]	heap		temp memory heap
+@param[in]	heap		Temp memory heap
 @param[in,out]	rec		mysql.tables record
 @param[in,out]	table		dict_table_t to fill
 @param[in]	dd_tables	dict_table_t obj of dd system table
-@param[in]	mdl		mdl on the table
-@param[in]	mtr		the mini-transaction
+@param[in]	mdl		MDL on the table
+@param[in]	mtr		Mini-transaction
 @retval error message, or NULL on success */
 const char *dd_process_dd_tables_rec_and_mtr_commit(
     mem_heap_t *heap, const rec_t *rec, dict_table_t **table,
     dict_table_t *dd_tables, MDL_ticket **mdl, mtr_t *mtr);
 /** Process one mysql.table_partitions record and get the dict_table_t
-@param[in]	heap		temp memory heap
+@param[in]	heap		Temp memory heap
 @param[in,out]	rec		mysql.table_partitions record
 @param[in,out]	table		dict_table_t to fill
 @param[in]	dd_tables	dict_table_t obj of dd partition table
-@param[in]	mdl		mdl on the table
-@param[in]	mtr		the mini-transaction
+@param[in]	mdl		MDL on the table
+@param[in]	mtr		Mini-transaction
 @retval error message, or NULL on success */
 const char *dd_process_dd_partitions_rec_and_mtr_commit(
     mem_heap_t *heap, const rec_t *rec, dict_table_t **table,
     dict_table_t *dd_tables, MDL_ticket **mdl, mtr_t *mtr);
+
 /** Process one mysql.columns record and get info to dict_col_t
-@param[in,out]	heap		temp memory heap
+@param[in,out]	heap		Temp memory heap
 @param[in]	rec		mysql.columns record
 @param[in,out]	col		dict_col_t to fill
-@param[in,out]	table_id	table id
-@param[in,out]	col_name	column name
-@param[in,out]	nth_v_col	nth v column
+@param[in,out]	table_id	Table id
+@param[in,out]	col_name	Column name
+@param[in,out]	nth_v_col	Nth v column
 @param[in]	dd_columns	dict_table_t obj of mysql.columns
-@param[in,out]	mtr		the mini-transaction
-@retval true if index is filled */
+@param[in,out]	mtr		Mini-transaction
+@retval true if column is filled */
 bool dd_process_dd_columns_rec(mem_heap_t *heap, const rec_t *rec,
                                dict_col_t *col, table_id_t *table_id,
                                char **col_name, ulint *nth_v_col,
@@ -700,12 +793,12 @@ bool dd_process_dd_columns_rec(mem_heap_t *heap, const rec_t *rec,
 /** Process one mysql.columns record for virtual columns
 @param[in]	heap		temp memory heap
 @param[in,out]	rec		mysql.columns record
-@param[in,out]	table_id	table id
-@param[in,out]	pos		position
-@param[in,out]	base_pos	base column position
-@param[in,out]	n_row		number of rows
+@param[in,out]	table_id	Table id
+@param[in,out]	pos		Position
+@param[in,out]	base_pos	Base column position
+@param[in,out]	n_row		Number of rows
 @param[in]	dd_columns	dict_table_t obj of mysql.columns
-@param[in]	mtr		the mini-transaction
+@param[in]	mtr		Mini-transaction
 @retval true if virtual info is filled */
 bool dd_process_dd_virtual_columns_rec(mem_heap_t *heap, const rec_t *rec,
                                        table_id_t *table_id, ulint **pos,
@@ -713,25 +806,26 @@ bool dd_process_dd_virtual_columns_rec(mem_heap_t *heap, const rec_t *rec,
                                        dict_table_t *dd_columns, mtr_t *mtr);
 
 /** Get next record of new DD system tables
-@param[in,out]	pcur		persistent cursor
-@param[in]		mtr			the mini-transaction
+@param[in,out]	pcur		Persistent cursor
+@param[in]		mtr			Mini-transaction
 @retval next record */
 const rec_t *dd_getnext_system_rec(btr_pcur_t *pcur, mtr_t *mtr);
 
 /** Process one mysql.indexes record and get the dict_index_t
-@param[in]	heap		temp memory heap
+@param[in]	heap		Temp memory heap
 @param[in,out]	rec		mysql.indexes record
 @param[in,out]	index		dict_index_t to fill
-@param[in]	mdl		mdl on index->table
-@param[in,out]	parent		parent table if it's fts aux table.
-@param[in,out]	parent_mdl	mdl on parent if it's fts aux table.
+@param[in]	mdl		MDL on index->table
+@param[in,out]	parent		Parent table if it's fts aux table.
+@param[in,out]	parent_mdl	MDL on parent if it's fts aux table.
 @param[in]	dd_indexes	dict_table_t obj of mysql.indexes
-@param[in]	mtr		the mini-transaction
+@param[in]	mtr		Mini-transaction
 @retval true if index is filled */
 bool dd_process_dd_indexes_rec(mem_heap_t *heap, const rec_t *rec,
                                const dict_index_t **index, MDL_ticket **mdl,
                                dict_table_t **parent, MDL_ticket **parent_mdl,
                                dict_table_t *dd_indexes, mtr_t *mtr);
+
 /** Process one mysql.indexes record and get brief info to dict_index_t
 @param[in]	heap		temp memory heap
 @param[in,out]	rec		mysql.indexes record
@@ -785,7 +879,7 @@ void dd_get_and_save_space_name(dict_table_t *table, const Table *dd_table,
 
 /** Get the meta-data filename from the table name for a
 single-table tablespace.
-@param[in]	table		table object
+@param[in,out]	table		table object
 @param[in]	dd_table	DD table object
 @param[out]	filename	filename
 @param[in]	max_len		filename max length */
@@ -804,7 +898,7 @@ the foreign table, if this table is referenced by the foreign table
                                 otherwise false
 @param[in]	check_charsets	whether to check charset compatibility
 @param[in,out]	fk_tables	name list for tables that refer to this table
-@return DB_SUCESS	if successfully load FK constraint */
+@return DB_SUCCESS	if successfully load FK constraint */
 dberr_t dd_table_load_fk(dd::cache::Dictionary_client *client,
                          const char *tbl_name, const char **col_names,
                          dict_table_t *m_table, const dd::Table *dd_table,
@@ -822,7 +916,7 @@ the foreign table, if this table is referenced by the foreign table
 @param[in]	check_charsets	whether to check charset compatibility
 @param[in]	ignore_err	DICT_ERR_IGNORE_FK_NOKEY or DICT_ERR_IGNORE_NONE
 @param[in,out]	fk_tables	name list for tables that refer to this table
-@return DB_SUCESS	if successfully load FK constraint */
+@return DB_SUCCESS	if successfully load FK constraint */
 dberr_t dd_table_check_for_child(dd::cache::Dictionary_client *client,
                                  const char *tbl_name, const char **col_names,
                                  dict_table_t *m_table,
@@ -831,27 +925,50 @@ dberr_t dd_table_check_for_child(dd::cache::Dictionary_client *client,
                                  dict_err_ignore_t ignore_err,
                                  dict_names_t *fk_tables);
 
+/** Open uncached table definition based on a Global DD object.
+@param[in]	thd             thread THD
+@param[in]	client          data dictionary client
+@param[in]	dd_table        Global DD table object
+@param[in]	name            Table Name
+@param[out]	ts              MySQL table share
+@param[out]	td              MySQL table definition
+@retval error number    on error
+@retval 0               on success */
+
+int acquire_uncached_table(THD *thd, dd::cache::Dictionary_client *client,
+                           const dd::Table *dd_table, const char *name,
+                           TABLE_SHARE *ts, TABLE *td);
+
+/** free uncached table definition.
+@param[in]	ts              MySQL table share
+@param[in]	td              MySQL table definition */
+
+void release_uncached_table(TABLE_SHARE *ts, TABLE *td);
+
 /** Instantiate an InnoDB in-memory table metadata (dict_table_t)
-based on a Global DD object.
+based on a Global DD object or MYSQL table definition.
+@param[in]	thd		thread THD
 @param[in,out]	client		data dictionary client
 @param[in]	dd_table	Global DD table object
 @param[in]	dd_part		Global DD partition or subpartition, or NULL
 @param[in]	tbl_name	table name, or NULL if not known
 @param[out]	table		InnoDB table (NULL if not found or loadable)
-@param[in]	thd		thread THD
+@param[in]      td              MYSQL table definition
 @return error code
 @retval 0	on success */
-int dd_table_open_on_dd_obj(dd::cache::Dictionary_client *client,
+int dd_table_open_on_dd_obj(THD *thd, dd::cache::Dictionary_client *client,
                             const dd::Table &dd_table,
                             const dd::Partition *dd_part, const char *tbl_name,
-                            dict_table_t *&table, THD *thd);
+                            dict_table_t *&table, const TABLE *td);
+
 #endif /* !UNIV_HOTBACKUP */
 
-/** Open a persistent InnoDB table based on table id.
+/** Open a persistent InnoDB table based on InnoDB table id, and
+hold Shared MDL lock on it.
 @param[in]	table_id		table identifier
 @param[in,out]	thd			current MySQL connection (for mdl)
 @param[in,out]	mdl			metadata lock (*mdl set if
-table_id was found); mdl=NULL if we are resurrecting table IX locks in recovery
+table_id was found) mdl=NULL if we are resurrecting table IX locks in recovery
 @param[in]	dict_locked		dict_sys mutex is held
 @param[in]	check_corruption	check if the table is corrupted or not.
 @return table
@@ -869,10 +986,12 @@ void dd_table_close(dict_table_t *table, THD *thd, MDL_ticket **mdl,
                     bool dict_locked);
 
 #ifndef UNIV_HOTBACKUP
-/** Set the discard flag for a dd table.
-@param[in,out]	thd	current thread
-@param[in]	table	InnoDB table
-@param[in]	discard	discard flag
+/** Set the discard flag for a non-partitioned dd table.
+@param[in,out]	thd		current thread
+@param[in]	table		InnoDB table
+@param[in,out]	table_def	MySQL dd::Table to update
+@param[in]	discard		discard flag
+@return	true	if success
 @retval false if fail. */
 bool dd_table_discard_tablespace(THD *thd, const dict_table_t *table,
                                  dd::Table *table_def, bool discard);
@@ -883,11 +1002,12 @@ bool dd_table_discard_tablespace(THD *thd, const dict_table_t *table,
 @param[in]	name		InnoDB table name
 @param[in]	dict_locked	has dict_sys mutex locked
 @param[in]	ignore_err	whether to ignore err
+@param[out]	error		pointer to error
 @return handle to non-partitioned table
 @retval NULL if the table does not exist */
 dict_table_t *dd_table_open_on_name(THD *thd, MDL_ticket **mdl,
                                     const char *name, bool dict_locked,
-                                    ulint ignore_err);
+                                    ulint ignore_err, int *error = nullptr);
 
 /** Returns a cached table object based on table id.
 @param[in]	table_id	table id
@@ -903,6 +1023,8 @@ dict_table_t *dd_table_open_on_id_in_mem(table_id_t table_id, bool dict_locked);
 UNIV_INLINE
 dict_table_t *dd_table_open_on_name_in_mem(const char *name, ibool dict_locked);
 
+MY_COMPILER_DIAGNOSTIC_PUSH()
+MY_COMPILER_CLANG_WORKAROUND_TPARAM_DOCBUG()
 /** Open or load a table definition based on a Global DD object.
 @tparam		Table		dd::Table or dd::Partition
 @param[in,out]	client		data dictionary client
@@ -915,6 +1037,7 @@ template <typename Table>
 dict_table_t *dd_open_table(dd::cache::Dictionary_client *client,
                             const TABLE *table, const char *norm_name,
                             const Table *dd_table, THD *thd);
+MY_COMPILER_DIAGNOSTIC_POP()
 
 /** Open foreign tables reference a table.
 @param[in]	fk_list		foreign key name list
@@ -1179,12 +1302,21 @@ bool dd_tablespace_get_discard(const dd::Tablespace *dd_space);
 @param[in]  mdl_ticket  tablespace MDL ticket */
 void dd_release_mdl(MDL_ticket *mdl_ticket);
 
+/** Set Innodb tablespace compression option from DD.
+@param[in,out]	client		dictionary client
+@param[in]	algorithm	compression algorithm
+@param[in]	dd_space_id	DD tablespace ID.
+@return true, if failed to set compression. */
+bool dd_set_tablespace_compression(dd::cache::Dictionary_client *client,
+                                   const char *algorithm,
+                                   dd::Object_id dd_space_id);
+
 #endif /* !UNIV_HOTBACKUP */
 
 /** Update all InnoDB tablespace cache objects. This step is done post
 dictionary trx rollback, binlog recovery and DDL_LOG apply. So DD is
 consistent. Update the cached tablespace objects, if they differ from
-dictionary
+the dictionary.
 @param[in,out]	thd	thread handle
 @retval	true	on error
 @retval	false	on success */

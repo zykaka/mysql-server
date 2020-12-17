@@ -1,4 +1,4 @@
-/* Copyright (c) 2008, 2020, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2008, 2020, Oracle and/or its affiliates.
 
   This program is free software; you can redistribute it and/or modify
   it under the terms of the GNU General Public License, version 2.0,
@@ -39,6 +39,7 @@
 #define HAVE_PSI_TABLE_INTERFACE
 #define HAVE_PSI_THREAD_INTERFACE
 #define HAVE_PSI_TRANSACTION_INTERFACE
+#define HAVE_PSI_TLS_CHANNEL_INTERFACE
 
 #include "storage/perfschema/pfs.h"
 
@@ -63,6 +64,7 @@
 #include <mysql/components/services/psi_system_service.h>
 #include <mysql/components/services/psi_table_service.h>
 #include <mysql/components/services/psi_thread_service.h>
+#include <mysql/components/services/psi_tls_channel_service.h>
 #include <mysql/components/services/psi_transaction_service.h>
 #include <sys/types.h>
 #include <time.h>
@@ -116,6 +118,7 @@
 #include "storage/perfschema/pfs_setup_actor.h"
 #include "storage/perfschema/pfs_setup_object.h"
 #include "storage/perfschema/pfs_timer.h"
+#include "storage/perfschema/pfs_tls_channel.h"
 #include "storage/perfschema/pfs_user.h"
 #include "storage/perfschema/service_pfs_notification.h"
 #include "thr_lock.h"
@@ -147,6 +150,7 @@ using std::min;
 #define DISABLE_PSI_TABLE
 #define DISABLE_PSI_THREAD
 #define DISABLE_PSI_TRANSACTION
+#define DISABLE_PSI_TLS_CHANNEL
 #endif /* IN_DOXYGEN */
 
 /*
@@ -471,6 +475,8 @@ static void report_memory_accounting_error(const char *api_name,
   @subpage PAGE_PFS_RESOURCE_GROUP_SERVICE
 
   @subpage PAGE_PFS_TABLE_PLUGIN_SERVICE
+
+  @subpage PAGE_PFS_TLS_CHANNEL
 */
 
 /**
@@ -1194,6 +1200,26 @@ PSI_DATA_LOCK_CALL(unregister_data_lock)(...)
     <td> Not available as a service.</td>
     <td>@ref PSI_data_lock_bootstrap</td>
     <td>Not available as a service.</td>
+  </tr>
+
+  <tr>
+    <td> TLS Channels</td>
+    <td>
+@verbatim
+#include "mysql/psi/psi_tls_channel.h"
+PSI_TLS_CHANNEL_CALL(register_tls_channel)(...)
+PSI_TLS_CHANNEL_CALL(unregister_tls_channel)(...)
+@endverbatim
+    </td>
+    <td>
+@verbatim
+#include "mysql/components/services/psi_tls_channel.h"
+PSI_TLS_CHANNEL_CALL(register_tls_channel)(...)
+PSI_TLS_CHANNEL_CALL(unregister_tls_channel)(...)
+@endverbatim
+    </td>
+    <td>@ref PSI_tls_channel_bootstrap</td>
+    <td>@ref REQUIRES_PSI_TLS_CHANNEL_SERVICE</td>
   </tr>
 
   </table>
@@ -2005,9 +2031,9 @@ PSI_DATA_LOCK_CALL(unregister_data_lock)(...)
 @endverbatim
 
   Implemented as:
-  - [1] #pfs_memory_alloc_v1(),
-        #pfs_memory_realloc_v1(),
-        #pfs_memory_free_v1().
+  - [1] #pfs_memory_alloc_vc(),
+        #pfs_memory_realloc_vc(),
+        #pfs_memory_free_vc().
   - [1+] are overflows that can happen during [1a],
         implemented with @c carry_memory_stat_delta()
   - [2] #pfs_delete_thread_v1(), #aggregate_thread_memory()
@@ -3198,23 +3224,16 @@ void pfs_set_thread_info_vc(const char *info, uint info_len) {
   pfs_dirty_state dirty_state;
   PFS_thread *pfs = my_thread_get_THR_PFS();
 
-  DBUG_ASSERT((info != nullptr) || (info_len == 0));
-
   if (likely(pfs != nullptr)) {
-    if ((info != nullptr) && (info_len > 0)) {
-      if (info_len > sizeof(pfs->m_processlist_info)) {
-        info_len = sizeof(pfs->m_processlist_info);
-      }
-
-      pfs->m_stmt_lock.allocated_to_dirty(&dirty_state);
-      memcpy(pfs->m_processlist_info, info, info_len);
-      pfs->m_processlist_info_length = info_len;
-      pfs->m_stmt_lock.dirty_to_allocated(&dirty_state);
-    } else {
-      pfs->m_stmt_lock.allocated_to_dirty(&dirty_state);
-      pfs->m_processlist_info_length = 0;
-      pfs->m_stmt_lock.dirty_to_allocated(&dirty_state);
+    if (info_len > sizeof(pfs->m_processlist_info)) {
+      info_len = sizeof(pfs->m_processlist_info);
     }
+    pfs->m_stmt_lock.allocated_to_dirty(&dirty_state);
+    if (info != nullptr && info_len > 0) {
+      memcpy(pfs->m_processlist_info, info, info_len);
+    }
+    pfs->m_processlist_info_length = info_len;
+    pfs->m_stmt_lock.dirty_to_allocated(&dirty_state);
   }
 }
 
@@ -3425,6 +3444,17 @@ void pfs_notify_session_change_user_vc(
 void pfs_set_thread_vc(PSI_thread *thread) {
   PFS_thread *pfs = reinterpret_cast<PFS_thread *>(thread);
   my_thread_set_THR_PFS(pfs);
+}
+
+/**
+  Implementation of the thread instrumentation interface.
+  @sa PSI_v4::set_thread_peer_port
+*/
+void pfs_set_thread_peer_port_vc(PSI_thread *thread, uint port) {
+  PFS_thread *pfs = reinterpret_cast<PFS_thread *>(thread);
+  if (likely(pfs != nullptr)) {
+    pfs->m_peer_port = port;
+  }
 }
 
 /**
@@ -7129,20 +7159,15 @@ void pfs_set_socket_info_v1(PSI_socket *socket, const my_socket *fd,
   PFS_socket *pfs = reinterpret_cast<PFS_socket *>(socket);
   DBUG_ASSERT(pfs != nullptr);
 
-  /** Set socket descriptor */
   if (fd != nullptr) {
-    pfs->m_fd = (uint)*fd;
+    pfs->m_fd = (my_socket)*fd;
   }
-
-  /** Set raw socket address and length */
   if (likely(addr != nullptr && addr_len > 0)) {
     pfs->m_addr_len = addr_len;
 
-    /** Restrict address length to size of struct */
     if (unlikely(pfs->m_addr_len > sizeof(sockaddr_storage))) {
       pfs->m_addr_len = sizeof(struct sockaddr_storage);
     }
-
     memcpy(&pfs->m_sock_addr, addr, pfs->m_addr_len);
   }
 }
@@ -7157,8 +7182,7 @@ void pfs_set_socket_thread_owner_v1(PSI_socket *socket) {
   PFS_thread *pfs_thread = my_thread_get_THR_PFS();
   pfs_socket->m_thread_owner = pfs_thread;
 
-  if (pfs_thread)  // TODO use set_thread_ip_addr()
-  {
+  if (pfs_thread) {
     pfs_thread->m_sock_addr_len = pfs_socket->m_addr_len;
     if (pfs_thread->m_sock_addr_len > 0) {
       memcpy(&pfs_thread->m_sock_addr, &pfs_socket->m_sock_addr,
@@ -7417,13 +7441,13 @@ void pfs_get_thread_event_id_vc(PSI_thread *psi, ulonglong *internal_thread_id,
   }
 }
 
-void pfs_register_memory_v1(const char *category, PSI_memory_info_v1 *info,
+void pfs_register_memory_vc(const char *category, PSI_memory_info_v1 *info,
                             int count) {
   REGISTER_BODY_V1(PSI_memory_key, memory_instrument_prefix,
                    register_memory_class);
 }
 
-PSI_memory_key pfs_memory_alloc_v1(PSI_memory_key key, size_t size,
+PSI_memory_key pfs_memory_alloc_vc(PSI_memory_key key, size_t size,
                                    PSI_thread **owner) {
   PFS_thread **owner_thread = reinterpret_cast<PFS_thread **>(owner);
   DBUG_ASSERT(owner_thread != nullptr);
@@ -7488,7 +7512,7 @@ PSI_memory_key pfs_memory_alloc_v1(PSI_memory_key key, size_t size,
   return key;
 }
 
-PSI_memory_key pfs_memory_realloc_v1(PSI_memory_key key, size_t old_size,
+PSI_memory_key pfs_memory_realloc_vc(PSI_memory_key key, size_t old_size,
                                      size_t new_size, PSI_thread **owner) {
   PFS_thread **owner_thread_hdl = reinterpret_cast<PFS_thread **>(owner);
   DBUG_ASSERT(owner != nullptr);
@@ -7511,7 +7535,7 @@ PSI_memory_key pfs_memory_realloc_v1(PSI_memory_key key, size_t old_size,
       if (owner_thread != pfs_thread) {
         owner_thread = sanitize_thread(owner_thread);
         if (owner_thread != nullptr) {
-          report_memory_accounting_error("pfs_memory_realloc_v1", pfs_thread,
+          report_memory_accounting_error("pfs_memory_realloc_vc", pfs_thread,
                                          old_size, klass, owner_thread);
         }
       }
@@ -7558,8 +7582,8 @@ PSI_memory_key pfs_memory_realloc_v1(PSI_memory_key key, size_t old_size,
   return key;
 }
 
-static PSI_memory_key pfs_memory_claim_v1(PSI_memory_key key, size_t size,
-                                          PSI_thread **owner) {
+PSI_memory_key pfs_memory_claim_vc(PSI_memory_key key, size_t size,
+                                   PSI_thread **owner, bool claim) {
   PFS_thread **owner_thread = reinterpret_cast<PFS_thread **>(owner);
   DBUG_ASSERT(owner_thread != nullptr);
 
@@ -7569,55 +7593,109 @@ static PSI_memory_key pfs_memory_claim_v1(PSI_memory_key key, size_t size,
     return PSI_NOT_INSTRUMENTED;
   }
 
+  if (klass->is_global()) {
+    *owner_thread = nullptr;
+    return key;
+  }
+
   /*
     Do not check klass->m_enabled.
     Do not check flag_global_instrumentation.
     If a memory alloc was instrumented,
-    the corresponding free must be instrumented.
+    the corresponding free (or un claim) must be instrumented.
   */
 
   uint index = klass->m_event_name_index;
   PFS_memory_stat_delta delta_buffer;
   PFS_memory_stat_delta *delta;
 
-  if (flag_thread_instrumentation && !klass->is_global()) {
-    PFS_thread *old_thread = sanitize_thread(*owner_thread);
-    PFS_thread *new_thread = my_thread_get_THR_PFS();
-    PFS_memory_safe_stat *event_name_array;
-    PFS_memory_safe_stat *stat;
+  PFS_thread *old_thread = sanitize_thread(*owner_thread);
+  PFS_thread *new_thread = my_thread_get_THR_PFS();
+  PFS_memory_safe_stat *event_name_local_array;
+  PFS_memory_safe_stat *local_stat;
+  PFS_memory_shared_stat *event_name_global_array;
+  PFS_memory_shared_stat *global_stat;
 
-    if (old_thread != new_thread) {
-      if (old_thread != nullptr) {
-        event_name_array = old_thread->write_instr_class_memory_stats();
-        stat = &event_name_array[index];
-        delta = stat->count_free(size, &delta_buffer);
+  /*
+    When thread X transfers some memory to thread Y:
 
-        if (delta != nullptr) {
-          old_thread->carry_memory_stat_delta(delta, index);
-        }
+    - Thread X (the donor) calls un claim
+      - a FREE is counted against X
+      - a MALLOC is counted globally
+      - owner was X, set to null
+
+    - Thread Y (the recipient) calls claim
+      - a FREE is counted globally
+      - a MALLOC is counted against Y
+      - owner was null, set to Y
+  */
+
+  if (!claim) {
+    /*
+      Implementation of UN CLAIM for thread X.
+      Do not check for flags,
+      memory already counted for X is always un claimed.
+    */
+
+    if (old_thread != nullptr) {
+      /* 1: A FREE is counted against X. */
+      event_name_local_array = old_thread->write_instr_class_memory_stats();
+      local_stat = &event_name_local_array[index];
+      delta = local_stat->count_free(size, &delta_buffer);
+
+      if (delta != NULL) {
+        old_thread->carry_memory_stat_delta(delta, index);
       }
 
-      if (new_thread != nullptr) {
-        event_name_array = new_thread->write_instr_class_memory_stats();
-        stat = &event_name_array[index];
-        delta = stat->count_alloc(size, &delta_buffer);
-
-        if (delta != nullptr) {
-          new_thread->carry_memory_stat_delta(delta, index);
-        }
+      /* 2: A MALLOC is counted globally. */
+      event_name_global_array = global_instr_class_memory_array;
+      if (event_name_global_array) {
+        global_stat = &event_name_global_array[index];
+        (void)global_stat->count_alloc(size, &delta_buffer);
       }
 
-      *owner_thread = new_thread;
+      /* 3: verify owner was X. */
+      DBUG_ASSERT(old_thread == new_thread);
     }
 
-    return key;
+    *owner_thread = nullptr;
+  } else {
+    /*
+      Implementation of CLAIM for thread Y.
+      Here we check flags,
+      to assign memory to Y only if instrumentation is enabled.
+    */
+
+    /* verify owner was null. */
+    DBUG_ASSERT(old_thread == nullptr);
+
+    if (flag_global_instrumentation && klass->m_enabled &&
+        flag_thread_instrumentation && (new_thread != nullptr)) {
+      /* 1: A FREE is counted globally. */
+      event_name_global_array = global_instr_class_memory_array;
+      if (event_name_global_array) {
+        global_stat = &event_name_global_array[index];
+        (void)global_stat->count_free(size, &delta_buffer);
+      }
+
+      /* 2: A MALLOC is counted against Y. */
+      event_name_local_array = new_thread->write_instr_class_memory_stats();
+      local_stat = &event_name_local_array[index];
+      delta = local_stat->count_alloc(size, &delta_buffer);
+
+      if (delta != nullptr) {
+        new_thread->carry_memory_stat_delta(delta, index);
+      }
+
+      /* 3: set owner to Y. */
+      *owner_thread = new_thread;
+    }
   }
 
-  *owner_thread = nullptr;
   return key;
 }
 
-void pfs_memory_free_v1(PSI_memory_key key, size_t size,
+void pfs_memory_free_vc(PSI_memory_key key, size_t size,
                         PSI_thread *owner MY_ATTRIBUTE((unused))) {
   PFS_memory_class *klass = find_memory_class(key);
   if (klass == nullptr) {
@@ -7644,7 +7722,7 @@ void pfs_memory_free_v1(PSI_memory_key key, size_t size,
       if (owner_thread != pfs_thread) {
         owner_thread = sanitize_thread(owner_thread);
         if (owner_thread != nullptr) {
-          report_memory_accounting_error("pfs_memory_free_v1", pfs_thread, size,
+          report_memory_accounting_error("pfs_memory_free_vc", pfs_thread, size,
                                          klass, owner_thread);
         }
       }
@@ -7985,9 +8063,9 @@ SERVICE_IMPLEMENTATION(performance_schema, psi_system_v1) = {
 
 /**
   Implementation of the instrumentation interface.
-  @sa PSI_thread_service_v3
+  @sa PSI_thread_service_v4
 */
-PSI_thread_service_v3 pfs_thread_service_v3 = {
+PSI_thread_service_v4 pfs_thread_service_v4 = {
     /* Old interface, for plugins. */
     pfs_register_thread_vc,
     pfs_spawn_thread_vc,
@@ -8009,6 +8087,7 @@ PSI_thread_service_v3 pfs_thread_service_v3 = {
     pfs_set_thread_resource_group_vc,
     pfs_set_thread_resource_group_by_id_vc,
     pfs_set_thread_vc,
+    pfs_set_thread_peer_port_vc,
     pfs_aggregate_thread_status_vc,
     pfs_delete_current_thread_vc,
     pfs_delete_thread_vc,
@@ -8023,8 +8102,8 @@ PSI_thread_service_v3 pfs_thread_service_v3 = {
     pfs_notify_session_disconnect_vc,
     pfs_notify_session_change_user_vc};
 
-SERVICE_TYPE(psi_thread_v3)
-SERVICE_IMPLEMENTATION(performance_schema, psi_thread_v3) = {
+SERVICE_TYPE(psi_thread_v4)
+SERVICE_IMPLEMENTATION(performance_schema, psi_thread_v4) = {
     /* New interface, for components. */
     pfs_register_thread_vc,
     pfs_spawn_thread_vc,
@@ -8044,6 +8123,7 @@ SERVICE_IMPLEMENTATION(performance_schema, psi_thread_v3) = {
     pfs_set_thread_start_time_vc,
     pfs_set_thread_info_vc,
     pfs_set_thread_vc,
+    pfs_set_thread_peer_port_vc,
     pfs_aggregate_thread_status_vc,
     pfs_delete_current_thread_vc,
     pfs_delete_thread_vc,
@@ -8343,16 +8423,16 @@ SERVICE_IMPLEMENTATION(performance_schema, psi_transaction_v1) = {
     pfs_inc_transaction_release_savepoint_v1,
     pfs_end_transaction_v1};
 
-PSI_memory_service_v1 pfs_memory_service_v1 = {
+PSI_memory_service_v2 pfs_memory_service_v2 = {
     /* Old interface, for plugins. */
-    pfs_register_memory_v1, pfs_memory_alloc_v1, pfs_memory_realloc_v1,
-    pfs_memory_claim_v1, pfs_memory_free_v1};
+    pfs_register_memory_vc, pfs_memory_alloc_vc, pfs_memory_realloc_vc,
+    pfs_memory_claim_vc, pfs_memory_free_vc};
 
-SERVICE_TYPE(psi_memory_v1)
-SERVICE_IMPLEMENTATION(performance_schema, psi_memory_v1) = {
+SERVICE_TYPE(psi_memory_v2)
+SERVICE_IMPLEMENTATION(performance_schema, psi_memory_v2) = {
     /* New interface, for components. */
-    pfs_register_memory_v1, pfs_memory_alloc_v1, pfs_memory_realloc_v1,
-    pfs_memory_claim_v1, pfs_memory_free_v1};
+    pfs_register_memory_vc, pfs_memory_alloc_vc, pfs_memory_realloc_vc,
+    pfs_memory_claim_vc, pfs_memory_free_vc};
 
 PSI_error_service_v1 pfs_error_service_v1 = {
     /* Old interface, for plugins. */
@@ -8363,9 +8443,17 @@ SERVICE_IMPLEMENTATION(performance_schema, psi_error_v1) = {
     /* New interface, for components. */
     pfs_log_error_v1};
 
+SERVICE_TYPE(psi_tls_channel_v1)
+SERVICE_IMPLEMENTATION(performance_schema, psi_tls_channel_v1) = {
+    /* New interface, for components */
+    pfs_register_tls_channel_v1, pfs_unregister_tls_channel_v1};
+
 PSI_data_lock_service_v1 pfs_data_lock_service_v1 = {
     /* Old interface, for plugins. */
     pfs_register_data_lock_v1, pfs_unregister_data_lock_v1};
+
+PSI_tls_channel_service_v1 pfs_tls_channel_service_v1 = {
+    pfs_register_tls_channel_v1, pfs_unregister_tls_channel_v1};
 
 static void *get_system_interface(int version) {
   switch (version) {
@@ -8383,7 +8471,9 @@ static void *get_thread_interface(int version) {
     case PSI_THREAD_VERSION_2:
       return nullptr;
     case PSI_THREAD_VERSION_3:
-      return &pfs_thread_service_v3;
+      return nullptr;
+    case PSI_THREAD_VERSION_4:
+      return &pfs_thread_service_v4;
     default:
       return nullptr;
   }
@@ -8529,8 +8619,8 @@ static void *get_transaction_interface(int version) {
 
 static void *get_memory_interface(int version) {
   switch (version) {
-    case PSI_MEMORY_VERSION_1:
-      return &pfs_memory_service_v1;
+    case PSI_MEMORY_VERSION_2:
+      return &pfs_memory_service_v2;
     default:
       return nullptr;
   }
@@ -8549,6 +8639,15 @@ static void *get_data_lock_interface(int version) {
   switch (version) {
     case PSI_DATA_LOCK_VERSION_1:
       return &pfs_data_lock_service_v1;
+    default:
+      return nullptr;
+  }
+}
+
+static void *get_tls_channel_interface(int version) {
+  switch (version) {
+    case PSI_TLS_CHANNEL_VERSION_1:
+      return &pfs_tls_channel_service_v1;
     default:
       return nullptr;
   }
@@ -8591,6 +8690,9 @@ struct PSI_table_bootstrap pfs_table_bootstrap = {get_table_interface};
 
 struct PSI_thread_bootstrap pfs_thread_bootstrap = {get_thread_interface};
 
+struct PSI_tls_channel_bootstrap pfs_tls_channel_bootstrap = {
+    get_tls_channel_interface};
+
 struct PSI_transaction_bootstrap pfs_transaction_bootstrap = {
     get_transaction_interface};
 
@@ -8600,7 +8702,8 @@ PROVIDES_SERVICE(performance_schema, psi_cond_v1),
     PROVIDES_SERVICE(performance_schema, psi_file_v2),
     PROVIDES_SERVICE(performance_schema, psi_idle_v1),
     PROVIDES_SERVICE(performance_schema, psi_mdl_v1),
-    PROVIDES_SERVICE(performance_schema, psi_memory_v1),
+    /* Obsolete: PROVIDES_SERVICE(performance_schema, psi_memory_v1), */
+    PROVIDES_SERVICE(performance_schema, psi_memory_v2),
     PROVIDES_SERVICE(performance_schema, psi_mutex_v1),
     /* Obsolete: PROVIDES_SERVICE(performance_schema, psi_rwlock_v1), */
     PROVIDES_SERVICE(performance_schema, psi_rwlock_v2),
@@ -8613,7 +8716,7 @@ PROVIDES_SERVICE(performance_schema, psi_cond_v1),
     PROVIDES_SERVICE(performance_schema, psi_table_v1),
     /* Obsolete: PROVIDES_SERVICE(performance_schema, psi_thread_v1), */
     /* Obsolete: PROVIDES_SERVICE(performance_schema, psi_thread_v2), */
-    PROVIDES_SERVICE(performance_schema, psi_thread_v3),
+    PROVIDES_SERVICE(performance_schema, psi_thread_v4),
     PROVIDES_SERVICE(performance_schema, psi_transaction_v1),
     /* Deprecated, use pfs_plugin_table_v1. */
     PROVIDES_SERVICE(performance_schema, pfs_plugin_table),
@@ -8636,6 +8739,7 @@ PROVIDES_SERVICE(performance_schema, psi_cond_v1),
     PROVIDES_SERVICE(performance_schema, pfs_plugin_column_timestamp_v1),
     PROVIDES_SERVICE(performance_schema, pfs_plugin_column_timestamp_v2),
     PROVIDES_SERVICE(performance_schema, pfs_plugin_column_year_v1),
+    PROVIDES_SERVICE(performance_schema, psi_tls_channel_v1),
     END_COMPONENT_PROVIDES();
 
 static BEGIN_COMPONENT_REQUIRES(performance_schema) END_COMPONENT_REQUIRES();

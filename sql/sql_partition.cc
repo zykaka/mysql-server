@@ -1,4 +1,4 @@
-/* Copyright (c) 2005, 2020, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2005, 2020, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -44,13 +44,15 @@
 
 #include "sql/sql_partition.h"
 
-#include <assert.h>
-#include <limits.h>
-#include <string.h>
 #include <algorithm>
+#include <cassert>
+#include <climits>
+#include <cstring>
 
 #include "field_types.h"  // enum_field_types
+#include "m_ctype.h"      // system_charset_info
 #include "m_string.h"
+#include "my_alloc.h"  // operator new
 #include "my_bitmap.h"
 #include "my_byteorder.h"
 #include "my_compiler.h"
@@ -58,6 +60,7 @@
 #include "my_io.h"
 #include "my_sqlcommand.h"
 #include "my_sys.h"
+#include "mysql/components/services/my_io_bits.h"  // File
 #include "mysql/components/services/psi_statement_bits.h"
 #include "mysql/plugin.h"
 #include "mysql/psi/mysql_file.h"
@@ -98,9 +101,8 @@
 #include "sql/system_variables.h"
 #include "sql/table.h"
 #include "sql/thd_raii.h"
+#include "sql/thr_malloc.h"  // sql_calloc
 #include "sql_string.h"
-
-struct MEM_ROOT;
 
 using std::max;
 using std::min;
@@ -437,7 +439,7 @@ static bool set_up_field_array(TABLE *table, bool is_sub_part) {
 
   ptr = table->field;
   while ((field = *(ptr++))) {
-    if (field->flags & GET_FIXED_FIELDS_FLAG) num_fields++;
+    if (field->is_flag_set(GET_FIXED_FIELDS_FLAG)) num_fields++;
   }
   if (num_fields > MAX_REF_PARTS) {
     const char *err_str;
@@ -463,9 +465,9 @@ static bool set_up_field_array(TABLE *table, bool is_sub_part) {
   }
   ptr = table->field;
   while ((field = *(ptr++))) {
-    if (field->flags & GET_FIXED_FIELDS_FLAG) {
-      field->flags &= ~GET_FIXED_FIELDS_FLAG;
-      field->flags |= FIELD_IN_PART_FUNC_FLAG;
+    if (field->is_flag_set(GET_FIXED_FIELDS_FLAG)) {
+      field->clear_flag(GET_FIXED_FIELDS_FLAG);
+      field->set_flag(FIELD_IN_PART_FUNC_FLAG);
       if (likely(!result)) {
         if (!is_sub_part && part_info->column_list) {
           List_iterator<char> it(part_info->part_field_list);
@@ -503,7 +505,7 @@ static bool set_up_field_array(TABLE *table, bool is_sub_part) {
             performance reasons.
         */
 
-        if (unlikely(field->flags & BLOB_FLAG)) {
+        if (field->is_flag_set(BLOB_FLAG)) {
           my_error(ER_BLOB_FIELD_IN_PART_FUNC_ERROR, MYF(0));
           result = true;
         }
@@ -557,7 +559,7 @@ static bool create_full_part_field_array(THD *thd, TABLE *table,
     uint num_part_fields = 0, size_field_array;
     ptr = table->field;
     while ((field = *(ptr++))) {
-      if (field->flags & FIELD_IN_PART_FUNC_FLAG) num_part_fields++;
+      if (field->is_flag_set(FIELD_IN_PART_FUNC_FLAG)) num_part_fields++;
     }
     size_field_array = (num_part_fields + 1) * sizeof(Field *);
     field_array = (Field **)sql_calloc(size_field_array);
@@ -569,7 +571,7 @@ static bool create_full_part_field_array(THD *thd, TABLE *table,
     num_part_fields = 0;
     ptr = table->field;
     while ((field = *(ptr++))) {
-      if (field->flags & FIELD_IN_PART_FUNC_FLAG)
+      if (field->is_flag_set(FIELD_IN_PART_FUNC_FLAG))
         field_array[num_part_fields++] = field;
     }
     field_array[num_part_fields] = nullptr;
@@ -601,7 +603,7 @@ static bool create_full_part_field_array(THD *thd, TABLE *table,
   */
   if ((ptr = part_info->full_part_field_array))
     for (; *ptr; ptr++)
-      bitmap_set_bit(&part_info->full_part_field_set, (*ptr)->field_index);
+      bitmap_set_bit(&part_info->full_part_field_set, (*ptr)->field_index());
 
 end:
   return result;
@@ -633,7 +635,7 @@ static void clear_indicator_in_key_fields(KEY *key_info) {
   KEY_PART_INFO *key_part;
   uint key_parts = key_info->user_defined_key_parts, i;
   for (i = 0, key_part = key_info->key_part; i < key_parts; i++, key_part++)
-    key_part->field->flags &= (~GET_FIXED_FIELDS_FLAG);
+    key_part->field->clear_flag(GET_FIXED_FIELDS_FLAG);
 }
 
 /*
@@ -651,7 +653,7 @@ static void set_indicator_in_key_fields(KEY *key_info) {
   KEY_PART_INFO *key_part;
   uint key_parts = key_info->user_defined_key_parts, i;
   for (i = 0, key_part = key_info->key_part; i < key_parts; i++, key_part++)
-    key_part->field->flags |= GET_FIXED_FIELDS_FLAG;
+    key_part->field->set_flag(GET_FIXED_FIELDS_FLAG);
 }
 
 /*
@@ -680,7 +682,7 @@ static void check_fields_in_PF(Field **ptr, bool *all_fields,
   }
   do {
     /* Check if the field of the PF is part of the current key investigated */
-    if ((*ptr)->flags & GET_FIXED_FIELDS_FLAG)
+    if ((*ptr)->is_flag_set(GET_FIXED_FIELDS_FLAG))
       *some_fields = true;
     else
       *all_fields = false;
@@ -704,7 +706,7 @@ static void clear_field_flag(TABLE *table) {
   DBUG_TRACE;
 
   for (ptr = table->field; *ptr; ptr++)
-    (*ptr)->flags &= (~GET_FIXED_FIELDS_FLAG);
+    (*ptr)->clear_flag(GET_FIXED_FIELDS_FLAG);
 }
 
 /*
@@ -740,7 +742,7 @@ static bool handle_list_of_fields(List_iterator<char> it, TABLE *table,
     is_list_empty = false;
     Field *field = find_field_in_table_sef(table, field_name);
     if (likely(field != nullptr))
-      field->flags |= GET_FIXED_FIELDS_FLAG;
+      field->set_flag(GET_FIXED_FIELDS_FLAG);
     else {
       my_error(ER_FIELD_NOT_FOUND_PART_ERROR, MYF(0));
       clear_field_flag(table);
@@ -758,7 +760,7 @@ static bool handle_list_of_fields(List_iterator<char> it, TABLE *table,
       */
       for (i = 0; i < num_key_parts; i++) {
         Field *field = table->key_info[primary_key].key_part[i].field;
-        field->flags |= GET_FIXED_FIELDS_FLAG;
+        field->set_flag(GET_FIXED_FIELDS_FLAG);
       }
     } else {
       if (table->s->db_type()->partition_flags &&
@@ -912,6 +914,15 @@ static void end_lex_with_single_table(THD *thd, TABLE *table, LEX *old_lex) {
     calling fix_fields and reset it immediately after.
     The get_fields_in_item_tree activates setting of bit in flags
     on the field object.
+
+    The function must be called with thd->mem_root set to the memory
+    allocator associated with the TABLE object. Thus, any memory allocated
+    during resolving and other actions have the same lifetime as the TABLE.
+
+    Notice that memory allocations made during evaluation calls is NOT
+    supported, thus any item class that performs memory allocations during
+    evaluation calls must be disallowed as partition functions.
+    SEE Bug #21658
 */
 
 static bool fix_fields_part_func(THD *thd, Item *func_expr, TABLE *table,
@@ -935,34 +946,8 @@ static bool fix_fields_part_func(THD *thd, Item *func_expr, TABLE *table,
                     (uchar *)&ctx);
   }
   thd->where = "partition function";
-  /*
-    In execution we must avoid the use of thd->change_item_tree since
-    we might release memory before statement is completed. We do this
-    by temporarily setting the stmt_arena->mem_root to be the mem_root
-    of the table object, this also ensures that any memory allocated
-    during fix_fields will not be released at end of execution of this
-    statement. Thus the item tree will remain valid also in subsequent
-    executions of this table object. We do however not at the moment
-    support allocations during execution of val_int so any item class
-    that does this during val_int must be disallowed as partition
-    function.
-    SEE Bug #21658
 
-    This is a tricky call to prepare for since it can have a large number
-    of interesting side effects, both desirable and undesirable.
-  */
-  {
-    const bool save_agg_func = thd->lex->current_select()->agg_func_used();
-
-    error = func_expr->fix_fields(thd, &func_expr);
-
-    /*
-      Restore agg_func.
-      fix_fields should not affect the optimizer later, see Bug#46923.
-    */
-    thd->lex->current_select()->set_agg_func_used(save_agg_func);
-  }
-  if (unlikely(error)) {
+  if (unlikely(func_expr->fix_fields(thd, &func_expr))) {
     DBUG_PRINT("info", ("Field in partition function not part of table"));
     clear_field_flag(table);
     goto end;
@@ -1983,6 +1968,7 @@ static int check_part_field(enum_field_types sql_type, const char *field_name,
       *result_type = STRING_RESULT;
       *need_cs_check = true;
       return false;
+    case MYSQL_TYPE_BOOL:
     case MYSQL_TYPE_NEWDECIMAL:
     case MYSQL_TYPE_DECIMAL:
     case MYSQL_TYPE_TIMESTAMP:
@@ -1994,6 +1980,7 @@ static int check_part_field(enum_field_types sql_type, const char *field_name,
     case MYSQL_TYPE_ENUM:
     case MYSQL_TYPE_SET:
     case MYSQL_TYPE_GEOMETRY:
+    case MYSQL_TYPE_INVALID:
       goto error;
     default:
       goto error;
@@ -2492,7 +2479,7 @@ bool partition_key_modified(TABLE *table, const MY_BITMAP *fields) {
       (table->s->db_type()->partition_flags() & HA_CAN_UPDATE_PARTITION_KEY))
     return false;
   for (fld = part_info->full_part_field_array; *fld; fld++)
-    if (bitmap_is_set(fields, (*fld)->field_index)) return true;
+    if (bitmap_is_set(fields, (*fld)->field_index())) return true;
   return false;
 }
 
@@ -2676,7 +2663,7 @@ static void copy_to_part_field_buffers(Field **ptr, uchar **field_bufs,
                                        uchar **restore_ptr) {
   Field *field;
   while ((field = *(ptr++))) {
-    *restore_ptr = field->ptr;
+    *restore_ptr = field->field_ptr();
     restore_ptr++;
     if (!field->is_null()) {
       const CHARSET_INFO *cs = field->charset();
@@ -2691,17 +2678,17 @@ static void copy_to_part_field_buffers(Field **ptr, uchar **field_bufs,
          the strnxfrm method to normalise the string.
        */
       if (field->type() == MYSQL_TYPE_VARCHAR) {
-        uint len_bytes = ((Field_varstring *)field)->length_bytes;
-        my_strnxfrm(cs, field_buf + len_bytes, max_len, field->ptr + len_bytes,
+        uint len_bytes = field->get_length_bytes();
+        my_strnxfrm(cs, field_buf + len_bytes, max_len, field->data_ptr(),
                     data_len);
         if (len_bytes == 1)
           *field_buf = (uchar)data_len;
         else
           int2store(field_buf, data_len);
       } else {
-        my_strnxfrm(cs, field_buf, max_len, field->ptr, max_len);
+        my_strnxfrm(cs, field_buf, max_len, field->field_ptr(), max_len);
       }
-      field->ptr = field_buf;
+      field->set_field_ptr(field_buf);
     }
     field_bufs++;
   }
@@ -2721,7 +2708,7 @@ static void copy_to_part_field_buffers(Field **ptr, uchar **field_bufs,
 static void restore_part_field_pointers(Field **ptr, uchar **restore_ptr) {
   Field *field;
   while ((field = *(ptr++))) {
-    field->ptr = *restore_ptr;
+    field->set_field_ptr(*restore_ptr);
     restore_ptr++;
   }
   return;
@@ -3378,9 +3365,9 @@ static bool set_PF_fields_in_key(KEY *key_info, uint key_length) {
     }
     if (key_length < key_part->length) break;
     key_length -= key_part->length;
-    if (key_part->field->flags & FIELD_IN_PART_FUNC_FLAG) {
+    if (key_part->field->is_flag_set(FIELD_IN_PART_FUNC_FLAG)) {
       found_part_field = true;
-      key_part->field->flags |= GET_FIXED_FIELDS_FLAG;
+      key_part->field->set_flag(GET_FIXED_FIELDS_FLAG);
     }
   }
   return found_part_field;
@@ -3404,7 +3391,7 @@ static bool check_part_func_bound(Field **ptr) {
   DBUG_TRACE;
 
   for (; *ptr; ptr++) {
-    if (!((*ptr)->flags & GET_FIXED_FIELDS_FLAG)) {
+    if (!(*ptr)->is_flag_set(GET_FIXED_FIELDS_FLAG)) {
       result = false;
       break;
     }
@@ -5240,7 +5227,7 @@ void append_row_to_str(String &str, const uchar *row, TABLE *table) {
   if (!fields) return;
   fields[num_fields] = nullptr;
   for (field_ptr = table->field; *field_ptr; field_ptr++) {
-    if (!bitmap_is_set(table->read_set, (*field_ptr)->field_index)) continue;
+    if (!bitmap_is_set(table->read_set, (*field_ptr)->field_index())) continue;
     fields[curr_field_index++] = *field_ptr;
   }
 
@@ -5294,7 +5281,7 @@ void mem_alloc_error(size_t size) {
 
 bool make_used_partitions_str(partition_info *part_info,
                               List<const char> *parts) {
-  parts->empty();
+  parts->clear();
   partition_element *pe;
   uint partition_id = 0;
   List_iterator<partition_element> it(part_info->partitions);
@@ -6105,7 +6092,8 @@ static uint32 get_next_partition_via_walking(PARTITION_ITERATOR *part_iter) {
   Field *field = part_iter->part_info->part_field_array[0];
   while (part_iter->field_vals.cur != part_iter->field_vals.end) {
     longlong dummy;
-    field->store(part_iter->field_vals.cur++, field->flags & UNSIGNED_FLAG);
+    field->store(part_iter->field_vals.cur++,
+                 field->is_flag_set(UNSIGNED_FLAG));
     if ((part_iter->part_info->is_sub_partitioned() &&
          !part_iter->part_info->get_part_partition_id(part_iter->part_info,
                                                       &part_id, &dummy)) ||
@@ -6126,7 +6114,7 @@ static uint32 get_next_subpartition_via_walking(PARTITION_ITERATOR *part_iter) {
     part_iter->field_vals.cur = part_iter->field_vals.start;
     return NOT_A_PARTITION_ID;
   }
-  field->store(part_iter->field_vals.cur++, field->flags & UNSIGNED_FLAG);
+  field->store(part_iter->field_vals.cur++, field->is_flag_set(UNSIGNED_FLAG));
   if (part_iter->part_info->get_subpartition_id(part_iter->part_info, &res))
     return NOT_A_PARTITION_ID;
   return res;

@@ -1,4 +1,4 @@
-/* Copyright (c) 2016, 2019, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2016, 2020, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -116,6 +116,7 @@ static Value_map_type field_type_to_value_map_type(
     case MYSQL_TYPE_DECIMAL:
     case MYSQL_TYPE_NEWDECIMAL:
       return Value_map_type::DECIMAL;
+    case MYSQL_TYPE_BOOL:
     case MYSQL_TYPE_TINY:
     case MYSQL_TYPE_SHORT:
     case MYSQL_TYPE_LONG:
@@ -154,6 +155,7 @@ static Value_map_type field_type_to_value_map_type(
     case MYSQL_TYPE_JSON:
     case MYSQL_TYPE_GEOMETRY:
     case MYSQL_TYPE_NULL:
+    case MYSQL_TYPE_INVALID:
     default:
       return Value_map_type::INVALID;
   }
@@ -185,8 +187,7 @@ static Value_map_type field_type_to_value_map_type(const Field *field) {
       BIGINT, so we need to distinguish between SIGNED BIGINT and UNSIGNED
       BIGINT so that we can switch the Value_map_type to UINT (uint64).
     */
-    const Field_num *field_num = down_cast<const Field_num *>(field);
-    is_unsigned = field_num->unsigned_flag;
+    is_unsigned = field->is_unsigned();
   }
 
   return field_type_to_value_map_type(field->real_type(), is_unsigned);
@@ -700,7 +701,7 @@ static bool prepare_value_maps(
     // Overhead for each element
     *row_size_bytes += value_map->element_overhead();
 
-    value_maps.emplace(field->field_index,
+    value_maps.emplace(field->field_index(),
                        std::unique_ptr<histograms::Value_map_base>(value_map));
   }
 
@@ -756,7 +757,7 @@ static bool fill_value_maps(
   while (res == 0) {
     for (Field *field : fields) {
       histograms::Value_map_base *value_map =
-          value_maps.at(field->field_index).get();
+          value_maps.at(field->field_index()).get();
 
       switch (histograms::field_type_to_value_map_type(field)) {
         case histograms::Value_map_type::STRING: {
@@ -901,7 +902,6 @@ bool update_histogram(THD *thd, TABLE_LIST *table, const columns_set &columns,
     close_thread_tables(thd);
   });
 
-  table->reinit_before_use(thd);
   if (open_and_lock_tables(thd, table, 0)) {
     return true;
   }
@@ -955,9 +955,9 @@ bool update_histogram(THD *thd, TABLE_LIST *table, const columns_set &columns,
     }
     resolved_fields.push_back(field);
 
-    bitmap_set_bit(tbl->read_set, field->field_index);
+    bitmap_set_bit(tbl->read_set, field->field_index());
     if (field->is_gcol()) {
-      bitmap_set_bit(tbl->write_set, field->field_index);
+      bitmap_set_bit(tbl->write_set, field->field_index());
       /*
         The base columns needs to be in the write set in case of nested
         generated columns:
@@ -1027,7 +1027,7 @@ bool update_histogram(THD *thd, TABLE_LIST *table, const columns_set &columns,
 
     std::string col_name(field->field_name);
     histograms::Histogram *histogram =
-        value_maps.at(field->field_index)
+        value_maps.at(field->field_index())
             ->build_histogram(
                 &local_mem_root, num_buckets,
                 std::string(table->db, table->db_length),

@@ -1832,9 +1832,9 @@ Note	1003	/* select#1 */ select `test`.`t1`.`id1` AS `id1`,sum(`test`.`t2`.`id2`
 select t1.id1, sum(t2.id2) from t1 join t2 on t1.id1=t2.id1 
 where t1.d=3 group by t1.id1;
 id1	sum(t2.id2)
+10	900
 20	2000
 30	900
-10	900
 explain
 select t1.id1  from t1 join t2 on t1.id1=t2.id1 
 where t1.d=3 and t2.id2 > 200 order by t1.id1;
@@ -2465,8 +2465,8 @@ SELECT * FROM t1 LEFT JOIN t2 force index (idx) ON t2.t2b = t1.t1b;
 t1a	t1b	t2a	t2b
 99	0	100	0
 99	0	999	0
-99	NULL	NULL	NULL
 99	3	NULL	NULL
+99	NULL	NULL	NULL
 
 EXPLAIN SELECT * FROM t1 LEFT JOIN t2 force index (idx) ON t2.t2b <=> t1.t1b;
 id	select_type	table	partitions	type	possible_keys	key	key_len	ref	rows	filtered	Extra
@@ -2478,8 +2478,8 @@ SELECT * FROM t1 LEFT JOIN t2 force index (idx) ON t2.t2b <=> t1.t1b;
 t1a	t1b	t2a	t2b
 99	0	100	0
 99	0	999	0
-99	NULL	999	NULL
 99	3	NULL	NULL
+99	NULL	999	NULL
 
 DROP TABLE t2;
 CREATE TABLE t2 (t2a int, t2b int NOT NULL, KEY idx (t2b));
@@ -2497,8 +2497,8 @@ SELECT * FROM t1 LEFT JOIN t2 force index (idx) ON t2.t2b = t1.t1b;
 t1a	t1b	t2a	t2b
 99	0	100	0
 99	0	999	0
-99	NULL	NULL	NULL
 99	3	NULL	NULL
+99	NULL	NULL	NULL
 
 EXPLAIN SELECT * FROM t1 LEFT JOIN t2 force index (idx) ON t2.t2b <=> t1.t1b;
 id	select_type	table	partitions	type	possible_keys	key	key_len	ref	rows	filtered	Extra
@@ -2510,8 +2510,8 @@ SELECT * FROM t1 LEFT JOIN t2 force index (idx) ON t2.t2b <=> t1.t1b;
 t1a	t1b	t2a	t2b
 99	0	100	0
 99	0	999	0
-99	NULL	NULL	NULL
 99	3	NULL	NULL
+99	NULL	NULL	NULL
 
 DROP TABLE t1,t2;
 #
@@ -2542,7 +2542,7 @@ EXPLAIN
 -> Filter: (<in_optimizer>(t3.c1,<exists>(select #2)) xor true)  (cost=0.45 rows=2)
     -> Index scan on t3 using k1  (cost=0.45 rows=2)
     -> Select #2 (subquery in condition; dependent)
-        -> Limit: 1 row(s)
+        -> Limit: 1 row(s)  (cost=0.70 rows=1)
             -> Nested loop inner join  (cost=0.70 rows=1)
                 -> Filter: <if>(outer_field_is_not_null, (<cache>(t3.c1) = t1.c2_key), true)  (cost=0.35 rows=1)
                     -> Alternative plans for IN subquery: Index lookup unless c2_key IS NULL  (cost=0.35 rows=1)
@@ -2559,7 +2559,7 @@ id	select_type	table	partitions	type	possible_keys	key	key_len	ref	rows	filtered
 2	DEPENDENT SUBQUERY	t1	NULL	ref	col_int_key	col_int_key	4	func	1	100.00	Using where; Full scan on NULL key
 2	DEPENDENT SUBQUERY	t2	NULL	ALL	PRIMARY	NULL	NULL	NULL	1	100.00	Range checked for each record (index map: 0x1)
 Warnings:
-Note	1003	/* select#1 */ select `test`.`t3`.`c1` AS `c1` from `test`.`t3` where (<in_optimizer>(`test`.`t3`.`c1`,<exists>(/* select#2 */ select 1 from `test`.`t2` join `test`.`t1` where (<if>(outer_field_is_not_null, (<cache>(`test`.`t3`.`c1`) = `test`.`t1`.`c2_key`), true) and (`test`.`t2`.`pk` < `test`.`t1`.`c1`)))) xor true)
+Note	1003	/* select#1 */ select `test`.`t3`.`c1` AS `c1` from `test`.`t3` where (<in_optimizer>(`test`.`t3`.`c1`,<exists>(/* select#2 */ select `test`.`t1`.`c2_key` from `test`.`t2` join `test`.`t1` where (<if>(outer_field_is_not_null, (<cache>(`test`.`t3`.`c1`) = `test`.`t1`.`c2_key`), true) and (`test`.`t2`.`pk` < `test`.`t1`.`c1`)))) xor true)
 explain SELECT t3.c1 FROM t3
 WHERE t3.c1 = ANY (SELECT t1.c2_key FROM t2 JOIN t1 ON t2.pk < t1.c1)
 XOR TRUE;
@@ -2568,7 +2568,7 @@ id	select_type	table	partitions	type	possible_keys	key	key_len	ref	rows	filtered
 2	DEPENDENT SUBQUERY	t1	NULL	ref	col_int_key	col_int_key	4	func	1	100.00	Using where; Full scan on NULL key
 2	DEPENDENT SUBQUERY	t2	NULL	ALL	PRIMARY	NULL	NULL	NULL	1	100.00	Range checked for each record (index map: 0x1)
 Warnings:
-Note	1003	/* select#1 */ select `test`.`t3`.`c1` AS `c1` from `test`.`t3` where (<in_optimizer>(`test`.`t3`.`c1`,<exists>(/* select#2 */ select 1 from `test`.`t2` join `test`.`t1` where (<if>(outer_field_is_not_null, (<cache>(`test`.`t3`.`c1`) = `test`.`t1`.`c2_key`), true) and (`test`.`t2`.`pk` < `test`.`t1`.`c1`)))) xor true)
+Note	1003	/* select#1 */ select `test`.`t3`.`c1` AS `c1` from `test`.`t3` where (<in_optimizer>(`test`.`t3`.`c1`,<exists>(/* select#2 */ select `test`.`t1`.`c2_key` from `test`.`t2` join `test`.`t1` where (<if>(outer_field_is_not_null, (<cache>(`test`.`t3`.`c1`) = `test`.`t1`.`c2_key`), true) and (`test`.`t2`.`pk` < `test`.`t1`.`c1`)))) xor true)
 explain SELECT t3.c1 FROM t3
 WHERE t3.c1 IN (SELECT t1.c2_key FROM t2 JOIN t1 ON t2.pk < t1.c1)
 XOR TRUE;
@@ -2577,7 +2577,7 @@ id	select_type	table	partitions	type	possible_keys	key	key_len	ref	rows	filtered
 2	DEPENDENT SUBQUERY	t1	NULL	ref	col_int_key	col_int_key	4	func	1	100.00	Using where; Full scan on NULL key
 2	DEPENDENT SUBQUERY	t2	NULL	ALL	PRIMARY	NULL	NULL	NULL	1	100.00	Range checked for each record (index map: 0x1)
 Warnings:
-Note	1003	/* select#1 */ select `test`.`t3`.`c1` AS `c1` from `test`.`t3` where (<in_optimizer>(`test`.`t3`.`c1`,<exists>(/* select#2 */ select 1 from `test`.`t2` join `test`.`t1` where (<if>(outer_field_is_not_null, (<cache>(`test`.`t3`.`c1`) = `test`.`t1`.`c2_key`), true) and (`test`.`t2`.`pk` < `test`.`t1`.`c1`)))) xor true)
+Note	1003	/* select#1 */ select `test`.`t3`.`c1` AS `c1` from `test`.`t3` where (<in_optimizer>(`test`.`t3`.`c1`,<exists>(/* select#2 */ select `test`.`t1`.`c2_key` from `test`.`t2` join `test`.`t1` where (<if>(outer_field_is_not_null, (<cache>(`test`.`t3`.`c1`) = `test`.`t1`.`c2_key`), true) and (`test`.`t2`.`pk` < `test`.`t1`.`c1`)))) xor true)
 explain SELECT t3.c1 FROM t3
 WHERE t3.c1 NOT IN (SELECT t1.c2_key FROM t2 JOIN t1 ON t2.pk < t1.c1);
 id	select_type	table	partitions	type	possible_keys	key	key_len	ref	rows	filtered	Extra
@@ -2585,7 +2585,7 @@ id	select_type	table	partitions	type	possible_keys	key	key_len	ref	rows	filtered
 2	DEPENDENT SUBQUERY	t1	NULL	ref	col_int_key	col_int_key	4	func	1	100.00	Using where; Full scan on NULL key
 2	DEPENDENT SUBQUERY	t2	NULL	ALL	PRIMARY	NULL	NULL	NULL	1	100.00	Range checked for each record (index map: 0x1)
 Warnings:
-Note	1003	/* select#1 */ select `test`.`t3`.`c1` AS `c1` from `test`.`t3` where <in_optimizer>(`test`.`t3`.`c1`,<exists>(/* select#2 */ select 1 from `test`.`t2` join `test`.`t1` where (<if>(outer_field_is_not_null, (<cache>(`test`.`t3`.`c1`) = `test`.`t1`.`c2_key`), true) and (`test`.`t2`.`pk` < `test`.`t1`.`c1`))) is false)
+Note	1003	/* select#1 */ select `test`.`t3`.`c1` AS `c1` from `test`.`t3` where <in_optimizer>(`test`.`t3`.`c1`,<exists>(/* select#2 */ select `test`.`t1`.`c2_key` from `test`.`t2` join `test`.`t1` where (<if>(outer_field_is_not_null, (<cache>(`test`.`t3`.`c1`) = `test`.`t1`.`c2_key`), true) and (`test`.`t2`.`pk` < `test`.`t1`.`c1`))) is false)
 explain SELECT t3.c1 FROM t3
 WHERE t3.c1 IN (SELECT t1.c2_key FROM t2 JOIN t1 ON t2.pk < t1.c1);
 id	select_type	table	partitions	type	possible_keys	key	key_len	ref	rows	filtered	Extra
@@ -2654,8 +2654,8 @@ ON t1.col_varchar_key = t2.col_varchar_key
 GROUP BY field2
 ORDER BY field1;
 field1	field2
-NULL	0
 2003-08-21 00:00:00	4
+NULL	0
 DROP TABLE t1,t2;
 
 # BUG#12619510 "JCL: MORE ROWS AND DIFFERENT OUTPUT WITH JCL>=5"
@@ -2984,7 +2984,7 @@ id	select_type	table	partitions	type	possible_keys	key	key_len	ref	rows	filtered
 2	DEPENDENT SUBQUERY	table3s	NULL	ALL	NULL	NULL	NULL	NULL	1	100.00	Using where
 2	DEPENDENT SUBQUERY	table2s	NULL	ALL	NULL	NULL	NULL	NULL	1	100.00	NULL
 Warnings:
-Note	1003	/* select#1 */ select `test`.`table1`.`col_varchar_10_unique` AS `col_varchar_10_unique` from `test`.`t1` `table1` where <not>(<in_optimizer>(`test`.`table1`.`col_varchar_10_unique`,<exists>(/* select#2 */ select straight_join 1 from `test`.`t4` `table4s` left join (`test`.`t3` `table3s` join `test`.`t2` `table2s`) on((`test`.`table3s`.`col_int_unique` = `test`.`table4s`.`col_int_unique`)) where <if>(outer_field_is_not_null, ((<cache>(`test`.`table1`.`col_varchar_10_unique`) <> `test`.`table3s`.`col_varchar_10`) or (`test`.`table3s`.`col_varchar_10` is null)), true) having <if>(outer_field_is_not_null, <is_not_null_test>(`test`.`table3s`.`col_varchar_10`), true))))
+Note	1003	/* select#1 */ select `test`.`table1`.`col_varchar_10_unique` AS `col_varchar_10_unique` from `test`.`t1` `table1` where <not>(<in_optimizer>(`test`.`table1`.`col_varchar_10_unique`,<exists>(/* select#2 */ select straight_join `test`.`table3s`.`col_varchar_10` AS `field3` from `test`.`t4` `table4s` left join (`test`.`t3` `table3s` join `test`.`t2` `table2s`) on((`test`.`table3s`.`col_int_unique` = `test`.`table4s`.`col_int_unique`)) where <if>(outer_field_is_not_null, ((<cache>(`test`.`table1`.`col_varchar_10_unique`) <> `test`.`table3s`.`col_varchar_10`) or (`test`.`table3s`.`col_varchar_10` is null)), true) having <if>(outer_field_is_not_null, <is_not_null_test>(`test`.`table3s`.`col_varchar_10`), true))))
 SELECT * FROM t1 AS table1
 WHERE
 table1.col_varchar_10_unique = ALL (

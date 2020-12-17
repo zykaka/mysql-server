@@ -1,5 +1,5 @@
 /*
-   Copyright (c) 2000, 2020, Oracle and/or its affiliates. All rights reserved.
+   Copyright (c) 2000, 2020, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -34,6 +34,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <sys/types.h>
+
 #include <algorithm>
 #include <cctype>
 #include <iterator>
@@ -79,7 +80,7 @@
 #include "sql/sql_udf.h"
 #include "sql/system_variables.h"
 #include "sql_string.h"
-#include "tztime.h"  // adjust_time_zone
+#include "tztime.h"  // convert_time_zone_displacement
 
 /**
   @addtogroup GROUP_PARSER
@@ -1089,8 +1090,8 @@ Internal_function_factory<Instantiator_fn>
 */
 class Create_sp_func : public Create_qfunc {
  public:
-  virtual Item *create(THD *thd, LEX_STRING db, LEX_STRING name,
-                       bool use_explicit_name, PT_item_list *item_list);
+  Item *create(THD *thd, LEX_STRING db, LEX_STRING name, bool use_explicit_name,
+               PT_item_list *item_list) override;
 
   static Create_sp_func s_singleton;
 
@@ -1098,7 +1099,7 @@ class Create_sp_func : public Create_qfunc {
   /** Constructor. */
   Create_sp_func() {}
   /** Destructor. */
-  virtual ~Create_sp_func() {}
+  ~Create_sp_func() override {}
 };
 
 Item *Create_qfunc::create_func(THD *thd, LEX_STRING name,
@@ -1621,6 +1622,8 @@ static const std::pair<const char *, Create_func *> func_array[] = {
      SQL_FN_LIST_INTERNAL(Item_func_get_dd_index_sub_part_length, 5)},
     {"GET_DD_CREATE_OPTIONS",
      SQL_FN_INTERNAL(Item_func_get_dd_create_options, 3)},
+    {"GET_DD_SCHEMA_OPTIONS",
+     SQL_FN_INTERNAL(Item_func_get_dd_schema_options, 1)},
     {"GET_DD_TABLESPACE_PRIVATE_DATA",
      SQL_FN_INTERNAL(Item_func_get_dd_tablespace_private_data, 2)},
     {"GET_DD_INDEX_PRIVATE_DATA",
@@ -1635,6 +1638,7 @@ static const std::pair<const char *, Create_func *> func_array[] = {
     {"CAN_ACCESS_ROUTINE",
      SQL_FN_LIST_INTERNAL(Item_func_can_access_routine, 5)},
     {"CAN_ACCESS_EVENT", SQL_FN_INTERNAL(Item_func_can_access_event, 1)},
+    {"CAN_ACCESS_USER", SQL_FN_INTERNAL(Item_func_can_access_user, 2)},
     {"ICU_VERSION", SQL_FN(Item_func_icu_version, 0)},
     {"CAN_ACCESS_RESOURCE_GROUP",
      SQL_FN_INTERNAL(Item_func_can_access_resource_group, 1)},
@@ -1763,12 +1767,13 @@ Item *create_func_cast(THD *thd, const POS &pos, Item *a,
   type.charset = cs;
   type.length = nullptr;
   type.dec = nullptr;
-  return create_func_cast(thd, pos, a, &type);
+  return create_func_cast(thd, pos, a, type, false);
 }
 
 /**
   Validates a cast target type and extracts the specified length and precision
-  of the target type.
+  of the target type. Helper function for creating Items representing CAST
+  expressions, and Items performing CAST-like tasks, such as JSON_VALUE.
 
   @param thd        thread handler
   @param pos        the location of the expression
@@ -1818,6 +1823,13 @@ static bool validate_cast_type_and_extract_length(
     case ITEM_CAST_SIGNED_INT:
     case ITEM_CAST_UNSIGNED_INT:
     case ITEM_CAST_DATE:
+      return false;
+    case ITEM_CAST_YEAR:
+      if (as_array) {
+        my_error(ER_NOT_SUPPORTED_YET, MYF(0),
+                 "CAST-ing data to array of YEAR");
+        return true;
+      }
       return false;
     case ITEM_CAST_TIME:
     case ITEM_CAST_DATETIME: {
@@ -1950,19 +1962,21 @@ static bool validate_cast_type_and_extract_length(
   /* purecov: end */
 }
 
+/// This function does not store the reference to `type`.
 Item *create_func_cast(THD *thd, const POS &pos, Item *arg,
-                       const Cast_type *type, bool as_array) {
+                       const Cast_type &type, bool as_array) {
   int64_t length = 0;
   unsigned precision = 0;
-  if (validate_cast_type_and_extract_length(thd, pos, arg, *type, as_array,
+  if (validate_cast_type_and_extract_length(thd, pos, arg, type, as_array,
                                             &length, &precision))
     return nullptr;
 
-  if (as_array)
+  if (as_array) {
     return new (thd->mem_root) Item_func_array_cast(
-        pos, arg, type->target, length, precision, type->charset);
+        pos, arg, type.target, length, precision, type.charset);
+  }
 
-  switch (type->target) {
+  switch (type.target) {
     case ITEM_CAST_SIGNED_INT:
       return new (thd->mem_root) Item_typecast_signed(pos, arg);
     case ITEM_CAST_UNSIGNED_INT:
@@ -1973,11 +1987,13 @@ Item *create_func_cast(THD *thd, const POS &pos, Item *arg,
       return new (thd->mem_root) Item_typecast_time(pos, arg, precision);
     case ITEM_CAST_DATETIME:
       return new (thd->mem_root) Item_typecast_datetime(pos, arg, precision);
+    case ITEM_CAST_YEAR:
+      return new (thd->mem_root) Item_typecast_year(pos, arg);
     case ITEM_CAST_DECIMAL:
       return new (thd->mem_root)
           Item_typecast_decimal(pos, arg, length, precision);
     case ITEM_CAST_CHAR: {
-      const CHARSET_INFO *cs = type->charset;
+      const CHARSET_INFO *cs = type.charset;
       if (cs == nullptr) cs = thd->variables.collation_connection;
       return new (thd->mem_root) Item_typecast_char(pos, arg, length, cs);
     }
@@ -1995,6 +2011,29 @@ Item *create_func_cast(THD *thd, const POS &pos, Item *arg,
   DBUG_ASSERT(false);
   return nullptr;
   /* purecov: end */
+}
+
+Item *create_func_json_value(THD *thd, const POS &pos, Item *arg, Item *path,
+                             const Cast_type &cast_type,
+                             Json_on_response_type on_empty_type,
+                             Item *on_empty_default,
+                             Json_on_response_type on_error_type,
+                             Item *on_error_default) {
+  int64_t length = 0;
+  unsigned precision = 0;
+  if (validate_cast_type_and_extract_length(thd, pos, arg, cast_type, false,
+                                            &length, &precision))
+    return nullptr;
+
+  // Create dummy items for the default values, if they haven't been specified.
+  if (on_empty_default == nullptr)
+    on_empty_default = new (thd->mem_root) Item_null;
+  if (on_error_default == nullptr)
+    on_error_default = new (thd->mem_root) Item_null;
+
+  return new (thd->mem_root) Item_func_json_value(
+      pos, arg, path, cast_type, length, precision, on_empty_type,
+      on_empty_default, on_error_type, on_error_default);
 }
 
 /**
@@ -2037,7 +2076,8 @@ Item *create_temporal_literal(THD *thd, const char *str, size_t length,
           (ltime.time_type == MYSQL_TIMESTAMP_DATETIME ||
            ltime.time_type == MYSQL_TIMESTAMP_DATETIME_TZ) &&
           !status.warnings) {
-        adjust_time_zone_displacement(thd->time_zone(), &ltime);
+        if (convert_time_zone_displacement(thd->time_zone(), &ltime))
+          return nullptr;
         item = new (thd->mem_root) Item_datetime_literal(
             &ltime, status.fractional_digits, thd->time_zone());
       }

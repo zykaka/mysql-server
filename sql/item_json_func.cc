@@ -1,4 +1,4 @@
-/* Copyright (c) 2015, 2020, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2015, 2020, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -24,15 +24,19 @@
 
 #include "sql/item_json_func.h"
 
+#include <stdint.h>
 #include <string.h>
-
 #include <algorithm>  // std::fill
+#include <limits>
 #include <memory>
 #include <new>
 #include <string>
 #include <utility>
 
+#include "decimal.h"
 #include "field_types.h"  // enum_field_types
+#include "lex_string.h"
+#include "m_ctype.h"
 #include "m_string.h"
 #include "my_alloc.h"
 #include "my_dbug.h"
@@ -42,6 +46,7 @@
 #include "prealloced_array.h"  // Prealloced_array
 #include "scope_guard.h"
 #include "sql/current_thd.h"  // current_thd
+#include "sql/error_handler.h"
 #include "sql/field.h"
 #include "sql/item_cmpfunc.h"  // Item_func_like
 #include "sql/item_create.h"
@@ -52,13 +57,16 @@
 #include "sql/json_schema.h"
 #include "sql/json_syntax_check.h"
 #include "sql/my_decimal.h"
+#include "sql/parser_yystype.h"
 #include "sql/psi_memory_key.h"  // key_memory_JSON
 #include "sql/sql_class.h"       // THD
 #include "sql/sql_const.h"
 #include "sql/sql_error.h"
 #include "sql/sql_exception_handler.h"  // handle_std_exception
 #include "sql/sql_time.h"               // field_type_to_timestamp_type
+#include "sql/system_variables.h"
 #include "sql/table.h"
+#include "sql/table_function.h"
 #include "sql/thd_raii.h"
 #include "sql/thr_malloc.h"
 #include "template_utils.h"  // down_cast
@@ -158,6 +166,22 @@ bool parse_json(const String &res, uint arg_idx, const char *func_name,
 }
 
 /**
+  Get correct blob type of given Field.
+  A helper function for get_normalized_field_type().
+
+  @param arg  the field to get blob type of
+
+  @returns
+    correct blob type
+*/
+
+static enum_field_types get_real_blob_type(const Field *arg) {
+  DBUG_ASSERT(arg);
+  return blob_type_from_pack_length(arg->pack_length() -
+                                    portable_sizeof_char_ptr);
+}
+
+/**
   Get correct blob type of given Item.
   A helper function for get_normalized_field_type().
 
@@ -174,40 +198,11 @@ static enum_field_types get_real_blob_type(const Item *arg) {
     MYSQL_TYPE_BLOB. We want to treat them like strings. We check
     the collation to see if the blob is really a string.
   */
-  if (arg->collation.collation != &my_charset_bin) return MYSQL_TYPE_STRING;
+  if (arg->collation.collation != &my_charset_bin) return MYSQL_TYPE_VARCHAR;
 
-  if (arg->type() == Item::FIELD_ITEM) {
-    Field *field = (down_cast<const Item_field *>(arg))->field;
-    return blob_type_from_pack_length(field->pack_length() -
-                                      portable_sizeof_char_ptr);
-  }
+  if (arg->type() == Item::FIELD_ITEM)
+    return get_real_blob_type((down_cast<const Item_field *>(arg))->field);
 
-  return arg->data_type();
-}
-
-/**
-  Get correct data type of given Item.
-  A helper function for get_normalized_field_type().
-
-  @param arg  the item to get data type of
-
-  @returns
-    correct blob type
-*/
-
-static enum_field_types get_real_data_type(const Item *arg) {
-  switch (arg->type()) {
-    case Item::NULL_ITEM:
-      return MYSQL_TYPE_NULL;
-    case Item::INT_ITEM:
-      return MYSQL_TYPE_LONGLONG;
-    case Item::REAL_ITEM:
-      return MYSQL_TYPE_DOUBLE;
-    case Item::DECIMAL_ITEM:
-      return MYSQL_TYPE_NEWDECIMAL;
-    default:
-      break;
-  }
   return arg->data_type();
 }
 
@@ -226,14 +221,6 @@ static enum_field_types get_normalized_field_type(const Item *arg) {
     case MYSQL_TYPE_LONG_BLOB:
       return get_real_blob_type(arg);
 
-    case MYSQL_TYPE_VARCHAR:
-      /*
-        If arg represents a parameter to a prepared statement, its field
-        type will be MYSQL_TYPE_VARCHAR instead of the actual type of
-        the parameter. The item type will have the info, so adjust
-        field_type to match.
-      */
-      return get_real_data_type(arg);
     default:
       break;
   }
@@ -281,7 +268,7 @@ static bool is_convertible_to_json(const Item *item) {
       if (item->type() == Item::FIELD_ITEM) {
         const Item_field *fi = down_cast<const Item_field *>(item);
         const Field *field = fi->field;
-        if (field->flags & (ENUM_FLAG | SET_FLAG)) {
+        if (field->is_flag_set(ENUM_FLAG) || field->is_flag_set(SET_FLAG)) {
           return false;
         }
       }
@@ -327,7 +314,9 @@ static bool json_is_valid(Item **args, uint arg_idx, String *value,
                           const char *func_name, Json_dom_ptr *dom,
                           bool require_str_or_json, bool *valid) {
   Item *const arg_item = args[arg_idx];
-  const enum_field_types field_type = get_normalized_field_type(arg_item);
+
+  enum_field_types field_type = get_normalized_field_type(arg_item);
+
   if (!is_convertible_to_json(arg_item)) {
     if (require_str_or_json) {
       *valid = false;
@@ -350,6 +339,7 @@ static bool json_is_valid(Item **args, uint arg_idx, String *value,
   } else {
     bool parse_error = false;
     String *const res = arg_item->val_str(value);
+    if (current_thd->is_error()) return true;
 
     if (arg_item->null_value) {
       *valid = true;
@@ -562,9 +552,8 @@ static bool evaluate_constant_json_schema(
     String *schema_string = json_schema->val_str(&schema_buffer);
     if (thd->is_error()) return true;
     if (json_schema->null_value) {
-      Item *null_item = new (thd->mem_root) Item_null((*ref)->item_name);
-      if (null_item == nullptr) return true;
-      thd->change_item_tree(ref, null_item);
+      *ref = new (thd->mem_root) Item_null((*ref)->item_name);
+      if (*ref == nullptr) return true;
     } else {
       *cached_schema_validator =
           create_json_schema_validator(thd->mem_root, schema_string->ptr(),
@@ -589,10 +578,7 @@ bool Item_func_json_schema_valid::fix_fields(THD *thd, Item **ref) {
                                        ref);
 }
 
-void Item_func_json_schema_valid::cleanup() {
-  Item_bool_func::cleanup();
-  m_cached_schema_validator = nullptr;
-}
+void Item_func_json_schema_valid::cleanup() { Item_bool_func::cleanup(); }
 
 Item_func_json_schema_valid::Item_func_json_schema_valid(const POS &pos,
                                                          Item *a, Item *b)
@@ -692,7 +678,6 @@ bool Item_func_json_schema_validation_report::fix_fields(THD *thd, Item **ref) {
 
 void Item_func_json_schema_validation_report::cleanup() {
   Item_json_func::cleanup();
-  m_cached_schema_validator = nullptr;
 }
 
 Item_func_json_schema_validation_report::
@@ -1066,39 +1051,36 @@ longlong Item_func_json_contains_path::val_int() {
   return result;
 }
 
-bool json_value(Item **args, uint arg_idx, Json_wrapper *result) {
-  Item *arg = args[arg_idx];
-
+bool json_value(Item *arg, Json_wrapper *result, bool *has_value) {
   if (arg->data_type() == MYSQL_TYPE_NULL) {
     if (arg->update_null_value()) return true;
     DBUG_ASSERT(arg->null_value);
+    *has_value = true;
     return false;
   }
 
+  // Give up if this is not a JSON value (including typed arrays)
   if (arg->data_type() != MYSQL_TYPE_JSON && !arg->returns_array()) {
-    // This is nor a JSON value, neither typed array. Give up.
-    return true;
+    *has_value = false;
+    return false;
   }
 
+  *has_value = true;
   return arg->val_json(result);
 }
 
 bool get_json_wrapper(Item **args, uint arg_idx, String *str,
                       const char *func_name, Json_wrapper *wrapper) {
-  if (!json_value(args, arg_idx, wrapper)) {
-    // Found a JSON value, return successfully.
-    return false;
-  }
+  Item *const arg = args[arg_idx];
 
-  if (args[arg_idx]->data_type() == MYSQL_TYPE_JSON) {
-    /*
-      If the type of the argument is JSON and json_value() returned
-      false, it means the argument didn't contain valid JSON data.
-      Give up.
-    */
+  bool has_value;
+  if (json_value(arg, wrapper, &has_value)) {
     return true;
   }
-
+  // If the value was handled, return with success
+  if (has_value) {
+    return false;
+  }
   /*
     Otherwise, it's a non-JSON type, so we need to see if we can
     convert it to JSON.
@@ -1116,7 +1098,7 @@ bool get_json_wrapper(Item **args, uint arg_idx, String *str,
     return true;
   }
 
-  if (args[arg_idx]->null_value) {
+  if (arg->null_value) {
     return false;
   }
 
@@ -1187,7 +1169,8 @@ static constexpr uint32 typelit_max_length =
         json_type_string_map + array_elements(json_type_string_map)) +
     1;
 
-bool Item_func_json_type::resolve_type(THD *) {
+bool Item_func_json_type::resolve_type(THD *thd) {
+  if (param_type_is_default(thd, 0, 1, MYSQL_TYPE_JSON)) return true;
   maybe_null = true;
   m_value.set_charset(&my_charset_utf8mb4_bin);
   set_data_type_string(typelit_max_length, &my_charset_utf8mb4_bin);
@@ -1269,68 +1252,88 @@ String *Item_func_json_type::val_str(String *) {
   return &m_value;
 }
 
-String *Item_json_func::val_str(String *) {
-  DBUG_ASSERT(fixed == 1);
-  Json_wrapper wr;
-  if (val_json(&wr)) return error_str();
-
-  if (null_value) return nullptr;
-
-  m_string_buffer.length(0);
-
-  if (wr.to_string(&m_string_buffer, true, func_name())) return error_str();
-
-  null_value = false;
-  return &m_string_buffer;
+static String *error_str(Item *item, String *buffer) {
+  item->null_value = item->maybe_null;
+  if (item->null_value) return nullptr;
+  buffer->set("", 0, item->collation.collation);
+  return buffer;
 }
 
-bool Item_json_func::get_date(MYSQL_TIME *ltime, my_time_flags_t) {
+static String *val_string_from_json(Item_func *item, String *buffer) {
   Json_wrapper wr;
-  if (val_json(&wr)) return true;
+  if (item->val_json(&wr)) return error_str(item, buffer);
+  if (item->null_value) return nullptr;
 
-  if (null_value) return true;
+  buffer->length(0);
+  if (wr.to_string(buffer, true, item->func_name()))
+    return error_str(item, buffer);
 
-  return wr.coerce_date(ltime, func_name());
+  item->null_value = false;
+  return buffer;
+}
+
+String *Item_json_func::val_str(String *) {
+  DBUG_ASSERT(fixed);
+  return val_string_from_json(this, &m_string_buffer);
+}
+
+static bool get_date_from_json(Item_func *item, MYSQL_TIME *ltime,
+                               my_time_flags_t) {
+  Json_wrapper wr;
+  if (item->val_json(&wr)) return true;
+  if (item->null_value) return true;
+  return wr.coerce_date(ltime, item->func_name());
+}
+
+bool Item_json_func::get_date(MYSQL_TIME *ltime, my_time_flags_t flags) {
+  return get_date_from_json(this, ltime, flags);
+}
+
+static bool get_time_from_json(Item_func *item, MYSQL_TIME *ltime) {
+  Json_wrapper wr;
+  if (item->val_json(&wr)) return true;
+  if (item->null_value) return true;
+  return wr.coerce_time(ltime, item->func_name());
 }
 
 bool Item_json_func::get_time(MYSQL_TIME *ltime) {
-  Json_wrapper wr;
-  if (val_json(&wr)) return true;
-
-  if (null_value) return true;
-
-  return wr.coerce_time(ltime, func_name());
+  return get_time_from_json(this, ltime);
 }
 
-longlong Item_json_func::val_int() {
+longlong val_int_from_json(Item_func *item) {
   Json_wrapper wr;
-  if (val_json(&wr)) return 0;
-
-  if (null_value) return 0;
-
-  return wr.coerce_int(func_name());
+  if (item->val_json(&wr)) return 0;
+  if (item->null_value) return 0;
+  return wr.coerce_int(item->func_name());
 }
 
-double Item_json_func::val_real() {
+longlong Item_json_func::val_int() { return val_int_from_json(this); }
+
+static double val_real_from_json(Item_func *item) {
   Json_wrapper wr;
-  if (val_json(&wr)) return 0.0;
+  if (item->val_json(&wr)) return 0.0;
+  if (item->null_value) return 0.0;
+  return wr.coerce_real(item->func_name());
+}
 
-  if (null_value) return 0.0;
+double Item_json_func::val_real() { return val_real_from_json(this); }
 
-  return wr.coerce_real(func_name());
+static my_decimal *val_decimal_from_json(Item_func *item,
+                                         my_decimal *decimal_value) {
+  Json_wrapper wr;
+  if (item->val_json(&wr)) {
+    my_decimal_set_zero(decimal_value);
+    return decimal_value;
+  }
+  if (item->null_value) {
+    my_decimal_set_zero(decimal_value);
+    return decimal_value;
+  }
+  return wr.coerce_decimal(decimal_value, item->func_name());
 }
 
 my_decimal *Item_json_func::val_decimal(my_decimal *decimal_value) {
-  Json_wrapper wr;
-  if (val_json(&wr)) {
-    my_decimal_set_zero(decimal_value);
-    return decimal_value;
-  }
-  if (null_value) {
-    my_decimal_set_zero(decimal_value);
-    return decimal_value;
-  }
-  return wr.coerce_decimal(decimal_value, func_name());
+  return val_decimal_from_json(this, decimal_value);
 }
 
 /**
@@ -1362,7 +1365,7 @@ static bool create_scalar(Json_scalar_holder *scalar, Json_dom_ptr *dom,
 }
 
 /**
-  Get a JSON value from a function, field or subselect scalar.
+  Get a JSON value from an SQL scalar value.
 
   @param[in]     arg         the function argument
   @param[in]     calling_function the name of the calling function
@@ -1375,16 +1378,27 @@ static bool create_scalar(Json_scalar_holder *scalar, Json_dom_ptr *dom,
                              borrowed by the result wrapper to hold the scalar
                              result. If the pointer is NULL, memory will be
                              allocated on the heap.
-  @param[in]     accept_string
-                             if true, accept SQL strings as scalars
-                             (false implies we need a valid
-                              JSON parsable string)
+  @param[in]     scalar_string
+                             if true, interpret SQL strings as scalar JSON
+                             strings.
+                             if false, interpret SQL strings as JSON objects.
+                             If conversion fails, return the string as a
+                             scalar JSON string instead.
+
   @return false if we could get a value or NULL, otherwise true
 */
-static bool val_json_func_field_subselect(
-    Item *arg, const char *calling_function, String *value, String *tmp,
-    Json_wrapper *wr, Json_scalar_holder *scalar, bool accept_string) {
+template <typename T>
+static bool sql_scalar_to_json(T *arg, const char *calling_function,
+                               String *value, String *tmp, Json_wrapper *wr,
+                               Json_scalar_holder *scalar, bool scalar_string) {
   enum_field_types field_type = get_normalized_field_type(arg);
+  /*
+    Most items and fields have same actual and resolved types, however e.g
+    a dynamic parameter will usually have a different type (integer, string...)
+  */
+  if (field_type == MYSQL_TYPE_JSON) {
+    field_type = arg->actual_data_type();
+  }
   Json_dom_ptr dom;
 
   switch (field_type) {
@@ -1395,6 +1409,7 @@ static bool val_json_func_field_subselect(
     case MYSQL_TYPE_LONGLONG:
     case MYSQL_TYPE_YEAR: {
       longlong i = arg->val_int();
+      if (current_thd->is_error()) return true;
 
       if (arg->null_value) return false;
 
@@ -1413,7 +1428,6 @@ static bool val_json_func_field_subselect(
     case MYSQL_TYPE_TIMESTAMP:
     case MYSQL_TYPE_TIME: {
       longlong dt = arg->val_temporal_by_field_type();
-
       if (arg->null_value) return false;
 
       MYSQL_TIME t;
@@ -1427,6 +1441,7 @@ static bool val_json_func_field_subselect(
     case MYSQL_TYPE_NEWDECIMAL: {
       my_decimal m;
       my_decimal *r = arg->val_decimal(&m);
+      if (current_thd->is_error()) return true;
 
       if (arg->null_value) return false;
 
@@ -1443,6 +1458,7 @@ static bool val_json_func_field_subselect(
     case MYSQL_TYPE_DOUBLE:
     case MYSQL_TYPE_FLOAT: {
       double d = arg->val_real();
+      if (current_thd->is_error()) return true;
 
       if (arg->null_value) return false;
 
@@ -1454,6 +1470,7 @@ static bool val_json_func_field_subselect(
     case MYSQL_TYPE_GEOMETRY: {
       uint32 geometry_srid;
       String *swkb = arg->val_str(tmp);
+      if (current_thd->is_error()) return true;
       if (arg->null_value) return false;
       bool retval = geometry_to_json(wr, swkb, calling_function, INT_MAX32,
                                      false, false, false, &geometry_srid);
@@ -1470,6 +1487,7 @@ static bool val_json_func_field_subselect(
     case MYSQL_TYPE_MEDIUM_BLOB:
     case MYSQL_TYPE_TINY_BLOB: {
       String *oo = arg->val_str(value);
+      if (current_thd->is_error()) return true;
 
       if (arg->null_value) return false;
 
@@ -1489,6 +1507,7 @@ static bool val_json_func_field_subselect(
         in which case a binary character set is our only hope for success).
       */
       String *res = arg->val_str(value);
+      if (current_thd->is_error()) return true;
 
       if (arg->null_value) return false;
       const CHARSET_INFO *cs = res->charset();
@@ -1511,7 +1530,7 @@ static bool val_json_func_field_subselect(
           return true; /* purecov: inspected */
 
         break;
-      } else if (accept_string) {
+      } else {
         const char *s = res->ptr();
         size_t ss = res->length();
 
@@ -1519,12 +1538,21 @@ static bool val_json_func_field_subselect(
           return true;
         }
 
-        if (create_scalar<Json_string>(scalar, &dom, s, ss))
-          return true; /* purecov: inspected */
+        if (scalar_string) {
+          if (create_scalar<Json_string>(scalar, &dom, s, ss))
+            return true; /* purecov: inspected */
+        } else {
+          const char *parse_err;
+          size_t err_offset;
+          dom = Json_dom::parse(s, ss, &parse_err, &err_offset);
+          if (dom == nullptr) {
+            if (parse_err == nullptr) return true;  // Error is generated
 
-      } else {
-        my_error(ER_INVALID_CAST_TO_JSON, MYF(0));
-        return true;
+            my_error(ER_INVALID_JSON_TEXT_IN_PARAM, MYF(0), 1, calling_function,
+                     parse_err, err_offset, "");
+            return true;
+          }
+        }
       }
       break;
     }
@@ -1533,18 +1561,12 @@ static bool val_json_func_field_subselect(
       return true;
 
     case MYSQL_TYPE_NULL:
-      /*
-        This shouldn't happen, since the only caller of this function
-        returns earlier if it sees that the type is MYSQL_TYPE_NULL.
-      */
-      /* purecov: begin inspected */
-      if (arg->update_null_value()) return true;
-      DBUG_ASSERT(arg->null_value);
+      // May occur for a parameter that is NULL
+      assert(arg->null_value);
       return false;
-      /* purecov: end */
 
     case MYSQL_TYPE_JSON:
-      DBUG_ASSERT(false); /* purecov: inspected */
+      assert(false); /* purecov: inspected */
 
       // fall-through
     default:
@@ -1556,7 +1578,7 @@ static bool val_json_func_field_subselect(
   DBUG_ASSERT((scalar == nullptr) != (dom == nullptr));
   DBUG_ASSERT(scalar == nullptr || scalar->get() != nullptr);
 
-  if (scalar) {
+  if (scalar != nullptr) {
     /*
       The DOM object lives in memory owned by the caller. Tell the
       wrapper that it's not the owner.
@@ -1613,6 +1635,12 @@ static bool extract_boolean(Item *arg, bool *result) {
   return false;
 }
 
+bool convert_scalar_to_json(Item *arg, String *value, String *tmp,
+                            Json_wrapper *wr) {
+  return sql_scalar_to_json(arg, "cast_as_json", value, tmp, wr, nullptr,
+                            arg->json_as_scalar());
+}
+
 // see the contract for this function in item_json_func.h
 bool get_json_atom_wrapper(Item **args, uint arg_idx,
                            const char *calling_function, String *value,
@@ -1622,20 +1650,16 @@ bool get_json_atom_wrapper(Item **args, uint arg_idx,
 
   Item *const arg = args[arg_idx];
 
+  // First, try to handle simple cases: NULL value and JSON type
+  bool has_value = false;
+  if (json_value(arg, wr, &has_value)) {
+    return true;
+  }
+  if (has_value) {
+    return false;
+  }
+
   try {
-    if (!json_value(args, arg_idx, wr)) {
-      return false;
-    }
-
-    if (arg->data_type() == MYSQL_TYPE_JSON) {
-      /*
-        If the type of the argument is JSON and json_value() returned
-        false, it means the argument didn't contain valid JSON data.
-        Give up.
-      */
-      return true;
-    }
-
     // boolean operators should produce boolean values
     bool boolean_value;
     if (extract_boolean(arg, &boolean_value)) {
@@ -1643,7 +1667,7 @@ bool get_json_atom_wrapper(Item **args, uint arg_idx,
       if (create_scalar<Json_boolean>(scalar, &boolean_dom, boolean_value))
         return true; /* purecov: inspected */
 
-      if (scalar) {
+      if (scalar != nullptr) {
         /*
           The DOM object lives in memory owned by the caller. Tell the
           wrapper that it's not the owner.
@@ -1661,8 +1685,8 @@ bool get_json_atom_wrapper(Item **args, uint arg_idx,
       Allow other types as first-class or opaque JSON values.
       But how to determine what the type is? We do a best effort...
     */
-    result = val_json_func_field_subselect(arg, calling_function, value, tmp,
-                                           wr, scalar, accept_string);
+    result = sql_scalar_to_json(arg, calling_function, value, tmp, wr, scalar,
+                                accept_string);
 
   } catch (...) {
     /* purecov: begin inspected */
@@ -1699,8 +1723,10 @@ bool Item_typecast_json::val_json(Json_wrapper *wr) {
   }
 
   if (args[0]->data_type() == MYSQL_TYPE_JSON) {
-    if (json_value(args, 0, wr)) return error_json();
+    bool has_value;
+    if (json_value(args[0], wr, &has_value)) return error_json();
 
+    DBUG_ASSERT(has_value);
     null_value = args[0]->null_value;
     return false;
   }
@@ -1729,6 +1755,7 @@ bool Item_typecast_json::val_json(Json_wrapper *wr) {
     return error_json();
 
   null_value = args[0]->null_value;
+
   return false;
 }
 
@@ -3531,7 +3558,8 @@ bool Item_func_json_merge_patch::val_json(Json_wrapper *wr) {
 }
 
 /**
-  Sets the data type of an Item_func_array_cast based on the Cast_type.
+  Sets the data type of an Item_func_array_cast or Item_func_json_value based on
+  the Cast_type.
 
   @param item       the Item whose data type to set
   @param cast_type  the type of cast
@@ -3555,6 +3583,9 @@ static void set_data_type_from_cast_type(Item *item, Cast_target cast_type,
     case ITEM_CAST_DATE:
       item->set_data_type_date();
       return;
+    case ITEM_CAST_YEAR:
+      item->set_data_type_year();
+      return;
     case ITEM_CAST_TIME:
       item->set_data_type_time(decimals);
       return;
@@ -3573,8 +3604,10 @@ static void set_data_type_from_cast_type(Item *item, Cast_target cast_type,
         item->set_data_type_string(length, charset);
       return;
     case ITEM_CAST_JSON:
-      // CAST(... AS JSON ARRAY) is not supported.
-      DBUG_ASSERT(false);
+      // JSON_VALUE(... RETURNING JSON) is supported, CAST(... AS JSON ARRAY) is
+      // not supported.
+      DBUG_ASSERT(!item->returns_array());
+      item->set_data_type_json();
       return;
     case ITEM_CAST_DOUBLE:
       item->set_data_type_double();
@@ -3630,54 +3663,80 @@ bool Item_func_array_cast::fix_fields(THD *thd, Item **ref) {
   return Item_func::fix_fields(thd, ref);
 }
 
+/**
+  Prints the target type of a cast operation (either CAST or JSON_VALUE).
+
+  @param cast_type   the cast type
+  @param item        the Item in which the cast operation is performed
+  @param[out] str    the string to print to
+*/
+static void print_cast_type(Cast_target cast_type, const Item *item,
+                            String *str) {
+  const unsigned decimals = item->decimals;
+  switch (cast_type) {
+    case ITEM_CAST_SIGNED_INT:
+      str->append(STRING_WITH_LEN("signed"));
+      return;
+    case ITEM_CAST_UNSIGNED_INT:
+      str->append(STRING_WITH_LEN("unsigned"));
+      return;
+    case ITEM_CAST_DATE:
+      str->append(STRING_WITH_LEN("date"));
+      return;
+    case ITEM_CAST_YEAR:
+      str->append(STRING_WITH_LEN("year"));
+      return;
+    case ITEM_CAST_TIME:
+      str->append(STRING_WITH_LEN("time"));
+      if (decimals > 0) str->append_parenthesized(decimals);
+      return;
+    case ITEM_CAST_DATETIME:
+      str->append(STRING_WITH_LEN("datetime"));
+      if (decimals > 0) str->append_parenthesized(decimals);
+      return;
+    case ITEM_CAST_DECIMAL:
+      // length and dec are already set
+      str->append(STRING_WITH_LEN("decimal("));
+      str->append_ulonglong(my_decimal_length_to_precision(
+          item->max_length, decimals, item->unsigned_flag));
+      str->append(STRING_WITH_LEN(", "));
+      str->append_ulonglong(decimals);
+      str->append(')');
+      return;
+    case ITEM_CAST_CHAR: {
+      const CHARSET_INFO *const cs = item->collation.collation;
+      if (cs == &my_charset_bin) {
+        str->append(STRING_WITH_LEN("binary"));
+        str->append_parenthesized(item->max_length);
+      } else {
+        str->append(STRING_WITH_LEN("char"));
+        str->append_parenthesized(item->max_char_length());
+        if (cs != &my_charset_utf8mb4_0900_bin) {
+          str->append(STRING_WITH_LEN(" character set "));
+          str->append(cs->csname);
+        }
+      }
+      return;
+    }
+    case ITEM_CAST_JSON:
+      str->append(STRING_WITH_LEN("json"));
+      return;
+    case ITEM_CAST_FLOAT:
+      str->append(STRING_WITH_LEN("float"));
+      return;
+    case ITEM_CAST_DOUBLE:
+      str->append(STRING_WITH_LEN("double"));
+      return;
+  }
+  DBUG_ASSERT(false); /* purecov: deadcode */
+}
+
 void Item_func_array_cast::print(const THD *thd, String *str,
                                  enum_query_type query_type) const {
   str->append(STRING_WITH_LEN("cast("));
   args[0]->print(thd, str, query_type);
   str->append(STRING_WITH_LEN(" as "));
-  switch (cast_type) {
-    case ITEM_CAST_SIGNED_INT:
-      str->append(STRING_WITH_LEN("signed"));
-      break;
-    case ITEM_CAST_UNSIGNED_INT:
-      str->append(STRING_WITH_LEN("unsigned"));
-      break;
-    case ITEM_CAST_DATE:
-      str->append(STRING_WITH_LEN("date"));
-      break;
-    case ITEM_CAST_TIME:
-      str->append(STRING_WITH_LEN("time"));
-      if (decimals > 0) str->append_parenthesized(decimals);
-      break;
-    case ITEM_CAST_DATETIME:
-      str->append(STRING_WITH_LEN("datetime"));
-      if (decimals > 0) str->append_parenthesized(decimals);
-      break;
-    case ITEM_CAST_DECIMAL:
-      // length and dec are already set
-      str->append(STRING_WITH_LEN("decimal("));
-      str->append_ulonglong(
-          my_decimal_length_to_precision(max_length, decimals, unsigned_flag));
-      str->append(STRING_WITH_LEN(", "));
-      str->append_ulonglong(decimals);
-      str->append(')');
-      break;
-    case ITEM_CAST_CHAR:
-      if (collation.collation == &my_charset_bin) {
-        str->append(STRING_WITH_LEN("binary"));
-        str->append_parenthesized(max_length);
-      } else {
-        str->append(STRING_WITH_LEN("char"));
-        str->append_parenthesized(max_char_length());
-        // CAST AS ARRAY does not support specifying a CHARACTER SET clause, so
-        // don't print one. The lack of a CHARACTER SET clause implies utf8mb4
-        // with the utf8mb4_0900_bin collation.
-        DBUG_ASSERT(collation.collation == &my_charset_utf8mb4_0900_bin);
-      }
-      break;
-    default:
-      DBUG_ASSERT(false); /* purecov: deadcode */
-  }
+  print_cast_type(cast_type, this, str);
   str->append(STRING_WITH_LEN(" array)"));
 }
 
@@ -3686,19 +3745,18 @@ bool Item_func_array_cast::resolve_type(THD *) {
   return false;
 }
 
-enum Item_result Item_func_array_cast::result_type() const {
+static enum Item_result json_cast_result_type(Cast_target cast_type) {
   switch (cast_type) {
     case ITEM_CAST_SIGNED_INT:
+    case ITEM_CAST_YEAR:
     case ITEM_CAST_UNSIGNED_INT:
       return INT_RESULT;
-      break;
     case ITEM_CAST_DATE:
     case ITEM_CAST_TIME:
     case ITEM_CAST_DATETIME:
     case ITEM_CAST_CHAR:
     case ITEM_CAST_JSON:
       return STRING_RESULT;
-      break;
     case ITEM_CAST_DECIMAL:
       return DECIMAL_RESULT;
     case ITEM_CAST_FLOAT:
@@ -3708,6 +3766,10 @@ enum Item_result Item_func_array_cast::result_type() const {
 
   DBUG_ASSERT(false); /* purecov: deadcode */
   return INT_RESULT;
+}
+
+enum Item_result Item_func_array_cast::result_type() const {
+  return json_cast_result_type(cast_type);
 }
 
 type_conversion_status Item_func_array_cast::save_in_field_inner(Field *field,
@@ -3722,6 +3784,8 @@ type_conversion_status Item_func_array_cast::save_in_field_inner(Field *field,
   return down_cast<Field_typed_array *>(field)->store_array(
       &wr, m_result_array.get());
 }
+
+void Item_func_array_cast::cleanup() { Item_func::cleanup(); }
 
 /// Converts the "data type" used by Item to a "real type" used by Field.
 static enum_field_types data_type_to_real_type(enum_field_types data_type) {
@@ -3747,19 +3811,6 @@ Field *Item_func_array_cast::tmp_table_field(TABLE *table) {
   return array_field;
 }
 
-/**
-  Coerce JSON data to the typed array's type and append it to the array (if
-  the latter is given)
-
-  @param[in]   wr       JSON data to coerce
-  @param[in]   no_error Whether to throw error
-  @param[out]  coerced  Coerced value (optional)
-
-  @returns
-    false Given JSON was successfully converted and appended to array (if
-          provided)
-    true  Otherwise
-*/
 bool Field_typed_array::coerce_json_value(const Json_wrapper *wr, bool no_error,
                                           Json_wrapper *coerced) const {
   Json_wrapper saved;
@@ -3777,11 +3828,11 @@ bool Field_typed_array::coerce_json_value(const Json_wrapper *wr, bool no_error,
     the value is coercible at all. In such case don't throw an error, just
     return 'true' when value isn't coercible.
   */
-  if (save_json_to_field(thd, m_conv_item->field, wr, no_error) ||
-      // The calling_function arg below isn't needed as it's used only for
-      // geometry and geometry arrays aren't supported
-      val_json_func_field_subselect(m_conv_item, "<typed array>", &value, &tmp,
-                                    &saved, nullptr, true))
+  if (save_json_to_field(thd, m_conv_item->field, wr, no_error)) return true;
+  // The calling_function arg below isn't needed as it's used only for
+  // geometry and geometry arrays aren't supported
+  if (sql_scalar_to_json(m_conv_item, "<typed array>", &value, &tmp, &saved,
+                         nullptr, true))
     return true;
   if (!coerced) return false;
   *coerced = std::move(saved);
@@ -4017,7 +4068,8 @@ bool save_json_to_field(THD *thd, Field *field, const Json_wrapper *w,
   bool err = false;
   switch (field->result_type()) {
     case INT_RESULT: {
-      longlong value = w->coerce_int(field->field_name, &err, cr_error);
+      longlong value =
+          w->coerce_int(field->field_name, cr_error, &err, nullptr);
 
       // If the Json_wrapper holds a numeric value, grab the signedness from it.
       // If not, grab the signedness from the column where we are storing the
@@ -4028,7 +4080,7 @@ bool save_json_to_field(THD *thd, Field *field, const Json_wrapper *w,
       } else if (w->type() == enum_json_type::J_UINT) {
         value_unsigned = true;
       } else {
-        value_unsigned = field->unsigned_flag;
+        value_unsigned = field->is_unsigned();
       }
 
       if (!err)
@@ -4066,7 +4118,13 @@ bool save_json_to_field(THD *thd, Field *field, const Json_wrapper *w,
         err = err || field->store_time(&ltime);
         break;
       }
-      String str;
+      // Initialize with an explicit empty string pointer,
+      // instead of the default nullptr.
+      // The reason is that we pass str.ptr() to Field::store()
+      // which may end up calling memmove() which may have
+      // __attribute__((nonnull)) on its 'src' argument.
+      String str{"", 0, /* charset= */ nullptr};
+
       if (can_store_json_value_unencoded(field, w)) {
         str.set(w->get_data(), w->get_data_length(), field->charset());
       } else {
@@ -4079,13 +4137,13 @@ bool save_json_to_field(THD *thd, Field *field, const Json_wrapper *w,
       break;
     }
     case REAL_RESULT: {
-      double value = w->coerce_real(field->field_name, &err, cr_error);
+      double value = w->coerce_real(field->field_name, cr_error, &err);
       if (!err && (field->store(value) >= TYPE_WARN_OUT_OF_RANGE)) err = true;
       break;
     }
     case DECIMAL_RESULT: {
       my_decimal value;
-      w->coerce_decimal(&value, field->field_name, &err, cr_error);
+      w->coerce_decimal(&value, field->field_name, cr_error, &err);
       if (!err && (field->store_decimal(&value) >= TYPE_WARN_OUT_OF_RANGE))
         err = true;
       break;
@@ -4099,4 +4157,904 @@ bool save_json_to_field(THD *thd, Field *field, const Json_wrapper *w,
   if (err && !no_error)
     my_error(ER_JT_VALUE_OUT_OF_RANGE, MYF(0), field->field_name);
   return err;
+}
+
+struct Item_func_json_value::Default_value {
+  int64_t integer_default;
+  const MYSQL_TIME *temporal_default;
+  LEX_CSTRING string_default;
+  const my_decimal *decimal_default;
+  std::unique_ptr<Json_dom> json_default;
+  double real_default;
+};
+
+Item_func_json_value::Item_func_json_value(
+    const POS &pos, Item *arg, Item *path, const Cast_type &cast_type,
+    unsigned length, unsigned precision, Json_on_response_type on_empty_type,
+    Item *on_empty_default, Json_on_response_type on_error_type,
+    Item *on_error_default)
+    : Item_func(pos, arg, path, on_empty_default, on_error_default),
+      m_on_empty(on_empty_type),
+      m_on_error(on_error_type),
+      m_cast_target(cast_type.target) {
+  set_data_type_from_cast_type(this, m_cast_target, length, precision,
+                               cast_type.charset);
+}
+
+Item_func_json_value::~Item_func_json_value() = default;
+
+enum Item_result Item_func_json_value::result_type() const {
+  return json_cast_result_type(m_cast_target);
+}
+
+bool Item_func_json_value::resolve_type(THD *) {
+  // The path must be a character literal, so it's never NULL.
+  DBUG_ASSERT(!args[1]->maybe_null);
+  // The DEFAULT values are character literals, so they are never NULL if they
+  // are specified.
+  DBUG_ASSERT(m_on_empty != Json_on_response_type::DEFAULT ||
+              !args[2]->maybe_null);
+  DBUG_ASSERT(m_on_error != Json_on_response_type::DEFAULT ||
+              !args[3]->maybe_null);
+
+  // JSON_VALUE can return NULL if its first argument is nullable, or if NULL
+  // ON EMPTY or NULL ON ERROR is specified or implied, or if the extracted JSON
+  // value is the JSON null literal.
+  maybe_null = true;
+  return false;
+}
+
+/**
+  Checks if a decimal value is within the range of the data type of an Item. It
+  is considered within range if it can be converted to the data type without
+  losing any leading significant digits.
+*/
+static bool decimal_within_range(const Item *item, const my_decimal *decimal) {
+  DBUG_ASSERT(item->data_type() == MYSQL_TYPE_NEWDECIMAL);
+  return decimal_intg(decimal) <= item->decimal_int_part();
+}
+
+unique_ptr_destroy_only<Item_func_json_value::Default_value>
+Item_func_json_value::create_json_value_default(THD *thd, Item *item) {
+  MEM_ROOT *const mem_root = thd->mem_root;
+
+  auto default_value = make_unique_destroy_only<Default_value>(mem_root);
+  if (default_value == nullptr) return nullptr;
+
+  // Evaluate the defaults under strict mode, so that an error is raised if the
+  // default value cannot be converted to the target type without warnings.
+  Strict_error_handler strict_handler{
+      Strict_error_handler::ENABLE_SET_SELECT_STRICT_ERROR_HANDLER};
+  auto strict_handler_guard =
+      create_scope_guard([thd, saved_sql_mode = thd->variables.sql_mode]() {
+        thd->pop_internal_handler();
+        thd->variables.sql_mode = saved_sql_mode;
+      });
+  thd->push_internal_handler(&strict_handler);
+  thd->variables.sql_mode |=
+      MODE_STRICT_ALL_TABLES | MODE_NO_ZERO_DATE | MODE_NO_ZERO_IN_DATE;
+  thd->variables.sql_mode &= ~MODE_INVALID_DATES;
+
+  // Check that the default value is within the range of the return type.
+  switch (m_cast_target) {
+    case ITEM_CAST_SIGNED_INT:
+    case ITEM_CAST_UNSIGNED_INT: {
+      StringBuffer<STRING_BUFFER_USUAL_SIZE> string_buffer;
+      const String *string_value = item->val_str(&string_buffer);
+      if (thd->is_error()) return nullptr;
+      DBUG_ASSERT(string_value != nullptr);
+      const CHARSET_INFO *const cs = string_value->charset();
+      const char *const start = string_value->ptr();
+      const char *const end_of_string = start + string_value->length();
+      const char *end_of_number = end_of_string;
+      int error = 0;
+      const int64_t value =
+          cs->cset->strtoll10(cs, start, &end_of_number, &error);
+      if (end_of_number != end_of_string) {
+        ErrConvString err(start, cs);
+        my_error(ER_TRUNCATED_WRONG_VALUE, MYF(0),
+                 unsigned_flag ? "INTEGER UNSIGNED" : "INTEGER SIGNED",
+                 err.ptr());
+        return nullptr;
+      }
+      if (error > 0 ||
+          (!unsigned_flag && error == 0 &&
+           static_cast<uint64_t>(value) > INT64_MAX) ||
+          (unsigned_flag && error == -1)) {
+        my_error(ER_DATA_OUT_OF_RANGE, MYF(0),
+                 unsigned_flag ? "UNSIGNED DEFAULT" : "SIGNED DEFAULT",
+                 func_name());
+        return nullptr;
+      }
+      default_value->integer_default = value;
+      break;
+    }
+    case ITEM_CAST_DATE: {
+      MYSQL_TIME *ltime = new (mem_root) MYSQL_TIME;
+      if (ltime == nullptr) return nullptr;
+      if (item->get_date(ltime, 0)) return nullptr;
+      DBUG_ASSERT(!thd->is_error());
+      default_value->temporal_default = ltime;
+      break;
+    }
+    case ITEM_CAST_YEAR: {
+      StringBuffer<STRING_BUFFER_USUAL_SIZE> string_buffer;
+      const String *string_value = item->val_str(&string_buffer);
+      if (thd->is_error()) return nullptr;
+      DBUG_ASSERT(string_value != nullptr);
+      const CHARSET_INFO *const cs = string_value->charset();
+      const char *const start = string_value->ptr();
+      const char *const end_of_string = start + string_value->length();
+      const char *end_of_number = end_of_string;
+      int error = 0;
+      const int64_t value =
+          cs->cset->strtoll10(cs, start, &end_of_number, &error);
+      if (end_of_number != end_of_string) {
+        ErrConvString err(start, cs);
+        my_error(ER_TRUNCATED_WRONG_VALUE, MYF(0), "YEAR", err.ptr());
+        return nullptr;
+      }
+      if (error != 0 || (value > 2155) || (value < 1901 && value != 0)) {
+        my_error(ER_DATA_OUT_OF_RANGE, MYF(0), "YEAR", func_name());
+        return nullptr;
+      }
+      default_value->integer_default = value;
+      break;
+    }
+    case ITEM_CAST_TIME: {
+      MYSQL_TIME *ltime = new (mem_root) MYSQL_TIME;
+      if (ltime == nullptr) return nullptr;
+      if (item->get_time(ltime)) return nullptr;
+      DBUG_ASSERT(!thd->is_error());
+      if (actual_decimals(ltime) > decimals) {
+        my_error(ER_DATA_OUT_OF_RANGE, MYF(0), "TIME DEFAULT", func_name());
+        return nullptr;
+      }
+      default_value->temporal_default = ltime;
+      break;
+    }
+    case ITEM_CAST_DATETIME: {
+      MYSQL_TIME *ltime = new (mem_root) MYSQL_TIME;
+      if (ltime == nullptr) return nullptr;
+      if (item->get_date(ltime, TIME_DATETIME_ONLY)) return nullptr;
+      DBUG_ASSERT(!thd->is_error());
+      if (actual_decimals(ltime) > decimals) {
+        my_error(ER_DATA_OUT_OF_RANGE, MYF(0), "TIME DEFAULT", func_name());
+        return nullptr;
+      }
+      default_value->temporal_default = ltime;
+      break;
+    }
+    case ITEM_CAST_CHAR: {
+      StringBuffer<STRING_BUFFER_USUAL_SIZE> string_buffer;
+      const String *string_value = item->val_str(&string_buffer);
+      if (thd->is_error()) return nullptr;
+      DBUG_ASSERT(string_value != nullptr);
+      if (string_value->numchars() > max_char_length()) {
+        my_error(ER_DATA_OUT_OF_RANGE, MYF(0), "CHAR DEFAULT", func_name());
+        return nullptr;
+      }
+      if (my_charset_same(collation.collation, string_value->charset())) {
+        default_value->string_default = {string_value->dup(mem_root),
+                                         string_value->length()};
+        if (default_value->string_default.str == nullptr) return nullptr;
+      } else {
+        String converted_string;
+        unsigned errors;
+        if (converted_string.copy(string_value->ptr(), string_value->length(),
+                                  string_value->charset(), collation.collation,
+                                  &errors))
+          return nullptr; /* purecov: inspected */
+        if (errors > 0) {
+          my_error(ER_DATA_OUT_OF_RANGE, MYF(0), "CHAR DEFAULT", func_name());
+          return nullptr;
+        }
+        default_value->string_default = {converted_string.dup(mem_root),
+                                         converted_string.length()};
+        if (default_value->string_default.str == nullptr) return nullptr;
+      }
+      break;
+    }
+    case ITEM_CAST_DECIMAL: {
+      my_decimal *buffer = new (mem_root) my_decimal;
+      if (buffer == nullptr) return nullptr;
+      const my_decimal *value = item->val_decimal(buffer);
+      if (thd->is_error()) return nullptr;
+      if (!decimal_within_range(this, value) || value->frac > decimals) {
+        my_error(ER_DATA_OUT_OF_RANGE, MYF(0), "DECIMAL DEFAULT", func_name());
+        return nullptr;
+      }
+      default_value->decimal_default = value;
+      break;
+    }
+    case ITEM_CAST_JSON: {
+      StringBuffer<STRING_BUFFER_USUAL_SIZE> string_buffer;
+      const String *string_value = item->val_str(&string_buffer);
+      if (thd->is_error()) return nullptr;
+      DBUG_ASSERT(string_value != nullptr);
+      bool parse_error;
+      if (parse_json(*string_value, 0, func_name(),
+                     &default_value->json_default, true, &parse_error)) {
+        my_error(ER_INVALID_DEFAULT, MYF(0), func_name());
+        return nullptr;
+      }
+      break;
+    }
+    case ITEM_CAST_FLOAT: {
+      const double value = item->val_real();
+      if (thd->is_error()) return nullptr;
+      if (value > std::numeric_limits<float>::max() ||
+          value < std::numeric_limits<float>::lowest()) {
+        my_error(ER_DATA_OUT_OF_RANGE, MYF(0), "FLOAT DEFAULT", func_name());
+        return nullptr;
+      }
+      default_value->real_default = value;
+      break;
+    }
+    case ITEM_CAST_DOUBLE: {
+      const double value = item->val_real();
+      if (thd->is_error()) return nullptr;
+      default_value->real_default = value;
+      break;
+    }
+  }
+
+  return default_value;
+}
+
+bool Item_func_json_value::fix_fields(THD *thd, Item **ref) {
+  if (Item_func::fix_fields(thd, ref)) return true;
+
+  if (check_convertible_to_json(args[0], 1, func_name())) return true;
+
+  DBUG_ASSERT(args[1]->basic_const_item());
+  const String *path = args[1]->val_str(nullptr);
+  DBUG_ASSERT(path != nullptr);
+  if (parse_path(*path, false, &m_path_json)) return true;
+
+  if (m_on_empty == Json_on_response_type::DEFAULT &&
+      m_default_empty == nullptr) {
+    DBUG_ASSERT(args[2]->basic_const_item());
+    Prepared_stmt_arena_holder ps_arena_holder(thd);
+    m_default_empty = create_json_value_default(thd, args[2]);
+    if (m_default_empty == nullptr) return true;
+  }
+
+  if (m_on_error == Json_on_response_type::DEFAULT &&
+      m_default_error == nullptr) {
+    DBUG_ASSERT(args[3]->basic_const_item());
+    Prepared_stmt_arena_holder ps_arena_holder(thd);
+    m_default_error = create_json_value_default(thd, args[3]);
+    if (m_default_error == nullptr) return true;
+  }
+
+  return false;
+}
+
+void Item_func_json_value::print(const THD *thd, String *str,
+                                 enum_query_type query_type) const {
+  str->append(STRING_WITH_LEN("json_value("));
+  args[0]->print(thd, str, query_type);
+  str->append(STRING_WITH_LEN(", "));
+  args[1]->print(thd, str, query_type);
+  str->append(STRING_WITH_LEN(" returning "));
+  print_cast_type(m_cast_target, this, str);
+  // ON EMPTY
+  print_on_empty_or_error(thd, str, query_type, /*on_empty=*/true, m_on_empty,
+                          args[2]);
+  // ON ERROR
+  print_on_empty_or_error(thd, str, query_type, /*on_empty=*/false, m_on_error,
+                          args[3]);
+  str->append(')');
+}
+
+/**
+  Checks if two Json_on_response_type values represent the same response.
+  Implicit responses are equal to NULL ON EMPTY/ERROR.
+*/
+static bool same_response_type(Json_on_response_type type1,
+                               Json_on_response_type type2) {
+  return type1 == type2 || ((type1 == Json_on_response_type::IMPLICIT ||
+                             type1 == Json_on_response_type::NULL_VALUE) &&
+                            (type2 == Json_on_response_type::IMPLICIT ||
+                             type2 == Json_on_response_type::NULL_VALUE));
+}
+
+bool Item_func_json_value::eq(const Item *item, bool binary_cmp) const {
+  if (!Item_func::eq(item, binary_cmp)) return false;
+
+  const auto other = down_cast<const Item_func_json_value *>(item);
+
+  if (other->m_cast_target != m_cast_target) return false;
+  if (other->max_length != max_length) return false;
+  if (other->decimals != decimals) return false;
+
+  if (!same_response_type(other->m_on_empty, m_on_empty)) return false;
+  if (!same_response_type(other->m_on_error, m_on_error)) return false;
+
+  return true;
+}
+
+/**
+  Handles conversion errors for JSON_VALUE according to the ON ERROR clause.
+  Called when the conversion of the extracted JSON value cannot be converted to
+  the target type without truncation or data loss.
+
+  If ERROR ON ERROR is specified, an error is raised, and true is returned.
+
+  If NULL ON ERROR is specified (explicitly or implicitly), the item's
+  null_value is set to true, and false is returned.
+
+  If DEFAULT ... ON ERROR is specified, the item's null_value is set to false,
+  and false is returned. It is up to the caller to return the correct default
+  value.
+
+  @param on_error     the type of response to give to the error
+  @param type         the data type returned by the JSON_VALUE expression
+  @param[in,out] item the Item representing the JSON_VALUE expression
+
+  @retval true for ERROR ON ERROR (my_error() is called before returning)
+  @retval false if DEFAULT .. ON ERROR or NULL ON ERROR was given
+*/
+static bool handle_json_value_conversion_error(Json_on_response_type on_error,
+                                               const char *type,
+                                               Item_func_json_value *item) {
+  // Should have returned earlier if the value is NULL.
+  DBUG_ASSERT(!item->null_value);
+
+  switch (on_error) {
+    case Json_on_response_type::ERROR: {
+      my_error(ER_DATA_OUT_OF_RANGE, MYF(0), type, item->func_name());
+      return true;
+    }
+    case Json_on_response_type::DEFAULT:
+      item->null_value = false;
+      break;
+    case Json_on_response_type::NULL_VALUE:
+    case Json_on_response_type::IMPLICIT:
+      DBUG_ASSERT(item->maybe_null);
+      item->null_value = true;
+      break;
+  }
+  return false;
+}
+
+bool Item_func_json_value::extract_json_value(
+    Json_wrapper *json, const Default_value **return_default) {
+  *return_default = nullptr;
+
+  try {
+    Json_wrapper doc;
+
+    DBUG_ASSERT(is_convertible_to_json(args[0]));  // Checked in fix_fields().
+    if (args[0]->data_type() == MYSQL_TYPE_JSON) {
+      if (args[0]->val_json(&doc)) return true;
+      null_value = args[0]->null_value;
+      if (null_value) {
+        DBUG_ASSERT(maybe_null);
+        return false;
+      }
+    } else {
+      String buffer;
+      const String *doc_string = args[0]->val_str(&buffer);
+      null_value = args[0]->null_value;
+      if (null_value) {
+        DBUG_ASSERT(maybe_null);
+        return false;
+      }
+
+      Json_dom_ptr dom;
+      bool parse_error = false;
+      {
+        THD *thd = current_thd;
+        // For all other modes than ERROR ON ERROR, downgrade parse errors to
+        // warnings.
+        Ignore_json_syntax_handler error_handler(
+            thd, m_on_error != Json_on_response_type::ERROR);
+        if (parse_json(*doc_string, 0, func_name(), &dom, true, &parse_error) &&
+            thd->is_error())
+          return error_json();
+      }
+
+      // Invoke the ON ERROR clause if a parse error was raised.
+      if (parse_error) {
+        // ERROR ON ERROR will have returned above.
+        DBUG_ASSERT(m_on_error != Json_on_response_type::ERROR);
+
+        if (m_on_error == Json_on_response_type::DEFAULT) {
+          *return_default = m_default_error.get();
+          return false;
+        } else {
+          DBUG_ASSERT(m_on_error == Json_on_response_type::IMPLICIT ||
+                      m_on_error == Json_on_response_type::NULL_VALUE);
+          DBUG_ASSERT(maybe_null);
+          null_value = true;
+          return false;
+        }
+      }
+
+      DBUG_ASSERT(dom != nullptr);
+      doc = Json_wrapper(std::move(dom));
+    }
+
+    Json_wrapper_vector v(key_memory_JSON);
+    if (doc.seek(m_path_json, m_path_json.leg_count(), &v, true, false))
+      return error_json(); /* purecov: inspected */
+
+    if (v.size() == 1) {
+      *json = std::move(v[0]);
+      if (json->type() == enum_json_type::J_NULL) {
+        /*
+          SQL:2016 : following the rule of JSON_VALUE we come to:
+          9.36 Parsing JSON text GenRule 3-a-iii-3-A-III
+          then to
+          9.40 Casting an SQL/JSON sequence to an SQL type GenRule 4-b-ii,
+          So, JSON null literal -> SQL/JSON null -> SQL NULL.
+        */
+        null_value = true;
+      }
+      return false;
+    }
+
+    // Invoke the ON EMPTY clause if no value was found.
+    if (v.empty()) {
+      switch (m_on_empty) {
+        case Json_on_response_type::DEFAULT:
+          *return_default = m_default_empty.get();
+          return false;
+        case Json_on_response_type::ERROR:
+          my_error(ER_MISSING_JSON_VALUE, MYF(0), func_name());
+          return error_json();
+        case Json_on_response_type::IMPLICIT:
+        case Json_on_response_type::NULL_VALUE:
+          DBUG_ASSERT(maybe_null);
+          null_value = true;
+          return false;
+      }
+    }
+
+    // Otherwise, we have multiple matches. Invoke the ON ERROR clause.
+    DBUG_ASSERT(v.size() > 1);
+
+    switch (m_on_error) {
+      case Json_on_response_type::ERROR:
+        my_error(ER_MULTIPLE_JSON_VALUES, MYF(0), func_name());
+        return error_json();
+      case Json_on_response_type::NULL_VALUE:
+      case Json_on_response_type::IMPLICIT:
+        DBUG_ASSERT(maybe_null);
+        null_value = true;
+        break;
+      case Json_on_response_type::DEFAULT:
+        *return_default = m_default_error.get();
+        break;
+    }
+
+    return false;
+
+    /* purecov: begin inspected */
+  } catch (...) {
+    handle_std_exception(func_name());
+    return error_json();
+    /* purecov: end */
+  }
+}
+
+bool Item_func_json_value::val_json(Json_wrapper *wr) {
+  DBUG_ASSERT(fixed);
+  DBUG_ASSERT(m_cast_target == ITEM_CAST_JSON);
+
+  const Default_value *return_default = nullptr;
+  if (extract_json_value(wr, &return_default)) return error_json();
+
+  if (return_default != nullptr) {
+    DBUG_ASSERT(!null_value);
+    *wr = Json_wrapper(return_default->json_default.get(), true);
+  }
+
+  return false;
+}
+
+String *Item_func_json_value::val_str(String *buffer) {
+  DBUG_ASSERT(fixed);
+  switch (m_cast_target) {
+    case ITEM_CAST_SIGNED_INT:
+    case ITEM_CAST_UNSIGNED_INT:
+    case ITEM_CAST_YEAR:
+      return val_string_from_int(buffer);
+    case ITEM_CAST_DATE:
+      return val_string_from_date(buffer);
+    case ITEM_CAST_TIME:
+      return val_string_from_time(buffer);
+    case ITEM_CAST_DATETIME:
+      return val_string_from_datetime(buffer);
+    case ITEM_CAST_CHAR:
+      return extract_string_value(buffer);
+    case ITEM_CAST_DECIMAL:
+      return val_string_from_decimal(buffer);
+    case ITEM_CAST_JSON:
+      return val_string_from_json(this, buffer);
+    case ITEM_CAST_FLOAT:
+    case ITEM_CAST_DOUBLE:
+      return val_string_from_real(buffer);
+  }
+  DBUG_ASSERT(false); /* purecov: deadcode */
+  return nullptr;
+}
+
+double Item_func_json_value::val_real() {
+  DBUG_ASSERT(fixed);
+  switch (m_cast_target) {
+    case ITEM_CAST_SIGNED_INT:
+    case ITEM_CAST_DATE:
+    case ITEM_CAST_YEAR:
+    case ITEM_CAST_TIME:
+    case ITEM_CAST_DATETIME:
+      return static_cast<double>(val_int());
+    case ITEM_CAST_UNSIGNED_INT:
+      return static_cast<double>(val_uint());
+    case ITEM_CAST_CHAR:
+      return val_real_from_string();
+    case ITEM_CAST_DECIMAL:
+      return val_real_from_decimal();
+    case ITEM_CAST_JSON:
+      return val_real_from_json(this);
+    case ITEM_CAST_FLOAT:
+    case ITEM_CAST_DOUBLE:
+      return extract_real_value();
+  }
+  DBUG_ASSERT(false); /* purecov: deadcode */
+  return 0.0;
+}
+
+longlong Item_func_json_value::val_int() {
+  DBUG_ASSERT(fixed);
+  switch (m_cast_target) {
+    case ITEM_CAST_SIGNED_INT:
+    case ITEM_CAST_UNSIGNED_INT:
+      return extract_integer_value();
+    case ITEM_CAST_YEAR:
+      return extract_year_value();
+    case ITEM_CAST_DATE:
+      return val_int_from_date();
+    case ITEM_CAST_TIME:
+      return val_int_from_time();
+    case ITEM_CAST_DATETIME:
+      return val_int_from_datetime();
+    case ITEM_CAST_CHAR:
+      return val_int_from_string();
+    case ITEM_CAST_DECIMAL:
+      return val_int_from_decimal();
+    case ITEM_CAST_JSON:
+      return val_int_from_json(this);
+    case ITEM_CAST_FLOAT:
+    case ITEM_CAST_DOUBLE:
+      return val_int_from_real();
+  }
+  DBUG_ASSERT(false); /* purecov: deadcode */
+  return 0;
+}
+
+my_decimal *Item_func_json_value::val_decimal(my_decimal *value) {
+  DBUG_ASSERT(fixed);
+  switch (m_cast_target) {
+    case ITEM_CAST_SIGNED_INT:
+    case ITEM_CAST_UNSIGNED_INT:
+    case ITEM_CAST_YEAR:
+      return val_decimal_from_int(value);
+    case ITEM_CAST_DATE:
+    case ITEM_CAST_DATETIME:
+      return val_decimal_from_date(value);
+    case ITEM_CAST_TIME:
+      return val_decimal_from_time(value);
+    case ITEM_CAST_CHAR:
+      return val_decimal_from_string(value);
+    case ITEM_CAST_DECIMAL:
+      return extract_decimal_value(value);
+    case ITEM_CAST_JSON:
+      return val_decimal_from_json(this, value);
+    case ITEM_CAST_FLOAT:
+    case ITEM_CAST_DOUBLE:
+      return val_decimal_from_real(value);
+  }
+  DBUG_ASSERT(false); /* purecov: deadcode */
+  return nullptr;
+}
+
+bool Item_func_json_value::get_date(MYSQL_TIME *ltime, my_time_flags_t flags) {
+  DBUG_ASSERT(fixed);
+  switch (m_cast_target) {
+    case ITEM_CAST_SIGNED_INT:
+    case ITEM_CAST_UNSIGNED_INT:
+      return get_date_from_int(ltime, flags);
+    case ITEM_CAST_DATE:
+    case ITEM_CAST_YEAR:
+      return extract_date_value(ltime);
+    case ITEM_CAST_DATETIME:
+      return extract_datetime_value(ltime);
+    case ITEM_CAST_TIME:
+      return get_date_from_time(ltime);
+    case ITEM_CAST_CHAR:
+      return get_date_from_string(ltime, flags);
+    case ITEM_CAST_DECIMAL:
+      return get_date_from_decimal(ltime, flags);
+    case ITEM_CAST_JSON:
+      return get_date_from_json(this, ltime, flags);
+    case ITEM_CAST_FLOAT:
+    case ITEM_CAST_DOUBLE:
+      return get_date_from_real(ltime, flags);
+  }
+  DBUG_ASSERT(false); /* purecov: deadcode */
+  return true;
+}
+
+bool Item_func_json_value::get_time(MYSQL_TIME *ltime) {
+  DBUG_ASSERT(fixed);
+  switch (m_cast_target) {
+    case ITEM_CAST_SIGNED_INT:
+    case ITEM_CAST_YEAR:
+    case ITEM_CAST_UNSIGNED_INT:
+      return get_time_from_int(ltime);
+    case ITEM_CAST_DATE:
+      return get_time_from_date(ltime);
+    case ITEM_CAST_TIME:
+      return extract_time_value(ltime);
+    case ITEM_CAST_DATETIME:
+      return get_time_from_datetime(ltime);
+    case ITEM_CAST_CHAR:
+      return get_time_from_string(ltime);
+    case ITEM_CAST_DECIMAL:
+      return get_time_from_decimal(ltime);
+    case ITEM_CAST_JSON:
+      return get_time_from_json(this, ltime);
+    case ITEM_CAST_FLOAT:
+    case ITEM_CAST_DOUBLE:
+      return get_time_from_real(ltime);
+  }
+  DBUG_ASSERT(false); /* purecov: deadcode */
+  return true;
+}
+
+int64_t Item_func_json_value::extract_integer_value() {
+  DBUG_ASSERT(m_cast_target == ITEM_CAST_SIGNED_INT ||
+              m_cast_target == ITEM_CAST_UNSIGNED_INT);
+  DBUG_ASSERT(unsigned_flag == (m_cast_target == ITEM_CAST_UNSIGNED_INT));
+
+  Json_wrapper wr;
+  const Default_value *return_default = nullptr;
+  if (extract_json_value(&wr, &return_default)) return error_int();
+
+  if (null_value) {
+    DBUG_ASSERT(maybe_null);
+    return 0;
+  }
+
+  if (return_default != nullptr) {
+    DBUG_ASSERT(!null_value);
+    return return_default->integer_default;
+  }
+
+  bool err = false;
+  bool unsigned_val = false;
+  const int64_t value =
+      wr.coerce_int(func_name(), CE_IGNORE, &err, &unsigned_val);
+
+  if (!err && (unsigned_flag == unsigned_val || value >= 0)) return value;
+
+  if (handle_json_value_conversion_error(
+          m_on_error, unsigned_flag ? "UNSIGNED" : "SIGNED", this))
+    return error_int();
+
+  if (null_value) return 0;
+
+  return m_default_error->integer_default;
+}
+
+int64_t Item_func_json_value::extract_year_value() {
+  DBUG_ASSERT(m_cast_target == ITEM_CAST_YEAR);
+  DBUG_ASSERT(unsigned_flag == false);
+
+  Json_wrapper wr;
+  const Default_value *return_default = nullptr;
+  if (extract_json_value(&wr, &return_default)) return error_int();
+
+  if (null_value) {
+    DBUG_ASSERT(maybe_null);
+    return 0;
+  }
+
+  if (return_default != nullptr) {
+    DBUG_ASSERT(!null_value);
+    return return_default->integer_default;
+  }
+
+  bool err = false;
+  bool unsigned_val = false;
+  const int64_t value =
+      wr.coerce_int(func_name(), CE_IGNORE, &err, &unsigned_val);
+
+  if (!err && ((value == 0) || (value > 1900 && value <= 2155))) return value;
+
+  if (handle_json_value_conversion_error(m_on_error, "YEAR", this))
+    return error_int();
+
+  if (null_value) return 0;
+
+  return m_default_error->integer_default;
+}
+
+bool Item_func_json_value::extract_date_value(MYSQL_TIME *ltime) {
+  DBUG_ASSERT(m_cast_target == ITEM_CAST_DATE ||
+              m_cast_target == ITEM_CAST_YEAR);
+  Json_wrapper wr;
+  const Default_value *return_default = nullptr;
+  if (extract_json_value(&wr, &return_default) || null_value) {
+    set_zero_time(ltime, MYSQL_TIMESTAMP_DATE);
+    return true;
+  }
+
+  if (return_default != nullptr) {
+    *ltime = *return_default->temporal_default;
+    return false;
+  }
+
+  if (!wr.coerce_date(ltime, func_name(), CE_IGNORE)) return false;
+
+  if (handle_json_value_conversion_error(m_on_error, "DATE", this) ||
+      null_value) {
+    set_zero_time(ltime, MYSQL_TIMESTAMP_DATE);
+    return true;
+  }
+
+  *ltime = *m_default_error->temporal_default;
+  return false;
+}
+
+bool Item_func_json_value::extract_time_value(MYSQL_TIME *ltime) {
+  DBUG_ASSERT(m_cast_target == ITEM_CAST_TIME);
+  Json_wrapper wr;
+  const Default_value *return_default = nullptr;
+  if (extract_json_value(&wr, &return_default) || null_value) {
+    set_zero_time(ltime, MYSQL_TIMESTAMP_TIME);
+    return true;
+  }
+
+  if (return_default != nullptr) {
+    *ltime = *return_default->temporal_default;
+    return false;
+  }
+
+  if (!wr.coerce_time(ltime, func_name(), CE_IGNORE)) return false;
+
+  if (handle_json_value_conversion_error(m_on_error, "TIME", this) ||
+      null_value) {
+    set_zero_time(ltime, MYSQL_TIMESTAMP_TIME);
+    return true;
+  }
+
+  *ltime = *m_default_error->temporal_default;
+  return false;
+}
+
+bool Item_func_json_value::extract_datetime_value(MYSQL_TIME *ltime) {
+  DBUG_ASSERT(m_cast_target == ITEM_CAST_DATETIME);
+  Json_wrapper wr;
+  const Default_value *return_default = nullptr;
+  if (extract_json_value(&wr, &return_default) || null_value) {
+    set_zero_time(ltime, MYSQL_TIMESTAMP_DATETIME);
+    return true;
+  }
+
+  if (return_default != nullptr) {
+    *ltime = *return_default->temporal_default;
+    return false;
+  }
+
+  if (!wr.coerce_date(ltime, func_name(), CE_IGNORE, TIME_DATETIME_ONLY))
+    return false;
+
+  if (handle_json_value_conversion_error(m_on_error, "DATETIME", this) ||
+      null_value) {
+    set_zero_time(ltime, MYSQL_TIMESTAMP_DATETIME);
+    return true;
+  }
+
+  *ltime = *m_default_error->temporal_default;
+  return false;
+}
+
+my_decimal *Item_func_json_value::extract_decimal_value(my_decimal *value) {
+  DBUG_ASSERT(m_cast_target == ITEM_CAST_DECIMAL);
+  Json_wrapper wr;
+  const Default_value *return_default = nullptr;
+  if (extract_json_value(&wr, &return_default) || null_value) {
+    my_decimal_set_zero(value);
+    return value;
+  }
+
+  if (return_default != nullptr) {
+    *value = *return_default->decimal_default;
+    return value;
+  }
+
+  bool err = false;
+  wr.coerce_decimal(value, func_name(), CE_IGNORE, &err);
+  if (!err && decimal_within_range(this, value)) return value;
+
+  if (handle_json_value_conversion_error(m_on_error, "DECIMAL", this) ||
+      null_value) {
+    my_decimal_set_zero(value);
+    return value;
+  }
+
+  *value = *m_default_error->decimal_default;
+  return value;
+}
+
+String *Item_func_json_value::extract_string_value(String *buffer) {
+  DBUG_ASSERT(m_cast_target == ITEM_CAST_CHAR);
+  Json_wrapper wr;
+  const Default_value *return_default = nullptr;
+  if (extract_json_value(&wr, &return_default)) return error_str();
+  if (null_value) return null_return_str();
+  if (return_default != nullptr) {
+    buffer->set(return_default->string_default.str,
+                return_default->string_default.length, collation.collation);
+    return buffer;
+  }
+
+  // Return the unquoted result
+  buffer->length(0);
+  if (wr.to_string(buffer, false, func_name())) return error_str();
+
+  unsigned conversion_errors = 0;
+  if (!my_charset_same(collation.collation, buffer->charset())) {
+    // The string should be returned in a different character set. Convert it.
+    String converted_string;
+    if (converted_string.copy(buffer->ptr(), buffer->length(),
+                              buffer->charset(), collation.collation,
+                              &conversion_errors))
+      return error_str(); /* purecov: inspected */
+    DBUG_ASSERT(converted_string.charset() == collation.collation);
+    buffer->swap(converted_string);
+  }
+
+  // If the string fits in the return type, return it.
+  if (conversion_errors == 0 && buffer->numchars() <= max_char_length())
+    return buffer;
+
+  // Otherwise, handle the error.
+  if (handle_json_value_conversion_error(m_on_error, "STRING", this))
+    return error_str();
+  if (null_value) return null_return_str();
+  buffer->set(m_default_error->string_default.str,
+              m_default_error->string_default.length, collation.collation);
+  return buffer;
+}
+
+double Item_func_json_value::extract_real_value() {
+  DBUG_ASSERT(m_cast_target == ITEM_CAST_FLOAT ||
+              m_cast_target == ITEM_CAST_DOUBLE);
+  Json_wrapper wr;
+  const Default_value *return_default = nullptr;
+  if (extract_json_value(&wr, &return_default)) return error_real();
+  if (null_value) {
+    DBUG_ASSERT(maybe_null);
+    return 0.0;
+  }
+
+  if (return_default != nullptr) return return_default->real_default;
+
+  bool err = false;
+  double value = wr.coerce_real(func_name(), CE_IGNORE, &err);
+  if (!err) return value;
+
+  if (handle_json_value_conversion_error(
+          m_on_error, data_type() == MYSQL_TYPE_DOUBLE ? "DOUBLE" : "FLOAT",
+          this))
+    return error_real();
+
+  if (null_value) return 0.0;
+
+  return m_default_error->real_default;
 }

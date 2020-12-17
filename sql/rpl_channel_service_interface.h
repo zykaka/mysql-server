@@ -105,6 +105,8 @@ struct Channel_creation_info {
                              // available
   char *compression_algorithm;
   unsigned int zstd_compression_level;
+  /* to enable async connection failover */
+  int m_source_connection_auto_failover{0};
 };
 
 void initialize_channel_creation_info(Channel_creation_info *channel_info);
@@ -429,14 +431,13 @@ bool is_any_slave_channel_running(int thread_mask);
   @param[in]  channel       The channel name
   @param[out] user          The user to extract
   @param[out] password      The password to extract
-  @param[out] pass_size     The password size
 
   @return the operation status
     @retval false   OK
     @retval true    Error, channel not found
 */
-int channel_get_credentials(const char *channel, const char **user,
-                            char **password, size_t *pass_size);
+int channel_get_credentials(const char *channel, std::string &user,
+                            std::string &password);
 
 /**
   Return type for function
@@ -467,4 +468,14 @@ enum enum_slave_channel_status {
 enum_slave_channel_status
 has_any_slave_channel_open_temp_table_or_is_its_applier_running();
 
+/**
+  Delete stored credentials from Slave_credentials
+  @param[in]  channel_name  The channel name
+
+  @return the operation status
+    @retval 0  OK
+    @retval 1  Error, channel not found
+
+ */
+int channel_delete_credentials(const char *channel_name);
 #endif  // RPL_SERVICE_INTERFACE_INCLUDE

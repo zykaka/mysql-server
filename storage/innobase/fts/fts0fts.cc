@@ -556,7 +556,7 @@ fts_cache_t *fts_cache_create(
       static_cast<fts_sync_t *>(mem_heap_zalloc(heap, sizeof(fts_sync_t)));
 
   cache->sync->table = table;
-  cache->sync->event = os_event_create(nullptr);
+  cache->sync->event = os_event_create();
 
   /* Create the index cache vector that will hold the inverted indexes. */
   cache->indexes =
@@ -1811,17 +1811,17 @@ static dict_table_t *fts_create_one_common_table(trx_t *trx,
                                             FTS_DELETED_TABLE_NUM_COLS);
 
     dict_mem_table_add_col(new_table, heap, "doc_id", DATA_INT, DATA_UNSIGNED,
-                           FTS_DELETED_TABLE_COL_LEN);
+                           FTS_DELETED_TABLE_COL_LEN, true);
   } else {
     /* Config table has different schema. */
     new_table = fts_create_in_mem_aux_table(fts_table_name, table,
                                             FTS_CONFIG_TABLE_NUM_COLS);
 
     dict_mem_table_add_col(new_table, heap, "key", DATA_VARCHAR, 0,
-                           FTS_CONFIG_TABLE_KEY_COL_LEN);
+                           FTS_CONFIG_TABLE_KEY_COL_LEN, true);
 
     dict_mem_table_add_col(new_table, heap, "value", DATA_VARCHAR,
-                           DATA_NOT_NULL, FTS_CONFIG_TABLE_VALUE_COL_LEN);
+                           DATA_NOT_NULL, FTS_CONFIG_TABLE_VALUE_COL_LEN, true);
   }
 
   error = row_create_table_for_mysql(new_table, nullptr, trx);
@@ -1996,19 +1996,19 @@ static dict_table_t *fts_create_one_index_table(trx_t *trx,
   dict_mem_table_add_col(
       new_table, heap, "word",
       charset == &my_charset_latin1 ? DATA_VARCHAR : DATA_VARMYSQL,
-      field->col->prtype, FTS_INDEX_WORD_LEN);
+      field->col->prtype, FTS_INDEX_WORD_LEN, true);
 
   dict_mem_table_add_col(new_table, heap, "first_doc_id", DATA_INT,
                          DATA_NOT_NULL | DATA_UNSIGNED,
-                         FTS_INDEX_FIRST_DOC_ID_LEN);
+                         FTS_INDEX_FIRST_DOC_ID_LEN, true);
 
   dict_mem_table_add_col(new_table, heap, "last_doc_id", DATA_INT,
                          DATA_NOT_NULL | DATA_UNSIGNED,
-                         FTS_INDEX_LAST_DOC_ID_LEN);
+                         FTS_INDEX_LAST_DOC_ID_LEN, true);
 
   dict_mem_table_add_col(new_table, heap, "doc_count", DATA_INT,
-                         DATA_NOT_NULL | DATA_UNSIGNED,
-                         FTS_INDEX_DOC_COUNT_LEN);
+                         DATA_NOT_NULL | DATA_UNSIGNED, FTS_INDEX_DOC_COUNT_LEN,
+                         true);
 
   /* The precise type calculation is as follows:
   least signficiant byte: MySQL type code (not applicable for sys cols)
@@ -2017,7 +2017,7 @@ static dict_table_t *fts_create_one_index_table(trx_t *trx,
 
   dict_mem_table_add_col(new_table, heap, "ilist", DATA_BLOB,
                          (DATA_MTYPE_MAX << 16) | DATA_UNSIGNED | DATA_NOT_NULL,
-                         FTS_INDEX_ILIST_LEN);
+                         FTS_INDEX_ILIST_LEN, true);
 
   error = row_create_table_for_mysql(new_table, nullptr, trx);
 
@@ -2628,14 +2628,14 @@ static void fts_trx_table_add_op(
   }
 }
 
-/** Notify the FTS system about an operation on an FTS-indexed table. */
-void fts_trx_add_op(trx_t *trx,               /*!< in: InnoDB transaction */
-                    dict_table_t *table,      /*!< in: table */
-                    doc_id_t doc_id,          /*!< in: new doc id */
-                    fts_row_state state,      /*!< in: state of the row */
-                    ib_vector_t *fts_indexes) /*!< in: FTS indexes affected
-                                              (NULL=all) */
-{
+/** Notify the FTS system about an operation on an FTS-indexed table.
+@param[in] trx Innodb transaction
+@param[in] table Table
+@param[in] doc_id Doc id
+@param[in] state State of the row
+@param[in] fts_indexes Fts indexes affected (null=all) */
+void fts_trx_add_op(trx_t *trx, dict_table_t *table, doc_id_t doc_id,
+                    fts_row_state state, ib_vector_t *fts_indexes) {
   fts_trx_table_t *tran_ftt;
   fts_trx_table_t *stmt_ftt;
 
@@ -3128,13 +3128,13 @@ static MY_ATTRIBUTE((warn_unused_result)) dberr_t
 }
 
 /** Create a new document id.
- @return DB_SUCCESS if all went well else error */
-dberr_t fts_create_doc_id(dict_table_t *table, /*!< in: row is of this table. */
-                          dtuple_t *row,    /* in/out: add doc id value to this
-                                            row. This is the current row that is
-                                            being inserted. */
-                          mem_heap_t *heap) /*!< in: heap */
-{
+@param[in]      table  Row is of this table.
+@param[in,out]  row    Add doc id value to this row. This is the current row
+that is being inserted.
+@param[in]      heap
+@return DB_SUCCESS if all went well else error */
+dberr_t fts_create_doc_id(dict_table_t *table, dtuple_t *row,
+                          mem_heap_t *heap) {
   doc_id_t doc_id;
   dberr_t error = DB_SUCCESS;
 
@@ -4477,8 +4477,8 @@ or greater than fts_max_token_size.
 @param[in]	stopwords	stopwords rb tree
 @param[in]	is_ngram	is ngram parser
 @param[in]	cs		token charset
-@retval	true	if it is not stopword and length in range
-@retval	false	if it is stopword or lenght not in range */
+@retval true	if it is not stopword and length in range
+@retval false	if it is stopword or length not in range */
 bool fts_check_token(const fts_string_t *token, const ib_rbt_t *stopwords,
                      bool is_ngram, const CHARSET_INFO *cs) {
   ut_ad(cs != nullptr || stopwords == nullptr);
@@ -5334,17 +5334,17 @@ ibool fts_wait_for_background_thread_to_start(
   return (done);
 }
 
-/** Add the FTS document id hidden column. */
-void fts_add_doc_id_column(
-    dict_table_t *table, /*!< in/out: Table with FTS index */
-    mem_heap_t *heap)    /*!< in: temporary memory heap, or NULL */
-{
+/** Add the FTS document id hidden column.
+@param[in,out] table Table with FTS index
+@param[in] heap Temporary memory heap, or NULL
+*/
+void fts_add_doc_id_column(dict_table_t *table, mem_heap_t *heap) {
   dict_mem_table_add_col(
       table, heap, FTS_DOC_ID_COL_NAME, DATA_INT,
       dtype_form_prtype(
           DATA_NOT_NULL | DATA_UNSIGNED | DATA_BINARY_TYPE | DATA_FTS_DOC_ID,
           0),
-      sizeof(doc_id_t));
+      sizeof(doc_id_t), false);
   DICT_TF2_FLAG_SET(table, DICT_TF2_FTS_HAS_DOC_ID);
 }
 
@@ -5520,11 +5520,11 @@ void fts_savepoint_copy(const fts_savepoint_t *src, /*!< in: source savepoint */
   }
 }
 
-/** Take a FTS savepoint. */
-void fts_savepoint_take(trx_t *trx,         /*!< in: transaction */
-                        fts_trx_t *fts_trx, /*!< in: fts transaction */
-                        const char *name)   /*!< in: savepoint name */
-{
+/** Take a FTS savepoint.
+@param[in] trx Transaction
+@param[in] fts_trx Fts transaction
+@param[in] name Savepoint name */
+void fts_savepoint_take(trx_t *trx, fts_trx_t *fts_trx, const char *name) {
   mem_heap_t *heap;
   fts_savepoint_t *savepoint;
   fts_savepoint_t *last_savepoint;

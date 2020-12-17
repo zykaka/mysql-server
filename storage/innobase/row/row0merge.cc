@@ -112,11 +112,11 @@ class index_tuple_info_t {
   void iter_init();
 
   /** Insert spatial index rows cached in vector into spatial index
-  @param[in]	trx_id		transaction id
-  @param[in,out]	row_heap	memory heap
-  @param[in]	pcur		cluster index scanning cursor
-  @param[in,out]	scan_mtr	mini-transaction for pcur
-  @param[out]	mtr_committed	whether scan_mtr got committed
+  @param[in]      trx_id        Transaction id
+  @param[in,out]  row_heap      Memory heap
+  @param[in]      pcur          Cluster index scanning cursor
+  @param[in,out]  scan_mtr      Mini-transaction for pcur
+  @param[out]     mtr_committed Whether scan_mtr got committed
   @return DB_SUCCESS if successful, else error number */
   dberr_t insert(trx_id_t trx_id, mem_heap_t *row_heap, btr_pcur_t *pcur,
                  mtr_t *scan_mtr, bool *mtr_committed) {
@@ -417,8 +417,12 @@ void row_merge_buf_free(
 @param[out]	field		field to copy to
 @param[in]	len		length of the field data
 @param[in]	page_size	compressed BLOB page size,
-                                zero for uncompressed BLOBs
-@param[in]	is_sdi		true for SDI indexes
+                                zero for uncompressed BLOBs */
+#ifdef UNIV_DEBUG
+/**
+@param[in]	is_sdi		true for SDI indexes */
+#endif /* UNIV_DEBUG */
+/**
 @param[in,out]	heap		memory heap where to allocate data when
                                 converting to ROW_FORMAT=REDUNDANT, or NULL
                                 when not to invoke
@@ -875,11 +879,10 @@ add_next:
   return n_row_added;
 }
 
-/** Report a duplicate key. */
-void row_merge_dup_report(
-    row_merge_dup_t *dup,  /*!< in/out: for reporting duplicates */
-    const dfield_t *entry) /*!< in: duplicate index entry */
-{
+/** Report a duplicate key.
+@param[in,out] dup For reporting duplicates
+@param[in] entry Duplicate index entry */
+void row_merge_dup_report(row_merge_dup_t *dup, const dfield_t *entry) {
   if (!dup->n_dup++) {
     /* Only report the first duplicate record,
     but count all duplicate records. */
@@ -987,12 +990,10 @@ static void row_merge_tuple_sort(
                         row_merge_tuple_cmp_ctx);
 }
 
-/** Sort a buffer. */
-void row_merge_buf_sort(
-    row_merge_buf_t *buf, /*!< in/out: sort buffer */
-    row_merge_dup_t *dup) /*!< in/out: reporter of duplicates
-                          (NULL if non-unique index) */
-{
+/** Sort a buffer.
+@param[in,out] buf Sort buffer
+@param[in,out] dup Reporter of duplicates (null if non-unique index) */
+void row_merge_buf_sort(row_merge_buf_t *buf, row_merge_dup_t *dup) {
   ut_ad(!dict_index_is_spatial(buf->index));
 
   row_merge_tuple_sort(buf->index, dict_index_get_n_unique(buf->index),
@@ -1484,14 +1485,14 @@ static int row_mtuple_cmp(const mtuple_t *prev_mtuple,
 }
 
 /** Insert cached spatial index rows.
-@param[in]	trx_id		transaction id
-@param[in]	sp_tuples	cached spatial rows
-@param[in]	num_spatial	number of spatial indexes
-@param[in,out]	row_heap	heap for insert
-@param[in,out]	sp_heap		heap for tuples
-@param[in,out]	pcur		cluster index cursor
-@param[in,out]	mtr		mini transaction
-@param[in,out]	mtr_committed	whether scan_mtr got committed
+@param[in]	trx_id		Transaction id
+@param[in]	sp_tuples	Cached spatial rows
+@param[in]	num_spatial	Number of spatial indexes
+@param[in,out]	row_heap	Heap for insert
+@param[in,out]	sp_heap		Heap for tuples
+@param[in,out]	pcur		Cluster index cursor
+@param[in,out]	mtr		Mini-transaction
+@param[in,out]	mtr_committed	Whether scan_mtr got committed
 @return DB_SUCCESS or error number */
 static dberr_t row_merge_spatial_rows(trx_id_t trx_id,
                                       index_tuple_info_t **sp_tuples,
@@ -1609,7 +1610,7 @@ static MY_ATTRIBUTE((warn_unused_result)) dberr_t
                                   data for virtual column */
   btr_pcur_t pcur;                   /* Cursor on the clustered
                                      index */
-  mtr_t mtr;                         /* Mini transaction */
+  mtr_t mtr;                         /* Mini-transaction */
   dberr_t err = DB_SUCCESS;          /* Return code */
   ulint n_nonnull = 0;               /* number of columns
                                      changed to NOT NULL */
@@ -2001,8 +2002,7 @@ static MY_ATTRIBUTE((warn_unused_result)) dberr_t
         err = DB_ERROR;
         trx->error_key_num = 0;
 
-        ib_errf(trx->mysql_thd, IB_LOG_LEVEL_ERROR, ER_AUTOINC_READ_FAILED,
-                "[NULL]");
+        ib_senderrf(trx->mysql_thd, IB_LOG_LEVEL_ERROR, ER_AUTOINC_READ_FAILED);
 
         goto func_exit;
       }
@@ -2920,8 +2920,12 @@ dberr_t row_merge_sort(trx_t *trx, const row_merge_dup_t *dup,
                                 or NULL to use tuple instead
 @param[in]	offsets		offsets of mrec
 @param[in]	page_size	compressed page size in bytes, or 0
-@param[in,out]	tuple		data tuple
-@param[in]	is_sdi		true for SDI Indexes
+@param[in,out]	tuple		data tuple */
+#ifdef UNIV_DEBUG
+/**
+@param[in]	is_sdi		true for SDI Indexes */
+#endif /* UNIV_DEBUG */
+/**
 @param[in,out]	heap		memory heap */
 static void row_merge_copy_blobs_func(trx_t *trx, const dict_index_t *index,
                                       const mrec_t *mrec, const ulint *offsets,
@@ -3589,15 +3593,16 @@ the flushing of such pages to the data files was completed.
 @param[in]	index	an index tree on which redo logging was disabled */
 static void row_merge_write_redo(const dict_index_t *index) {
   mtr_t mtr;
-  byte *log_ptr;
+  byte *log_ptr = nullptr;
 
   ut_ad(!index->table->is_temporary());
   mtr.start();
-  log_ptr = mlog_open(&mtr, 11 + 8);
-  log_ptr = mlog_write_initial_log_record_low(MLOG_INDEX_LOAD, index->space,
-                                              index->page, log_ptr, &mtr);
-  mach_write_to_8(log_ptr, index->id);
-  mlog_close(&mtr, log_ptr + 8);
+  if (mlog_open(&mtr, 11 + 8, log_ptr)) {
+    log_ptr = mlog_write_initial_log_record_low(MLOG_INDEX_LOAD, index->space,
+                                                index->page, log_ptr, &mtr);
+    mach_write_to_8(log_ptr, index->id);
+    mlog_close(&mtr, log_ptr + 8);
+  }
   mtr.commit();
 }
 

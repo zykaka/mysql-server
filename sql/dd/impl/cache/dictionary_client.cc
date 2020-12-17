@@ -762,11 +762,21 @@ Dictionary_client::Auto_releaser::Auto_releaser()
 // as the current releaser.
 Dictionary_client::Auto_releaser::Auto_releaser(Dictionary_client *client)
     : m_client(client), m_prev(client->m_current_releaser) {
+  /**
+    Make sure that if we install a first auto_releaser, we do not have
+    uncommitted object or we are not processing a transactional DDL.
+  */
+  DBUG_ASSERT(m_client->m_current_releaser != &m_client->m_default_releaser ||
+              m_client->m_registry_uncommitted.size_all() == 0 ||
+              m_client->m_thd->m_transactional_ddl.inited());
   m_client->m_current_releaser = this;
 }
 
 // Release all objects registered and restore previous releaser.
 Dictionary_client::Auto_releaser::~Auto_releaser() {
+  // Make sure that we destroy auto_releaser object in LIFO order.
+  DBUG_ASSERT(m_client->m_current_releaser == this);
+
   // Release all objects registered.
   m_client->release<Abstract_table>(&m_release_registry);
   m_client->release<Schema>(&m_release_registry);
@@ -787,12 +797,16 @@ Dictionary_client::Auto_releaser::~Auto_releaser() {
   // the transaction.
   if (m_client->m_current_releaser == &m_client->m_default_releaser) {
     // We should either have reported an error or have removed all
-    // uncommitted objects (typically committed them to the shared cache).
+    // uncommitted objects (typically committed them to the shared cache)
+    // we should be processing transactional DDL.
     DBUG_ASSERT(m_client->m_thd->is_error() || m_client->m_thd->killed ||
+                m_client->m_thd->m_transactional_ddl.inited() ||
                 (m_client->m_registry_uncommitted.size_all() == 0 &&
                  m_client->m_registry_dropped.size_all() == 0));
 
-    m_client->m_registry_uncommitted.erase_all();
+    // Do not remove uncommitted object when processing transactional DDL.
+    if (!m_client->m_thd->m_transactional_ddl.inited())
+      m_client->m_registry_uncommitted.erase_all();
     m_client->m_registry_dropped.erase_all();
 
     // Delete any objects retrieved by acquire_uncached() or
@@ -2179,6 +2193,43 @@ bool Dictionary_client::fetch_global_components(Const_ptr_vec<T> *coll) {
   return false;
 }
 
+// Check if a user is referenced as definer by some object of the given type.
+template <typename T>
+bool Dictionary_client::is_user_definer(const LEX_USER &user,
+                                        bool *is_definer) const {
+  // Start RO transaction.
+  dd::Transaction_ro trx(m_thd, ISO_READ_COMMITTED);
+
+  // Register and open tables.
+  trx.otx.register_tables<T>();
+  Raw_table *entity_table = trx.otx.get_table<T>();
+  DBUG_ASSERT(entity_table);
+
+  if (trx.otx.open_tables()) {
+    DBUG_ASSERT(m_thd->is_system_thread() || m_thd->killed ||
+                m_thd->is_error());
+    return true;
+  }
+
+  // Prepare object key and open the record set.
+  const String_type definer = String_type(user.user.str, user.user.length) +
+                              String_type("@") +
+                              String_type(user.host.str, user.host.length);
+
+  std::unique_ptr<Object_key> object_key(
+      T::DD_table::create_key_by_definer(definer));
+  std::unique_ptr<Raw_record_set> rs;
+  if (entity_table->open_record_set(object_key.get(), rs)) {
+    DBUG_ASSERT(m_thd->is_system_thread() || m_thd->killed ||
+                m_thd->is_error());
+    return true;
+  }
+
+  // If there are records in the set, then this user is definer.
+  *is_definer = (rs->current_record() != nullptr);
+  return false;
+}
+
 template <typename T>
 bool Dictionary_client::fetch_referencing_views_object_id(
     const char *schema, const char *tbl_or_sf_name,
@@ -2881,6 +2932,9 @@ template bool Dictionary_client::fetch_schema_components(
 template bool Dictionary_client::fetch_schema_components(
     const Schema *, std::vector<const Routine *> *);
 
+template bool Dictionary_client::fetch_schema_components(
+    const Schema *, std::vector<const Function *> *);
+
 template bool Dictionary_client::fetch_global_components(
     std::vector<const Charset *> *);
 
@@ -2904,6 +2958,9 @@ template bool Dictionary_client::fetch_schema_component_names<Event>(
 
 template bool Dictionary_client::fetch_schema_component_names<Trigger>(
     const Schema *, std::vector<String_type> *) const;
+
+template bool Dictionary_client::is_user_definer<Trigger>(const LEX_USER &,
+                                                          bool *) const;
 
 template bool Dictionary_client::fetch_global_component_ids<Table>(
     std::vector<Object_id> *) const;
@@ -3047,6 +3104,8 @@ template void Dictionary_client::remove_uncommitted_objects<View>(bool);
 template bool Dictionary_client::drop(const View *);
 template bool Dictionary_client::store(View *);
 template bool Dictionary_client::update(View *);
+template bool Dictionary_client::is_user_definer<View>(const LEX_USER &,
+                                                       bool *) const;
 
 template bool Dictionary_client::acquire_uncached(Object_id, Event **);
 template bool Dictionary_client::acquire(Object_id, const Event **);
@@ -3060,6 +3119,8 @@ template bool Dictionary_client::acquire_for_modification(const String_type &,
 template bool Dictionary_client::drop(const Event *);
 template bool Dictionary_client::store(Event *);
 template bool Dictionary_client::update(Event *);
+template bool Dictionary_client::is_user_definer<Event>(const LEX_USER &,
+                                                        bool *) const;
 
 template bool Dictionary_client::acquire_uncached(Object_id, Function **);
 template bool Dictionary_client::acquire(Object_id, const Function **);
@@ -3088,6 +3149,8 @@ template bool Dictionary_client::update(Procedure *);
 template bool Dictionary_client::drop(const Routine *);
 template void Dictionary_client::remove_uncommitted_objects<Routine>(bool);
 template bool Dictionary_client::update(Routine *);
+template bool Dictionary_client::is_user_definer<Routine>(const LEX_USER &,
+                                                          bool *) const;
 
 template bool Dictionary_client::acquire<Function>(
     const String_type &, const String_type &,

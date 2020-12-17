@@ -1,6 +1,6 @@
 /*****************************************************************************
 
-Copyright (c) 1996, 2019, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 1996, 2020, Oracle and/or its affiliates. All Rights Reserved.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License, version 2.0, as published by the
@@ -701,11 +701,14 @@ static void row_ins_foreign_trx_print(trx_t *trx) /*!< in: transaction */
     return;
   }
 
-  lock_mutex_enter();
-  n_rec_locks = lock_number_of_rows_locked(&trx->lock);
-  n_trx_locks = UT_LIST_GET_LEN(trx->lock.trx_locks);
-  heap_size = mem_heap_get_size(trx->lock.lock_heap);
-  lock_mutex_exit();
+  {
+    /** lock_number_of_rows_locked() requires global exclusive latch, and so
+    does accessing trx_locks with trx->mutex */
+    locksys::Global_exclusive_latch_guard guard{};
+    n_rec_locks = lock_number_of_rows_locked(&trx->lock);
+    n_trx_locks = UT_LIST_GET_LEN(trx->lock.trx_locks);
+    heap_size = mem_heap_get_size(trx->lock.lock_heap);
+  }
 
   trx_sys_mutex_enter();
 
@@ -2242,23 +2245,25 @@ of a clustered index entry.
 @param[in]	entry	index entry to insert
 @param[in]	big_rec	externally stored fields
 @param[in,out]	offsets	rec_get_offsets()
-@param[in,out]	heap	memory heap
-@param[in]	thd	client connection, or NULL
+@param[in,out]	heap	memory heap */
+#ifdef UNIV_DEBUG
+/**
+@param[in]	thd	client connection, or NULL */
+#endif /* UNIV_DEBUG */
+/**
 @param[in]	index	clustered index
 @return	error code
 @retval	DB_SUCCESS
 @retval DB_OUT_OF_FILE_SPACE */
-static dberr_t row_ins_index_entry_big_rec_func(
-    trx_t *trx,               /*!< in: current transaction */
-    const dtuple_t *entry,    /*!< in/out: index entry to insert */
-    const big_rec_t *big_rec, /*!< in: externally stored fields */
-    ulint *offsets,           /*!< in/out: rec offsets */
-    mem_heap_t **heap,        /*!< in/out: memory heap */
+static dberr_t row_ins_index_entry_big_rec_func(trx_t *trx,
+                                                const dtuple_t *entry,
+                                                const big_rec_t *big_rec,
+                                                ulint *offsets,
+                                                mem_heap_t **heap,
 #ifdef UNIV_DEBUG
-    const THD *thd,      /*!< in: connection, or NULL */
-#endif                   /* UNIV_DEBUG */
-    dict_index_t *index) /*!< in: index */
-{
+                                                const THD *thd,
+#endif /* UNIV_DEBUG */
+                                                dict_index_t *index) {
   mtr_t mtr;
   btr_pcur_t pcur;
   rec_t *rec;
@@ -2704,10 +2709,10 @@ static dberr_t row_ins_sorted_clust_index_entry(ulint mode, dict_index_t *index,
 }
 
 /** Start a mini-transaction and check if the index will be dropped.
-@param[in,out]	mtr		mini-transaction
-@param[in,out]	index		secondary index
-@param[in]	check		whether to check
-@param[in]	search_mode	flags
+@param[in,out]	mtr		Mini-transaction
+@param[in,out]	index		Secondary index
+@param[in]	check		Whether to check
+@param[in]	search_mode	Flags
 @return true if the index is to be dropped */
 static MY_ATTRIBUTE((warn_unused_result)) bool row_ins_sec_mtr_start_and_check_if_aborted(
     mtr_t *mtr, dict_index_t *index, bool check, ulint search_mode) {
@@ -3322,7 +3327,6 @@ columns in row.
 @param[in]	index	index handler
 @param[out]	entry	index entry to make
 @param[in]	row	row
-
 @return DB_SUCCESS if the set is successful */
 dberr_t row_ins_index_entry_set_vals(const dict_index_t *index, dtuple_t *entry,
                                      const dtuple_t *row) {

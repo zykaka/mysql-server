@@ -1,4 +1,4 @@
-/* Copyright (c) 2016, 2019, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2016, 2020, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -23,23 +23,45 @@
 #ifndef PARSE_TREE_COL_ATTRS_INCLUDED
 #define PARSE_TREE_COL_ATTRS_INCLUDED
 
-#include <type_traits>
+#include <sys/types.h>  // ulong, uint. TODO: replace with cstdint
 
+#include <type_traits>
+#include <vector>
+
+#include "field_types.h"
+#include "lex_string.h"
+#include "m_ctype.h"
+#include "my_alloc.h"
+#include "my_base.h"
+#include "my_compiler.h"
 #include "my_dbug.h"
-#include "mysql/mysql_lex_string.h"
+#include "my_inttypes.h"
+#include "my_sys.h"
 #include "mysql_com.h"
+#include "mysqld_error.h"
 #include "nullable.h"
+#include "sql/derror.h"
+#include "sql/field.h"
 #include "sql/gis/srid.h"
+#include "sql/item.h"
 #include "sql/item_timefunc.h"
+#include "sql/mem_root_array.h"
+#include "sql/parse_location.h"
+#include "sql/parse_tree_helpers.h"  // move_cf_appliers
 #include "sql/parse_tree_node_base.h"
+#include "sql/parser_yystype.h"
 #include "sql/sql_alter.h"
 #include "sql/sql_check_constraint.h"  // Sql_check_constraint_spec
 #include "sql/sql_class.h"
 #include "sql/sql_error.h"
 #include "sql/sql_lex.h"
+#include "sql/sql_list.h"
 #include "sql/sql_parse.h"
+#include "sql/system_variables.h"
 
 using Mysql::Nullable;
+
+class String;
 
 /**
   Parse context for column type attribyte specific parse tree nodes.
@@ -50,7 +72,7 @@ using Mysql::Nullable;
 */
 struct Column_parse_context : public Parse_context {
   const bool is_generated;  ///< Owner column is a generated one.
-
+  std::vector<CreateFieldApplier> cf_appliers;
   Column_parse_context(THD *thd_arg, SELECT_LEX *select_arg, bool is_generated)
       : Parse_context(thd_arg, select_arg), is_generated(is_generated) {}
 };
@@ -925,7 +947,11 @@ class PT_field_def : public PT_field_def_base {
 
   bool contextualize(Parse_context *pc_arg) override {
     Column_parse_context pc(pc_arg->thd, pc_arg->select, false);
-    return super::contextualize(&pc) || contextualize_attrs(&pc, opt_attrs);
+    if (super::contextualize(&pc) || contextualize_attrs(&pc, opt_attrs))
+      return true;
+
+    move_cf_appliers(pc_arg, &pc);
+    return false;
   }
 };
 
@@ -966,5 +992,7 @@ class PT_generated_field_def : public PT_field_def_base {
     return false;
   }
 };
+
+void move_cf_appliers(Parse_context *tddlpc, Column_parse_context *cpc);
 
 #endif /* PARSE_TREE_COL_ATTRS_INCLUDED */

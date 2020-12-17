@@ -1,4 +1,4 @@
-/* Copyright (c) 2010, 2020, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2010, 2020, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -26,10 +26,11 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/types.h>
+
+#include <algorithm>
 #include <string>
 #include <utility>
 
-#include <sql/ssl_acceptor_context.h>
 #include "keycache.h"
 #include "m_string.h"
 #include "my_base.h"
@@ -86,8 +87,9 @@
 #include "sql/sql_list.h"
 #include "sql/sql_parse.h"      // check_table_access
 #include "sql/sql_partition.h"  // set_part_state
-#include "sql/sql_prepare.h"    // mysql_test_show
 #include "sql/sql_table.h"      // mysql_recreate_table
+#include "sql/ssl_acceptor_context_operator.h"
+#include "sql/ssl_init_callback.h"
 #include "sql/system_variables.h"
 #include "sql/table.h"
 #include "sql/table_trigger_dispatcher.h"  // Table_trigger_dispatcher
@@ -343,7 +345,7 @@ static bool send_analyze_table_errors(THD *thd, const char *operator_name,
 bool Sql_cmd_analyze_table::send_histogram_results(
     THD *thd, const histograms::results_map &results, const TABLE_LIST *table) {
   Item *item;
-  List<Item> field_list;
+  mem_root_deque<Item *> field_list(thd->mem_root);
 
   field_list.push_back(item =
                            new Item_empty_string("Table", NAME_CHAR_LEN * 2));
@@ -355,7 +357,7 @@ bool Sql_cmd_analyze_table::send_histogram_results(
   field_list.push_back(
       item = new Item_empty_string("Msg_text", SQL_ADMIN_MSG_TEXT_SIZE));
   item->maybe_null = true;
-  if (thd->send_result_metadata(&field_list,
+  if (thd->send_result_metadata(field_list,
                                 Protocol::SEND_NUM_ROWS | Protocol::SEND_EOF)) {
     return true; /* purecov: deadcode */
   }
@@ -550,7 +552,6 @@ static bool mysql_admin_table(
 
   TABLE_LIST *table;
   SELECT_LEX *select = thd->lex->select_lex;
-  List<Item> field_list;
   Item *item;
   Protocol *protocol = thd->get_protocol();
   LEX *lex = thd->lex;
@@ -562,6 +563,7 @@ static bool mysql_admin_table(
   bool ignore_grl_on_analyze = operator_func == &handler::ha_analyze;
   DBUG_TRACE;
 
+  mem_root_deque<Item *> field_list(thd->mem_root);
   field_list.push_back(item =
                            new Item_empty_string("Table", NAME_CHAR_LEN * 2));
   item->maybe_null = true;
@@ -572,7 +574,7 @@ static bool mysql_admin_table(
   field_list.push_back(
       item = new Item_empty_string("Msg_text", SQL_ADMIN_MSG_TEXT_SIZE));
   item->maybe_null = true;
-  if (thd->send_result_metadata(&field_list,
+  if (thd->send_result_metadata(field_list,
                                 Protocol::SEND_NUM_ROWS | Protocol::SEND_EOF))
     return true;
 
@@ -1159,8 +1161,8 @@ static bool mysql_admin_table(
                 (table->table = open_n_lock_single_table(
                      thd, table, TL_READ_NO_INSERT, 0))) {
               /*
-             Reset the ALTER_ADMIN_PARTITION bit in alter_info->flags
-             to force analyze on all partitions.
+                Reset the ALTER_ADMIN_PARTITION bit in alter_info->flags
+                to force analyze on all partitions.
                */
               alter_info->flags &= ~(Alter_info::ALTER_ADMIN_PARTITION);
               result_code = table->table->file->ha_analyze(thd, check_opt);
@@ -1647,10 +1649,16 @@ bool Sql_cmd_shutdown::execute(THD *thd) {
 
 class Alter_instance_reload_tls : public Alter_instance {
  public:
-  explicit Alter_instance_reload_tls(THD *thd, bool force = false)
-      : Alter_instance(thd), force_(force) {}
+  explicit Alter_instance_reload_tls(THD *thd, const LEX_CSTRING &channel_name,
+                                     bool force = false)
+      : Alter_instance(thd), channel_name_(channel_name), force_(force) {}
 
-  bool execute() {
+  bool execute() override {
+    if (match_channel_name() == false) {
+      my_error(ER_SYNTAX_ERROR, MYF(0));
+      return true;
+    }
+
     Security_context *sctx = m_thd->security_context();
     if (!sctx->has_global_grant(STRING_WITH_LEN("CONNECTION_ADMIN")).first) {
       my_error(ER_SPECIFIC_ACCESS_DENIED_ERROR, MYF(0), "CONNECTION_ADMIN");
@@ -1659,7 +1667,21 @@ class Alter_instance_reload_tls : public Alter_instance {
 
     bool res = false;
     enum enum_ssl_init_error error = SSL_INITERR_NOERROR;
-    SslAcceptorContext::singleton_flush(&error, force_);
+    switch (context_type_) {
+      case Ssl_acceptor_context_type::context_server_main:
+        TLS_channel::singleton_flush(mysql_main, mysql_main_channel,
+                                     &server_main_callback, &error, force_);
+        break;
+      case Ssl_acceptor_context_type::context_server_admin:
+        TLS_channel::singleton_flush(mysql_admin, mysql_admin_channel,
+                                     &server_admin_callback, &error, force_);
+        break;
+      case Ssl_acceptor_context_type::context_last:
+        // Fall through
+      default:
+        DBUG_ASSERT(false);
+        return false;
+    }
     if (error != SSL_INITERR_NOERROR) {
       const char *error_text = sslGetErrString(error);
       if (force_) {
@@ -1676,10 +1698,32 @@ class Alter_instance_reload_tls : public Alter_instance {
     if (!res) my_ok(m_thd);
     return res;
   }
-  ~Alter_instance_reload_tls() {}
+  ~Alter_instance_reload_tls() override {}
 
  protected:
+  bool match_channel_name() {
+    String specified_channel(channel_name_.str, channel_name_.length,
+                             system_charset_info);
+
+    /* Compare now */
+    if (!my_strcasecmp(system_charset_info, mysql_main_channel.c_str(),
+                       specified_channel.ptr())) {
+      context_type_ = Ssl_acceptor_context_type::context_server_main;
+      return true;
+    }
+    if (!my_strcasecmp(system_charset_info, mysql_admin_channel.c_str(),
+                       specified_channel.ptr())) {
+      context_type_ = Ssl_acceptor_context_type::context_server_admin;
+      return true;
+    }
+
+    return false;
+  }
+
+ protected:
+  LEX_CSTRING channel_name_;
   bool force_;
+  Ssl_acceptor_context_type context_type_;
 };
 
 bool Sql_cmd_alter_instance::execute(THD *thd) {
@@ -1690,13 +1734,19 @@ bool Sql_cmd_alter_instance::execute(THD *thd) {
       alter_instance = new Rotate_innodb_master_key(thd);
       break;
     case ALTER_INSTANCE_RELOAD_TLS:
-      alter_instance = new Alter_instance_reload_tls(thd, true);
+      alter_instance = new Alter_instance_reload_tls(thd, channel_name_, true);
       break;
     case ALTER_INSTANCE_RELOAD_TLS_ROLLBACK_ON_ERROR:
-      alter_instance = new Alter_instance_reload_tls(thd);
+      alter_instance = new Alter_instance_reload_tls(thd, channel_name_);
       break;
     case ROTATE_BINLOG_MASTER_KEY:
       alter_instance = new Rotate_binlog_master_key(thd);
+      break;
+    case ALTER_INSTANCE_ENABLE_INNODB_REDO:
+      alter_instance = new Innodb_redo_log(thd, true);
+      break;
+    case ALTER_INSTANCE_DISABLE_INNODB_REDO:
+      alter_instance = new Innodb_redo_log(thd, false);
       break;
     default:
       DBUG_ASSERT(false);
@@ -2061,24 +2111,20 @@ bool Sql_cmd_set_role::execute(THD *thd) {
 
 bool Sql_cmd_grant_roles::execute(THD *thd) {
   DBUG_TRACE;
-  for (const LEX_USER &role : *roles) {
-    if (!has_grant_role_privilege(thd, role.user, role.host)) {
-      my_error(ER_SPECIFIC_ACCESS_DENIED_ERROR, MYF(0),
-               "WITH ADMIN, ROLE_ADMIN, SUPER");
-      return true;
-    }
+  if (!has_grant_role_privilege(thd, roles)) {
+    my_error(ER_SPECIFIC_ACCESS_DENIED_ERROR, MYF(0),
+             "WITH ADMIN, ROLE_ADMIN, SUPER");
+    return true;
   }
   return mysql_grant_role(thd, users, roles, this->with_admin_option);
 }
 
 bool Sql_cmd_revoke_roles::execute(THD *thd) {
   DBUG_TRACE;
-  for (const LEX_USER &role : *roles) {
-    if (!has_grant_role_privilege(thd, role.user, role.host)) {
-      my_error(ER_SPECIFIC_ACCESS_DENIED_ERROR, MYF(0),
-               "WITH ADMIN, ROLE_ADMIN, SUPER");
-      return true;
-    }
+  if (!has_grant_role_privilege(thd, roles)) {
+    my_error(ER_SPECIFIC_ACCESS_DENIED_ERROR, MYF(0),
+             "WITH ADMIN, ROLE_ADMIN, SUPER");
+    return true;
   }
   return mysql_revoke_role(thd, users, roles);
 }
@@ -2090,65 +2136,4 @@ bool Sql_cmd_alter_user_default_role::execute(THD *thd) {
   if (!ret) my_ok(thd);
 
   return ret;
-}
-
-bool Sql_cmd_show_grants::execute(THD *thd) {
-  DBUG_TRACE;
-  bool show_mandatory_roles = (for_user == nullptr);
-  bool have_using_clause =
-      (using_users != nullptr && using_users->elements > 0);
-
-  if (for_user == nullptr || for_user->user.str == nullptr) {
-    /* SHOW PRIVILEGE FOR CURRENT_USER */
-    LEX_USER current_user;
-    get_default_definer(thd, &current_user);
-    if (!have_using_clause) {
-      const List_of_auth_id_refs *active_list =
-          thd->security_context()->get_active_roles();
-      return mysql_show_grants(thd, &current_user, *active_list,
-                               show_mandatory_roles, have_using_clause);
-    }
-  } else if (strcmp(thd->security_context()->priv_user().str,
-                    for_user->user.str) != 0) {
-    TABLE_LIST table("mysql", "user", nullptr, TL_READ);
-    if (!is_granted_table_access(thd, SELECT_ACL, &table)) {
-      char command[128];
-      get_privilege_desc(command, sizeof(command), SELECT_ACL);
-      my_error(ER_TABLEACCESS_DENIED_ERROR, MYF(0), command,
-               thd->security_context()->priv_user().str,
-               thd->security_context()->host_or_ip().str, "user");
-      return false;
-    }
-  }
-  List_of_auth_id_refs authid_list;
-  if (have_using_clause) {
-    for (const LEX_USER &user : *using_users) {
-      authid_list.emplace_back(user.user, user.host);
-    }
-  }
-
-  LEX_USER *tmp_user = const_cast<LEX_USER *>(for_user);
-  tmp_user = get_current_user(thd, tmp_user);
-  return mysql_show_grants(thd, tmp_user, authid_list, show_mandatory_roles,
-                           have_using_clause);
-}
-
-bool Sql_cmd_show::execute(THD *thd) {
-  DBUG_TRACE;
-
-  thd->clear_current_query_costs();
-  bool res = show_precheck(thd, thd->lex, true);
-  if (!res) res = execute_show(thd, thd->lex->query_tables);
-  thd->save_current_query_costs();
-
-  return res;
-}
-
-bool Sql_cmd_show::prepare(THD *thd) {
-  DBUG_TRACE;
-
-  if (Sql_cmd::prepare(thd)) return true;
-
-  bool rc = mysql_test_show(get_owner(), thd->lex->query_tables);
-  return rc;
 }

@@ -1,4 +1,4 @@
-/* Copyright (c) 2011, 2020, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2011, 2020, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -63,8 +63,8 @@ using ::testing::Return;
 
 class ItemTest : public ::testing::Test {
  protected:
-  virtual void SetUp() { initializer.SetUp(); }
-  virtual void TearDown() { initializer.TearDown(); }
+  void SetUp() override { initializer.SetUp(); }
+  void TearDown() override { initializer.TearDown(); }
 
   THD *thd() { return initializer.thd(); }
 
@@ -528,7 +528,7 @@ TEST_F(ItemTest, ItemFuncSetUserVar) {
 
   LEX_CSTRING var_name = {STRING_WITH_LEN("a")};
   Item_func_set_user_var *user_var =
-      new Item_func_set_user_var(var_name, item_str, false);
+      new Item_func_set_user_var(var_name, item_str);
   EXPECT_FALSE(user_var->set_entry(thd(), true));
   EXPECT_FALSE(user_var->fix_fields(thd(), nullptr));
   EXPECT_EQ(val1, user_var->val_int());
@@ -699,8 +699,8 @@ TEST_F(ItemTest, MysqlTimeCache) {
   /*
     Testing DATETIME(5)
   */
-  MysqlTime datetime5(2011, 11, 7, 10, 20, 30, 123450, false,
-                      MYSQL_TIMESTAMP_DATETIME);
+  MysqlTime datetime5 = {
+      2011, 11, 7, 10, 20, 30, 123450, false, MYSQL_TIMESTAMP_DATETIME};
   cache.set_datetime(&datetime5, 5);
   EXPECT_EQ(1840440237558456890LL, cache.val_packed());
   EXPECT_EQ(5, cache.decimals());
@@ -780,19 +780,15 @@ TEST_F(ItemTest, ItemDecimalTypecast) {
   const char msg[] = "";
   POS pos;
   pos.cpp.start = pos.cpp.end = pos.raw.start = pos.raw.end = msg;
-  // Sun Studio needs this null_item,
-  // it fails to compile EXPECT_EQ(NULL, create_func_cast());
-  const Item *null_item = nullptr;
 
   Cast_type type;
   type.target = ITEM_CAST_DECIMAL;
-
   type.length = "123456789012345678901234567890";
   type.dec = nullptr;
 
   {
     initializer.set_expected_error(ER_TOO_BIG_PRECISION);
-    EXPECT_EQ(null_item, create_func_cast(thd(), pos, nullptr, &type));
+    EXPECT_EQ(nullptr, create_func_cast(thd(), pos, nullptr, type, false));
   }
 
   {
@@ -801,14 +797,14 @@ TEST_F(ItemTest, ItemDecimalTypecast) {
     type.length = buff;
     type.dec = nullptr;
     initializer.set_expected_error(ER_TOO_BIG_PRECISION);
-    EXPECT_EQ(null_item, create_func_cast(thd(), pos, nullptr, &type));
+    EXPECT_EQ(nullptr, create_func_cast(thd(), pos, nullptr, type, false));
   }
 
   {
     type.length = nullptr;
     type.dec = "123456789012345678901234567890";
     initializer.set_expected_error(ER_TOO_BIG_SCALE);
-    EXPECT_EQ(null_item, create_func_cast(thd(), pos, nullptr, &type));
+    EXPECT_EQ(nullptr, create_func_cast(thd(), pos, nullptr, type, false));
   }
 
   {
@@ -817,7 +813,7 @@ TEST_F(ItemTest, ItemDecimalTypecast) {
     type.length = buff;
     type.dec = buff;
     initializer.set_expected_error(ER_TOO_BIG_SCALE);
-    EXPECT_EQ(null_item, create_func_cast(thd(), pos, nullptr, &type));
+    EXPECT_EQ(nullptr, create_func_cast(thd(), pos, nullptr, type, false));
   }
 }
 

@@ -1,4 +1,4 @@
-/* Copyright (c) 2006, 2019, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2006, 2020, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -100,8 +100,11 @@ enum {
   /* line for tls_ciphersuites */
   LINE_FOR_TLS_CIPHERSUITES = 31,
 
+  /* line for source_connection_auto_failover */
+  LINE_FOR_SOURCE_CONNECTION_AUTO_FAILOVER = 32,
+
   /* Number of lines currently used when saving master info file */
-  LINES_IN_MASTER_INFO = LINE_FOR_TLS_CIPHERSUITES
+  LINES_IN_MASTER_INFO = LINE_FOR_SOURCE_CONNECTION_AUTO_FAILOVER
 
 };
 
@@ -140,7 +143,8 @@ const char *info_mi_fields[] = {"number_of_lines",
                                 "network_namespace",
                                 "master_compression_algorithm",
                                 "master_zstd_compression_level",
-                                "tls_ciphersuites"};
+                                "tls_ciphersuites",
+                                "source_connection_auto_failover"};
 
 const uint info_mi_table_pk_field_indexes[] = {
     LINE_FOR_CHANNEL - 1,
@@ -494,7 +498,7 @@ bool Master_info::read_info(Rpl_info_handler *from) {
 
   if (!!from->get_info(&temp_master_log_pos, (ulong)BIN_LOG_HEADER_SIZE) ||
       !!from->get_info(host, sizeof(host), (char *)nullptr) ||
-      !!from->get_info(user, sizeof(user), "test") ||
+      !!from->get_info(user, sizeof(user), (char *)nullptr) ||
       !!from->get_info(password, sizeof(password), (char *)nullptr) ||
       !!from->get_info((int *)&port, (int)MYSQL_PORT) ||
       !!from->get_info((int *)&connect_retry, (int)DEFAULT_CONNECT_RETRY))
@@ -651,6 +655,12 @@ bool Master_info::read_info(Rpl_info_handler *from) {
     }
   }
 
+  if (lines >= LINE_FOR_SOURCE_CONNECTION_AUTO_FAILOVER) {
+    auto temp_source_connection_auto_failover{0};
+    if (!!from->get_info(&temp_source_connection_auto_failover, 0)) return true;
+    m_source_connection_auto_failover = temp_source_connection_auto_failover;
+  }
+
   return false;
 }
 
@@ -689,7 +699,8 @@ bool Master_info::write_info(Rpl_info_handler *to) {
       to->set_info(network_namespace) || to->set_info(compression_algorithm) ||
       to->set_info((int)zstd_compression_level) ||
       to->set_info(tls_ciphersuites.first ? nullptr
-                                          : tls_ciphersuites.second.c_str()))
+                                          : tls_ciphersuites.second.c_str()) ||
+      to->set_info((int)m_source_connection_auto_failover))
     return true;
 
   return false;

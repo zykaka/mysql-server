@@ -1,5 +1,5 @@
 /*
-   Copyright (c) 2000, 2020, Oracle and/or its affiliates. All rights reserved.
+   Copyright (c) 2000, 2020, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -179,6 +179,7 @@ static int connect_flag = CLIENT_INTERACTIVE;
 static bool opt_binary_mode = false;
 static bool opt_connect_expired_password = false;
 static char *current_host;
+static char *dns_srv_name;
 static char *current_db;
 static char *current_user = nullptr;
 static char *opt_password = nullptr;
@@ -199,6 +200,7 @@ static STATUS status;
 static ulong select_limit, max_join_size, opt_connect_timeout = 0;
 static char mysql_charsets_dir[FN_REFLEN + 1];
 static char *opt_plugin_dir = nullptr, *opt_default_auth = nullptr;
+static char *opt_load_data_local_dir = nullptr;
 #ifdef HAVE_SETNS
 static char *opt_network_namespace = nullptr;
 #endif
@@ -256,7 +258,7 @@ static bool opt_build_completion_hash = false;
   A flag that indicates if --execute buffer has already been converted,
   to avoid double conversion on reconnect.
 */
-static bool execute_buffer_conversion_done = 0;
+static bool execute_buffer_conversion_done{false};
 
 /*
   my_win_is_console(...) is quite slow.
@@ -1478,6 +1480,7 @@ void mysql_end(int sig) {
   my_free(opt_mysql_unix_port);
   my_free(current_db);
   my_free(current_host);
+  my_free(dns_srv_name);
   my_free(current_user);
   my_free(full_username);
   my_free(part_username);
@@ -1566,8 +1569,15 @@ static void kill_query(const char *reason) {
   }
 #endif
 
-  if (!mysql_real_connect(kill_mysql, current_host, current_user, opt_password,
-                          "", opt_mysql_port, opt_mysql_unix_port, 0)) {
+  MYSQL *ret;
+  if (dns_srv_name)
+    ret = mysql_real_connect_dns_srv(kill_mysql, dns_srv_name, current_user,
+                                     opt_password, "", 0);
+  else
+    ret =
+        mysql_real_connect(kill_mysql, current_host, current_user, opt_password,
+                           "", opt_mysql_port, opt_mysql_unix_port, 0);
+  if (!ret) {
 #ifdef HAVE_SETNS
     if (opt_network_namespace) (void)restore_original_network_namespace();
 #endif
@@ -1731,6 +1741,9 @@ static struct my_option my_long_options[] = {
      nullptr, GET_BOOL, NO_ARG, 0, 0, 0, nullptr, 0, nullptr},
     {"host", 'h', "Connect to host.", &current_host, &current_host, nullptr,
      GET_STR_ALLOC, REQUIRED_ARG, 0, 0, 0, nullptr, 0, nullptr},
+    {"dns-srv-name", 0, "Connect to a DNS SRV resource", &dns_srv_name,
+     &dns_srv_name, nullptr, GET_STR_ALLOC, REQUIRED_ARG, 0, 0, 0, nullptr, 0,
+     nullptr},
     {"html", 'H', "Produce HTML output.", &opt_html, &opt_html, nullptr,
      GET_BOOL, NO_ARG, 0, 0, 0, nullptr, 0, nullptr},
     {"xml", 'X', "Produce XML output.", &opt_xml, &opt_xml, nullptr, GET_BOOL,
@@ -1917,6 +1930,10 @@ static struct my_option my_long_options[] = {
      "inclusive. Default is 3.",
      &opt_zstd_compress_level, &opt_zstd_compress_level, nullptr, GET_UINT,
      REQUIRED_ARG, 3, 1, 22, nullptr, 0, nullptr},
+    {"load_data_local_dir", OPT_LOAD_DATA_LOCAL_DIR,
+     "Directory path safe for LOAD DATA LOCAL INFILE to read from.",
+     &opt_load_data_local_dir, &opt_load_data_local_dir, nullptr, GET_STR,
+     REQUIRED_ARG, 0, 0, 0, nullptr, 0, nullptr},
 
     {nullptr, 0, nullptr, nullptr, nullptr, nullptr, GET_NO_ARG, NO_ARG, 0, 0,
      0, nullptr, 0, nullptr}};
@@ -2657,12 +2674,10 @@ static char **new_mysql_completion(const char *text, int start, int end);
   if not.
 */
 
-#if defined(USE_NEW_EDITLINE_INTERFACE)
-static int fake_magic_space(int, int);
+#if defined(EDITLINE_HAVE_COMPLETION_CHAR)
 char *no_completion(const char *, int)
-#elif defined(USE_LIBEDIT_INTERFACE)
-static int fake_magic_space(int, int);
-char *no_completion(const char *, int)
+#elif defined(EDITLINE_HAVE_COMPLETION_INT)
+int no_completion(const char *, int)
 #else
 char *no_completion()
 #endif
@@ -2685,7 +2700,7 @@ static int not_in_history(const char *line) {
 #if defined(USE_NEW_EDITLINE_INTERFACE)
 static int fake_magic_space(int, int)
 #else
-static int fake_magic_space(int, int)
+static int fake_magic_space(const char *, int)
 #endif
 {
   rl_insert(1, ' ');
@@ -2697,12 +2712,12 @@ static void initialize_readline(char *name) {
   rl_readline_name = name;
 
   /* Tell the completer that we want a crack first. */
-#if defined(USE_NEW_EDITLINE_INTERFACE)
+#if defined(EDITLINE_HAVE_COMPLETION_CHAR)
   rl_attempted_completion_function = &new_mysql_completion;
   rl_completion_entry_function = &no_completion;
 
   rl_add_defun("magic-space", &fake_magic_space, -1);
-#elif defined(USE_LIBEDIT_INTERFACE)
+#elif defined(EDITLINE_HAVE_COMPLETION_INT)
   setlocale(LC_ALL, ""); /* so as libedit use isprint */
   rl_attempted_completion_function = &new_mysql_completion;
   rl_completion_entry_function = &no_completion;
@@ -3042,6 +3057,7 @@ static void get_current_db() {
 static int mysql_real_query_for_lazy(const char *buf, size_t length) {
   for (uint retry = 0;; retry++) {
     int error;
+
     if (!mysql_real_query(&mysql, buf, (ulong)length)) return 0;
     error = put_error(&mysql);
     if (mysql_errno(&mysql) != CR_SERVER_GONE_ERROR || retry > 1 ||
@@ -3427,66 +3443,7 @@ static int com_ego(String *buffer, char *line) {
   return result;
 }
 
-static const char *fieldtype2str(enum enum_field_types type) {
-  switch (type) {
-    case MYSQL_TYPE_BIT:
-      return "BIT";
-    case MYSQL_TYPE_BLOB:
-      return "BLOB";
-    case MYSQL_TYPE_DATE:
-      return "DATE";
-    case MYSQL_TYPE_DATETIME:
-      return "DATETIME";
-    case MYSQL_TYPE_NEWDECIMAL:
-      return "NEWDECIMAL";
-    case MYSQL_TYPE_DECIMAL:
-      return "DECIMAL";
-    case MYSQL_TYPE_DOUBLE:
-      return "DOUBLE";
-    case MYSQL_TYPE_ENUM:
-      return "ENUM";
-    case MYSQL_TYPE_FLOAT:
-      return "FLOAT";
-    case MYSQL_TYPE_GEOMETRY:
-      return "GEOMETRY";
-    case MYSQL_TYPE_INT24:
-      return "INT24";
-    case MYSQL_TYPE_JSON:
-      return "JSON";
-    case MYSQL_TYPE_LONG:
-      return "LONG";
-    case MYSQL_TYPE_LONGLONG:
-      return "LONGLONG";
-    case MYSQL_TYPE_LONG_BLOB:
-      return "LONG_BLOB";
-    case MYSQL_TYPE_MEDIUM_BLOB:
-      return "MEDIUM_BLOB";
-    case MYSQL_TYPE_NEWDATE:
-      return "NEWDATE";
-    case MYSQL_TYPE_NULL:
-      return "NULL";
-    case MYSQL_TYPE_SET:
-      return "SET";
-    case MYSQL_TYPE_SHORT:
-      return "SHORT";
-    case MYSQL_TYPE_STRING:
-      return "STRING";
-    case MYSQL_TYPE_TIME:
-      return "TIME";
-    case MYSQL_TYPE_TIMESTAMP:
-      return "TIMESTAMP";
-    case MYSQL_TYPE_TINY:
-      return "TINY";
-    case MYSQL_TYPE_TINY_BLOB:
-      return "TINY_BLOB";
-    case MYSQL_TYPE_VAR_STRING:
-      return "VAR_STRING";
-    case MYSQL_TYPE_YEAR:
-      return "YEAR";
-    default:
-      return "?-unknown-?";
-  }
-}
+const char *fieldtype2str(enum enum_field_types type);
 
 static char *fieldflags2str(uint f) {
   static char buf[1024];
@@ -4168,6 +4125,8 @@ static int com_connect(String *buffer, char *line) {
       if (tmp) {
         my_free(current_host);
         current_host = my_strdup(PSI_NOT_INSTRUMENTED, tmp, MYF(MY_WME));
+        my_free(dns_srv_name);
+        dns_srv_name = nullptr;
       }
     } else {
       /* Quick re-connect */
@@ -4511,10 +4470,16 @@ static int sql_real_connect(char *host, char *database, char *user,
     return ignore_errors ? -1 : 1;  // Abort
   }
 #endif
-
-  if (!mysql_real_connect(&mysql, host, user, password, database,
-                          opt_mysql_port, opt_mysql_unix_port,
-                          connect_flag | CLIENT_MULTI_STATEMENTS)) {
+  MYSQL *ret;
+  if (dns_srv_name)
+    ret = mysql_real_connect_dns_srv(&mysql, dns_srv_name, user, password,
+                                     database,
+                                     connect_flag | CLIENT_MULTI_STATEMENTS);
+  else
+    ret = mysql_real_connect(&mysql, host, user, password, database,
+                             opt_mysql_port, opt_mysql_unix_port,
+                             connect_flag | CLIENT_MULTI_STATEMENTS);
+  if (!ret) {
 #ifdef HAVE_SETNS
     if (opt_network_namespace) (void)restore_original_network_namespace();
 #endif
@@ -4548,7 +4513,7 @@ static int sql_real_connect(char *host, char *database, char *user,
 
 #ifdef _WIN32
   /* Convert --execute buffer from UTF8MB4 to connection character set */
-  if (!execute_buffer_conversion_done++ && status.line_buff &&
+  if (!execute_buffer_conversion_done && status.line_buff &&
       !status.line_buff->file && /* Convert only -e buffer, not real file */
       status.line_buff->buffer < status.line_buff->end && /* Non-empty */
       !my_charset_same(&my_charset_utf8mb4_bin, mysql.charset)) {
@@ -4573,6 +4538,7 @@ static int sql_real_connect(char *host, char *database, char *user,
               batch_readline_command(NULL, (char *)tmp.c_ptr_safe())))
       return 1;
   }
+  execute_buffer_conversion_done = true;
 #endif /* _WIN32 */
 
   charset_info = mysql.charset;
@@ -4635,6 +4601,11 @@ static bool init_connection_options(MYSQL *mysql) {
 
   if (opt_plugin_dir && *opt_plugin_dir)
     mysql_options(mysql, MYSQL_PLUGIN_DIR, opt_plugin_dir);
+
+  if (opt_load_data_local_dir &&
+      mysql_options(mysql, MYSQL_OPT_LOAD_DATA_LOCAL_DIR,
+                    opt_load_data_local_dir))
+    return true;
 
   if (opt_default_auth && *opt_default_auth)
     mysql_options(mysql, MYSQL_DEFAULT_AUTH, opt_default_auth);

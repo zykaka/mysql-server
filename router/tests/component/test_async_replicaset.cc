@@ -1,5 +1,5 @@
 /*
-Copyright (c) 2019, 2020, Oracle and/or its affiliates. All rights reserved.
+Copyright (c) 2019, 2020, Oracle and/or its affiliates.
 
 This program is free software; you can redistribute it and/or modify
 it under the terms of the GNU General Public License, version 2.0,
@@ -129,7 +129,8 @@ class AsyncReplicasetTest : public RouterComponentTest {
                       const std::string &metadata_cache_section,
                       const std::string &routing_section,
                       const std::string &state_file_path,
-                      const int expected_errorcode = EXIT_SUCCESS) {
+                      const int expected_errorcode = EXIT_SUCCESS,
+                      std::chrono::milliseconds wait_for_notify_ready = 5s) {
     const std::string masterkey_file =
         Path(temp_test_dir).join("master.key").str();
     const std::string keyring_file = Path(temp_test_dir).join("keyring").str();
@@ -139,21 +140,17 @@ class AsyncReplicasetTest : public RouterComponentTest {
     mysql_harness::flush_keyring();
     mysql_harness::reset_keyring();
 
-    // enable debug logs for better diagnostics in case of failure
-    std::string logger_section = "[logger]\nlevel = DEBUG\n";
-
     // launch the router with metadata-cache configuration
     auto default_section = get_DEFAULT_defaults();
     default_section["keyring_path"] = keyring_file;
     default_section["master_key_path"] = masterkey_file;
     default_section["dynamic_state"] = state_file_path;
     const std::string conf_file = create_config_file(
-        temp_test_dir,
-        logger_section + metadata_cache_section + routing_section,
+        temp_test_dir, metadata_cache_section + routing_section,
         &default_section);
     auto &router = ProcessManager::launch_router(
         {"-c", conf_file}, expected_errorcode, /*catch_stderr=*/true,
-        /*with_sudo=*/false);
+        /*with_sudo=*/false, wait_for_notify_ready);
     return router;
   }
 
@@ -218,13 +215,9 @@ TEST_F(AsyncReplicasetTest, NoChange) {
     cluster_nodes.push_back(&ProcessManager::launch_mysql_server_mock(
         trace_file, cluster_nodes_ports[i], EXIT_SUCCESS, false,
         cluster_http_ports[i]));
-    ASSERT_NO_FATAL_FAILURE(
-        check_port_ready(*cluster_nodes[i], cluster_nodes_ports[i]));
-    ASSERT_TRUE(MockServerRestClient(cluster_http_ports[i])
-                    .wait_for_rest_endpoint_ready());
 
     SCOPED_TRACE(
-        "// Make our metadata server to return all 3 nodes a s a cluster "
+        "// Make our metadata server to return all 3 nodes as a cluster "
         "members");
 
     // each memeber should report the same view_id (=1)
@@ -281,10 +274,6 @@ TEST_F(AsyncReplicasetTest, SecondaryAdded) {
     cluster_nodes.push_back(&ProcessManager::launch_mysql_server_mock(
         trace_file, cluster_nodes_ports[i], EXIT_SUCCESS, false,
         cluster_http_ports[i]));
-    ASSERT_NO_FATAL_FAILURE(
-        check_port_ready(*cluster_nodes[i], cluster_nodes_ports[i]));
-    ASSERT_TRUE(MockServerRestClient(cluster_http_ports[i])
-                    .wait_for_rest_endpoint_ready());
 
     SCOPED_TRACE(
         "// Make our metadata server to return all 3 nodes a s a cluster "
@@ -385,10 +374,6 @@ TEST_F(AsyncReplicasetTest, SecondaryRemovedStillReachable) {
     cluster_nodes.push_back(&ProcessManager::launch_mysql_server_mock(
         trace_file, cluster_nodes_ports[i], EXIT_SUCCESS, false,
         cluster_http_ports[i]));
-    ASSERT_NO_FATAL_FAILURE(
-        check_port_ready(*cluster_nodes[i], cluster_nodes_ports[i]));
-    ASSERT_TRUE(MockServerRestClient(cluster_http_ports[i])
-                    .wait_for_rest_endpoint_ready());
 
     SCOPED_TRACE(
         "// Make our metadata server to return all 3 nodes as a cluster "
@@ -486,10 +471,6 @@ TEST_F(AsyncReplicasetTest, ClusterIdChanged) {
     cluster_nodes.push_back(&ProcessManager::launch_mysql_server_mock(
         trace_file, cluster_nodes_ports[i], EXIT_SUCCESS, false,
         cluster_http_ports[i]));
-    ASSERT_NO_FATAL_FAILURE(
-        check_port_ready(*cluster_nodes[i], cluster_nodes_ports[i]));
-    ASSERT_TRUE(MockServerRestClient(cluster_http_ports[i])
-                    .wait_for_rest_endpoint_ready());
 
     SCOPED_TRACE(
         "// Make our metadata server to return all 3 nodes as a cluster "
@@ -569,10 +550,6 @@ TEST_F(AsyncReplicasetTest, ClusterSecondaryQueryErrors) {
     cluster_nodes.push_back(&ProcessManager::launch_mysql_server_mock(
         trace_file, cluster_nodes_ports[i], EXIT_SUCCESS, false,
         cluster_http_ports[i]));
-    ASSERT_NO_FATAL_FAILURE(
-        check_port_ready(*cluster_nodes[i], cluster_nodes_ports[i]));
-    ASSERT_TRUE(MockServerRestClient(cluster_http_ports[i])
-                    .wait_for_rest_endpoint_ready());
 
     SCOPED_TRACE(
         "// Make our metadata server to return all 3 nodes as a cluster "
@@ -644,10 +621,6 @@ TEST_F(AsyncReplicasetTest, MetadataUnavailableDisconnectFromSecondary) {
     cluster_nodes.push_back(&ProcessManager::launch_mysql_server_mock(
         trace_file, cluster_nodes_ports[i], EXIT_SUCCESS, false,
         cluster_http_ports[i]));
-    ASSERT_NO_FATAL_FAILURE(
-        check_port_ready(*cluster_nodes[i], cluster_nodes_ports[i]));
-    ASSERT_TRUE(MockServerRestClient(cluster_http_ports[i])
-                    .wait_for_rest_endpoint_ready());
 
     SCOPED_TRACE(
         "// Make our metadata server to return both nodes as a cluster "
@@ -739,10 +712,6 @@ TEST_F(AsyncReplicasetTest, MetadataUnavailableDisconnectFromPrimary) {
     cluster_nodes.push_back(&ProcessManager::launch_mysql_server_mock(
         trace_file, cluster_nodes_ports[i], EXIT_SUCCESS, false,
         cluster_http_ports[i]));
-    ASSERT_NO_FATAL_FAILURE(
-        check_port_ready(*cluster_nodes[i], cluster_nodes_ports[i]));
-    ASSERT_TRUE(MockServerRestClient(cluster_http_ports[i])
-                    .wait_for_rest_endpoint_ready());
 
     SCOPED_TRACE(
         "// Make our metadata server to return both nodes as a cluster "
@@ -854,10 +823,6 @@ TEST_F(AsyncReplicasetTest, MultipleChangesInTheCluster) {
     cluster_nodes.push_back(&ProcessManager::launch_mysql_server_mock(
         trace_file, cluster_nodes_ports[i], EXIT_SUCCESS, false,
         cluster_http_ports[i]));
-    ASSERT_NO_FATAL_FAILURE(
-        check_port_ready(*cluster_nodes[i], cluster_nodes_ports[i]));
-    ASSERT_TRUE(MockServerRestClient(cluster_http_ports[i])
-                    .wait_for_rest_endpoint_ready());
 
     SCOPED_TRACE(
         "// Make our metadata server to return first 3 nodes as a cluster "
@@ -930,10 +895,6 @@ TEST_F(AsyncReplicasetTest, SecondaryRemoved) {
     cluster_nodes.push_back(&ProcessManager::launch_mysql_server_mock(
         trace_file, cluster_nodes_ports[i], EXIT_SUCCESS, false,
         cluster_http_ports[i]));
-    ASSERT_NO_FATAL_FAILURE(
-        check_port_ready(*cluster_nodes[i], cluster_nodes_ports[i]));
-    ASSERT_TRUE(MockServerRestClient(cluster_http_ports[i])
-                    .wait_for_rest_endpoint_ready());
 
     SCOPED_TRACE(
         "// Make our metadata server initially return all 3 nodes as a cluster "
@@ -1034,10 +995,6 @@ TEST_F(AsyncReplicasetTest, NewPrimaryOldGone) {
     cluster_nodes.push_back(&ProcessManager::launch_mysql_server_mock(
         trace_file, cluster_nodes_ports[i], EXIT_SUCCESS, false,
         cluster_http_ports[i]));
-    ASSERT_NO_FATAL_FAILURE(
-        check_port_ready(*cluster_nodes[i], cluster_nodes_ports[i]));
-    ASSERT_TRUE(MockServerRestClient(cluster_http_ports[i])
-                    .wait_for_rest_endpoint_ready());
 
     SCOPED_TRACE("// Let us start with 2 members (PRIMARY and SECONDARY)");
     set_mock_metadata(cluster_http_ports[i], cluster_id,
@@ -1130,10 +1087,6 @@ TEST_F(AsyncReplicasetTest, NewPrimaryOldBecomesSecondary) {
     cluster_nodes.push_back(&ProcessManager::launch_mysql_server_mock(
         trace_file, cluster_nodes_ports[i], EXIT_SUCCESS, false,
         cluster_http_ports[i]));
-    ASSERT_NO_FATAL_FAILURE(
-        check_port_ready(*cluster_nodes[i], cluster_nodes_ports[i]));
-    ASSERT_TRUE(MockServerRestClient(cluster_http_ports[i])
-                    .wait_for_rest_endpoint_ready());
 
     SCOPED_TRACE("// Let us start with all 3 members (PRIMARY and SECONDARY)");
     set_mock_metadata(cluster_http_ports[i], cluster_id, cluster_nodes_ports,
@@ -1222,10 +1175,6 @@ TEST_F(AsyncReplicasetTest, NewPrimaryOldBecomesSecondaryDisconnectOnPromoted) {
     cluster_nodes.push_back(&ProcessManager::launch_mysql_server_mock(
         trace_file, cluster_nodes_ports[i], EXIT_SUCCESS, false,
         cluster_http_ports[i]));
-    ASSERT_NO_FATAL_FAILURE(
-        check_port_ready(*cluster_nodes[i], cluster_nodes_ports[i]));
-    ASSERT_TRUE(MockServerRestClient(cluster_http_ports[i])
-                    .wait_for_rest_endpoint_ready());
 
     SCOPED_TRACE("// Let us start with all 3 members");
     set_mock_metadata(cluster_http_ports[i], cluster_id, cluster_nodes_ports,
@@ -1317,10 +1266,6 @@ TEST_F(AsyncReplicasetTest, OnlyPrimaryLeftAcceptsRWAndRO) {
     cluster_nodes.push_back(&ProcessManager::launch_mysql_server_mock(
         trace_file, cluster_nodes_ports[i], EXIT_SUCCESS, false,
         cluster_http_ports[i]));
-    ASSERT_NO_FATAL_FAILURE(
-        check_port_ready(*cluster_nodes[i], cluster_nodes_ports[i]));
-    ASSERT_TRUE(MockServerRestClient(cluster_http_ports[i])
-                    .wait_for_rest_endpoint_ready());
 
     SCOPED_TRACE("// Let us start with 2 members (PRIMARY and SECONDARY)");
     set_mock_metadata(cluster_http_ports[i], cluster_id, cluster_nodes_ports,
@@ -1414,10 +1359,6 @@ TEST_F(AsyncReplicasetTest, OnlyPrimaryLeftAcceptsRW) {
     cluster_nodes.push_back(&ProcessManager::launch_mysql_server_mock(
         trace_file, cluster_nodes_ports[i], EXIT_SUCCESS, false,
         cluster_http_ports[i]));
-    ASSERT_NO_FATAL_FAILURE(
-        check_port_ready(*cluster_nodes[i], cluster_nodes_ports[i]));
-    ASSERT_TRUE(MockServerRestClient(cluster_http_ports[i])
-                    .wait_for_rest_endpoint_ready());
 
     SCOPED_TRACE("// Let us start with 2 members (PRIMARY and SECONDARY)");
     set_mock_metadata(cluster_http_ports[i], cluster_id, cluster_nodes_ports,
@@ -1504,10 +1445,6 @@ TEST_P(NodeUnavailableTest, NodeUnavailable) {
     cluster_nodes.push_back(&ProcessManager::launch_mysql_server_mock(
         trace_file, cluster_nodes_ports[i], EXIT_SUCCESS, false,
         cluster_http_ports[i]));
-    ASSERT_NO_FATAL_FAILURE(
-        check_port_ready(*cluster_nodes[nodes], cluster_nodes_ports[i]));
-    ASSERT_TRUE(MockServerRestClient(cluster_http_ports[i])
-                    .wait_for_rest_endpoint_ready());
 
     SCOPED_TRACE("// All 4 nodes are in the metadata");
     set_mock_metadata(cluster_http_ports[i], cluster_id, cluster_nodes_ports,
@@ -1567,9 +1504,9 @@ TEST_P(NodeUnavailableTest, NodeUnavailable) {
   }
 }
 
-INSTANTIATE_TEST_CASE_P(NodeUnavailable, NodeUnavailableTest,
-                        ::testing::Values("first-available", "round-robin",
-                                          "round-robin-with-fallback"));
+INSTANTIATE_TEST_SUITE_P(NodeUnavailable, NodeUnavailableTest,
+                         ::testing::Values("first-available", "round-robin",
+                                           "round-robin-with-fallback"));
 
 class NodeUnavailableAllNodesDownTest
     : public AsyncReplicasetTest,
@@ -1597,10 +1534,6 @@ TEST_P(NodeUnavailableAllNodesDownTest, NodeUnavailableAllNodesDown) {
     cluster_nodes.push_back(&ProcessManager::launch_mysql_server_mock(
         trace_file, cluster_nodes_ports[i], EXIT_SUCCESS, false,
         cluster_http_ports[i]));
-    ASSERT_NO_FATAL_FAILURE(
-        check_port_ready(*cluster_nodes[i], cluster_nodes_ports[i]));
-    ASSERT_TRUE(MockServerRestClient(cluster_http_ports[i])
-                    .wait_for_rest_endpoint_ready());
 
     SCOPED_TRACE("// All 3 nodes are in the metadata");
     set_mock_metadata(cluster_http_ports[i], cluster_id, cluster_nodes_ports,
@@ -1655,10 +1588,10 @@ TEST_P(NodeUnavailableAllNodesDownTest, NodeUnavailableAllNodesDown) {
   }
 }
 
-INSTANTIATE_TEST_CASE_P(NodeUnavailableAllNodesDown,
-                        NodeUnavailableAllNodesDownTest,
-                        ::testing::Values("first-available", "round-robin",
-                                          "round-robin-with-fallback"));
+INSTANTIATE_TEST_SUITE_P(NodeUnavailableAllNodesDown,
+                         NodeUnavailableAllNodesDownTest,
+                         ::testing::Values("first-available", "round-robin",
+                                           "round-robin-with-fallback"));
 
 struct ClusterTypeMismatchTestParams {
   std::string cluster_type_str;
@@ -1687,10 +1620,6 @@ TEST_P(ClusterTypeMismatchTest, ClusterTypeMismatch) {
     cluster_nodes.push_back(&ProcessManager::launch_mysql_server_mock(
         trace_file, cluster_nodes_ports[i], EXIT_SUCCESS, false,
         cluster_http_ports[i]));
-    ASSERT_NO_FATAL_FAILURE(
-        check_port_ready(*cluster_nodes[i], cluster_nodes_ports[i]));
-    ASSERT_TRUE(MockServerRestClient(cluster_http_ports[i])
-                    .wait_for_rest_endpoint_ready());
 
     SCOPED_TRACE("// Let us start with 2 members (PRIMARY and SECONDARY)");
     set_mock_metadata(cluster_http_ports[i], cluster_id, cluster_nodes_ports,
@@ -1716,7 +1645,8 @@ TEST_P(ClusterTypeMismatchTest, ClusterTypeMismatch) {
 
   SCOPED_TRACE("// Launch the router with the initial state file");
   auto &router = launch_router(temp_test_dir.name(), metadata_cache_section,
-                               routing_section, state_file);
+                               routing_section, state_file, EXIT_SUCCESS,
+                               /*wait_for_notify_ready=*/-1s);
 
   SCOPED_TRACE("// Wait until the router at least once queried the metadata");
   ASSERT_TRUE(wait_for_transaction_count_increase(cluster_http_ports[0], 2));
@@ -1732,14 +1662,15 @@ TEST_P(ClusterTypeMismatchTest, ClusterTypeMismatch) {
       << log_content;
 }
 
-INSTANTIATE_TEST_CASE_P(ClusterTypeMismatch, ClusterTypeMismatchTest,
-                        ::testing::Values(
-                            ClusterTypeMismatchTestParams{
-                                "rs", "metadata_dynamic_nodes_v2_gr.js",
-                                "Invalid cluster type 'gr'. Configured 'rs'"},
-                            ClusterTypeMismatchTestParams{
-                                "gr", "metadata_dynamic_nodes_v2_ar.js",
-                                "Invalid cluster type 'rs'. Configured 'gr'"}));
+INSTANTIATE_TEST_SUITE_P(
+    ClusterTypeMismatch, ClusterTypeMismatchTest,
+    ::testing::Values(
+        ClusterTypeMismatchTestParams{
+            "rs", "metadata_dynamic_nodes_v2_gr.js",
+            "Invalid cluster type 'gr'. Configured 'rs'"},
+        ClusterTypeMismatchTestParams{
+            "gr", "metadata_dynamic_nodes_v2_ar.js",
+            "Invalid cluster type 'rs'. Configured 'gr'"}));
 
 class UnexpectedResultFromMDRefreshTest
     : public AsyncReplicasetTest,
@@ -1762,11 +1693,6 @@ TEST_P(UnexpectedResultFromMDRefreshTest, UnexpectedResultFromMDRefreshQuery) {
     cluster_nodes.push_back(&ProcessManager::launch_mysql_server_mock(
         trace_file, cluster_nodes_ports[i], EXIT_SUCCESS, false,
         cluster_http_ports[i]));
-    ASSERT_NO_FATAL_FAILURE(
-        check_port_ready(*cluster_nodes[i], cluster_nodes_ports[i]));
-    ASSERT_TRUE(MockServerRestClient(cluster_http_ports[i])
-                    .wait_for_rest_endpoint_ready())
-        << cluster_nodes[i]->get_full_output();
 
     SCOPED_TRACE(
         "// Make our metadata server to return both nodes as a cluster "
@@ -1799,7 +1725,8 @@ TEST_P(UnexpectedResultFromMDRefreshTest, UnexpectedResultFromMDRefreshQuery) {
 
   SCOPED_TRACE("// Launch the router with the initial state file");
   launch_router(temp_test_dir.name(), metadata_cache_section, routing_section,
-                state_file);
+                state_file, EXIT_SUCCESS,
+                /*wait_for_notify_ready=*/-1s);
 
   SCOPED_TRACE("// Wait until the router at least once queried the metadata");
   ASSERT_TRUE(wait_for_transaction_count_increase(cluster_http_ports[0], 2));
@@ -1832,13 +1759,13 @@ TEST_P(UnexpectedResultFromMDRefreshTest, UnexpectedResultFromMDRefreshQuery) {
   // check that the router did not crash (happens automatically)
 }
 
-INSTANTIATE_TEST_CASE_P(UnexpectedResultFromMDRefreshQuery,
-                        UnexpectedResultFromMDRefreshTest,
-                        ::testing::Values(
-                            ClusterTypeMismatchTestParams{
-                                "gr", "metadata_dynamic_nodes_v2_gr.js", ""},
-                            ClusterTypeMismatchTestParams{
-                                "rs", "metadata_dynamic_nodes_v2_ar.js", ""}));
+INSTANTIATE_TEST_SUITE_P(UnexpectedResultFromMDRefreshQuery,
+                         UnexpectedResultFromMDRefreshTest,
+                         ::testing::Values(
+                             ClusterTypeMismatchTestParams{
+                                 "gr", "metadata_dynamic_nodes_v2_gr.js", ""},
+                             ClusterTypeMismatchTestParams{
+                                 "rs", "metadata_dynamic_nodes_v2_ar.js", ""}));
 
 int main(int argc, char *argv[]) {
   init_windows_sockets();

@@ -1,4 +1,4 @@
-/* Copyright (c) 2009, 2019, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2009, 2020, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -59,7 +59,16 @@ void thd_wait_end(THD *) {}
   A mock error handler.
 */
 static uint expected_error = 0;
+
+// This is needed to verify that an error was indeed reported. If
+// my_error() is NOT called as expected, test_error_handler_hook will
+// not be called, so the EXPECT_EQ below will not fire, even if
+// expected_error has been assigned a non-zero value.
+static uint reported_error = 0;
 extern "C" void test_error_handler_hook(uint err, const char *str, myf) {
+  // Record the error reported, so that it becomes possible to verify
+  // that an error was actually reported
+  reported_error = err;
   EXPECT_EQ(expected_error, err) << str;
 }
 
@@ -78,6 +87,8 @@ void debug_sync(THD *, const char *sync_point_name MY_ATTRIBUTE((unused)),
   name clashes with the code under test.
 */
 namespace mdl_unittest {
+
+bool test_drive_fix_pins(MDL_context *cp) { return cp->fix_pins(); }
 
 using thread::Notification;
 using thread::Thread;
@@ -104,8 +115,10 @@ class MDLTest : public ::testing::Test, public Test_MDL_context_owner {
     error_handler_hook = m_old_error_handler_hook;
   }
 
-  void SetUp() {
+  void SetUp() override {
     expected_error = 0;
+    reported_error = 0;
+
     mdl_locks_unused_locks_low_water = MDL_LOCKS_UNUSED_LOCKS_LOW_WATER_DEFAULT;
     max_write_lock_count = ULONG_MAX;
     mdl_init();
@@ -119,14 +132,17 @@ class MDLTest : public ::testing::Test, public Test_MDL_context_owner {
                      MDL_INTENTION_EXCLUSIVE, MDL_TRANSACTION);
   }
 
-  void TearDown() {
+  void TearDown() override {
+    // Verify that the error handling hook has indeed been called if an error
+    // was expected.
+    EXPECT_TRUE((expected_error == 0 || reported_error > 0));
     system_charset_info = m_charset;
     m_mdl_context.destroy();
     mdl_destroy();
   }
 
-  virtual void notify_shared_lock(MDL_context_owner *in_use,
-                                  bool needs_thr_lock_abort) {
+  void notify_shared_lock(MDL_context_owner *in_use,
+                          bool needs_thr_lock_abort) override {
     in_use->notify_shared_lock(nullptr, needs_thr_lock_abort);
   }
 
@@ -169,23 +185,23 @@ class MDL_thread : public Thread, public Test_MDL_context_owner {
     m_mdl_context.init(this);
   }
 
-  ~MDL_thread() { m_mdl_context.destroy(); }
+  ~MDL_thread() override { m_mdl_context.destroy(); }
 
-  virtual void run();
+  void run() override;
   void enable_release_on_notify() { m_enable_release_on_notify = true; }
 
-  virtual void notify_shared_lock(MDL_context_owner *in_use,
-                                  bool needs_thr_lock_abort) {
+  void notify_shared_lock(MDL_context_owner *in_use,
+                          bool needs_thr_lock_abort) override {
     if (in_use)
       in_use->notify_shared_lock(nullptr, needs_thr_lock_abort);
     else if (m_enable_release_on_notify && m_release_locks)
       m_release_locks->notify();
   }
 
-  virtual void enter_cond(mysql_cond_t *cond, mysql_mutex_t *mutex,
-                          const PSI_stage_info *stage,
-                          PSI_stage_info *old_stage, const char *src_function,
-                          const char *src_file, int src_line) {
+  void enter_cond(mysql_cond_t *cond, mysql_mutex_t *mutex,
+                  const PSI_stage_info *stage, PSI_stage_info *old_stage,
+                  const char *src_function, const char *src_file,
+                  int src_line) override {
     Test_MDL_context_owner::enter_cond(cond, mutex, stage, old_stage,
                                        src_function, src_file, src_line);
 
@@ -3520,11 +3536,11 @@ class MDL_SRO_SNRW_thread : public Thread, public Test_MDL_context_owner {
  public:
   MDL_SRO_SNRW_thread() { m_mdl_context.init(this); }
 
-  ~MDL_SRO_SNRW_thread() { m_mdl_context.destroy(); }
+  ~MDL_SRO_SNRW_thread() override { m_mdl_context.destroy(); }
 
-  virtual void run();
+  void run() override;
 
-  virtual void notify_shared_lock(MDL_context_owner *, bool) {}
+  void notify_shared_lock(MDL_context_owner *, bool) override {}
 
  private:
   MDL_context m_mdl_context;
@@ -3590,16 +3606,16 @@ class MDL_weight_thread : public Thread, public Test_MDL_context_owner {
     m_mdl_context.init(this);
   }
 
-  ~MDL_weight_thread() { m_mdl_context.destroy(); }
+  ~MDL_weight_thread() override { m_mdl_context.destroy(); }
 
-  virtual void run();
+  void run() override;
 
-  virtual void notify_shared_lock(MDL_context_owner *, bool) {}
+  void notify_shared_lock(MDL_context_owner *, bool) override {}
 
-  virtual void enter_cond(mysql_cond_t *cond, mysql_mutex_t *mutex,
-                          const PSI_stage_info *stage,
-                          PSI_stage_info *old_stage, const char *src_function,
-                          const char *src_file, int src_line) {
+  void enter_cond(mysql_cond_t *cond, mysql_mutex_t *mutex,
+                  const PSI_stage_info *stage, PSI_stage_info *old_stage,
+                  const char *src_function, const char *src_file,
+                  int src_line) override {
     Test_MDL_context_owner::enter_cond(cond, mutex, stage, old_stage,
                                        src_function, src_file, src_line);
 
@@ -3693,7 +3709,7 @@ TEST_F(MDLTest, ForceDMLDeadlockWeight) {
 class MDLTestContextVisitor : public MDL_context_visitor {
  public:
   MDLTestContextVisitor() : m_visited_ctx(nullptr) {}
-  virtual void visit_context(const MDL_context *ctx) { m_visited_ctx = ctx; }
+  void visit_context(const MDL_context *ctx) override { m_visited_ctx = ctx; }
   const MDL_context *get_visited_ctx() { return m_visited_ctx; }
 
  private:
@@ -3759,27 +3775,41 @@ TEST_F(MDLTest, FindLockOwner) {
   EXPECT_EQ(null_context, visitor4.get_visited_ctx());
 }
 
+/**
+   Verify that correct error is reported when the MDL system exhausts the LF
+   Pinbox.
+*/
+TEST_F(MDLTest, ExhaustPinbox) {
+  for (int i = 0; i < 65535; ++i) {
+    MDL_context c;
+    EXPECT_FALSE(test_drive_fix_pins(&c));
+  }
+  MDL_context bad;
+  expected_error = ER_MDL_OUT_OF_RESOURCES;
+  EXPECT_TRUE(test_drive_fix_pins(&bad));
+}
+
 /** Test class for SE notification testing. */
 
 class MDLHtonNotifyTest : public MDLTest {
  protected:
   MDLHtonNotifyTest() {}
 
-  void SetUp() {
+  void SetUp() override {
     MDLTest::SetUp();
     reset_counts_and_keys();
   }
 
-  void TearDown() { MDLTest::TearDown(); }
+  void TearDown() override { MDLTest::TearDown(); }
 
-  virtual bool notify_hton_pre_acquire_exclusive(const MDL_key *mdl_key,
-                                                 bool *victimized) {
+  bool notify_hton_pre_acquire_exclusive(const MDL_key *mdl_key,
+                                         bool *victimized) override {
     *victimized = false;
     m_pre_acquire_count++;
     m_pre_acquire_key.mdl_key_init(mdl_key);
     return m_refuse_acquire;
   }
-  virtual void notify_hton_post_release_exclusive(const MDL_key *mdl_key) {
+  void notify_hton_post_release_exclusive(const MDL_key *mdl_key) override {
     m_post_release_key.mdl_key_init(mdl_key);
     m_post_release_count++;
   }
@@ -4317,7 +4347,7 @@ TEST_F(MDLKeyTest, TruncateTooLongNames) {
 
 struct Mock_MDL_context_owner : public Test_MDL_context_owner {
   void notify_shared_lock(MDL_context_owner *in_use,
-                          bool needs_thr_lock_abort) override final {
+                          bool needs_thr_lock_abort) final {
     in_use->notify_shared_lock(NULL, needs_thr_lock_abort);
   }
 };

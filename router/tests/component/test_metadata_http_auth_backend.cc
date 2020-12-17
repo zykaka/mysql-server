@@ -1,5 +1,5 @@
 /*
-Copyright (c) 2020, Oracle and/or its affiliates. All rights reserved.
+Copyright (c) 2020, 2020, Oracle and/or its affiliates.
 
 This program is free software; you can redistribute it and/or modify
 it under the terms of the GNU General Public License, version 2.0,
@@ -141,8 +141,10 @@ class MetadataHttpAuthTest : public RouterComponentTest {
     return result;
   }
 
-  auto &launch_router(const std::string &metadata_cache_section,
-                      const int expected_errorcode = EXIT_SUCCESS) {
+  auto &launch_router(
+      const std::string &metadata_cache_section,
+      const int expected_errorcode = EXIT_SUCCESS,
+      const std::chrono::milliseconds wait_for_notify_ready = 5s) {
     const std::string &temp_test_dir_str = temp_test_dir.name();
 
     const auto &routing_section =
@@ -165,22 +167,19 @@ class MetadataHttpAuthTest : public RouterComponentTest {
     mysql_harness::flush_keyring();
     mysql_harness::reset_keyring();
 
-    // enable debug logs for better diagnostics in case of failure
-    const std::string logger_section =
-        "[logger]\nlevel = DEBUG\ntimestamp_precision=millisecond\n";
-
     // launch the router with metadata-cache configuration
     auto default_section = get_DEFAULT_defaults();
     default_section["keyring_path"] = keyring_file;
     default_section["master_key_path"] = masterkey_file;
     default_section["dynamic_state"] = state_file;
-    const std::string conf_file =
-        create_config_file(temp_test_dir_str,
-                           logger_section + metadata_cache_section +
-                               routing_section + rest_section,
-                           &default_section);
+    const std::string conf_file = create_config_file(
+        temp_test_dir_str,
+        metadata_cache_section + routing_section + rest_section,
+        &default_section);
 
-    return ProcessManager::launch_router({"-c", conf_file}, expected_errorcode);
+    return ProcessManager::launch_router(
+        {"-c", conf_file}, expected_errorcode, /*catch_stderr=*/true,
+        /*with_sudo=*/false, wait_for_notify_ready);
   }
 
   void set_mock_metadata(
@@ -267,10 +266,6 @@ class MetadataHttpAuthTest : public RouterComponentTest {
 
     cluster_node = &ProcessManager::launch_mysql_server_mock(
         trace_file, cluster_node_port, EXIT_SUCCESS, false, cluster_http_port);
-    ASSERT_NO_FATAL_FAILURE(check_port_ready(*cluster_node, cluster_node_port));
-    ASSERT_TRUE(
-        MockServerRestClient(cluster_http_port).wait_for_rest_endpoint_ready())
-        << cluster_node->get_full_output();
 
     router_port = port_pool_.get_next_available();
 
@@ -354,7 +349,6 @@ TEST_F(BasicMetadataHttpAuthTest, MetadataHttpAuthDefaultConfig) {
   SCOPED_TRACE("// Launch the router with the initial state file");
   ASSERT_NO_FATAL_FAILURE(launch_router(kMetadataCacheSectionBase));
 
-  wait_for_port_ready(router_port);
   ASSERT_TRUE(wait_for_rest_endpoint_ready(uri, http_server_port));
   EXPECT_GT(wait_for_rest_auth_query(2, cluster_http_port), 0);
 
@@ -375,7 +369,6 @@ TEST_F(BasicMetadataHttpAuthTest, UnsupportedMetadataSchemaVersion) {
   SCOPED_TRACE("// Launch the router with the initial state file");
   launch_router(kMetadataCacheSectionBase);
 
-  wait_for_port_ready(router_port);
   ASSERT_TRUE(wait_for_rest_endpoint_ready(uri, http_server_port));
 
   IOContext io_ctx;
@@ -399,7 +392,6 @@ TEST_P(BasicMetadataHttpAuthTest, BasicMetadataHttpAuth) {
       get_metadata_cache_section(kTTL, kAuthCacheTTL, kAuthCacheRefreshRate);
   launch_router(metadata_cache_section);
 
-  wait_for_port_ready(router_port);
   ASSERT_TRUE(wait_for_rest_endpoint_ready(uri, http_server_port));
   EXPECT_GT(wait_for_rest_auth_query(2, cluster_http_port), 0);
 
@@ -413,7 +405,7 @@ TEST_P(BasicMetadataHttpAuthTest, BasicMetadataHttpAuth) {
                                        GetParam().http_response.type));
 }
 
-INSTANTIATE_TEST_CASE_P(
+INSTANTIATE_TEST_SUITE_P(
     BasicMetadataHttpAuth, BasicMetadataHttpAuthTest,
     ::testing::Values(
         // matching user and password
@@ -517,12 +509,12 @@ TEST_P(InvalidMetadataHttpAuthTimersTest, InvalidMetadataHttpAuthTimers) {
 
   SCOPED_TRACE("// Launch the router with the initial state file");
   auto &router =
-      launch_router(kMetadataCacheSectionBase + GetParam(), EXIT_FAILURE);
+      launch_router(kMetadataCacheSectionBase + GetParam(), EXIT_FAILURE, -1s);
   check_exit_code(router, EXIT_FAILURE);
   EXPECT_THAT(router.exit_code(), testing::Ne(0));
 }
 
-INSTANTIATE_TEST_CASE_P(
+INSTANTIATE_TEST_SUITE_P(
     InvalidMetadataHttpAuthTimers, InvalidMetadataHttpAuthTimersTest,
     ::testing::Values(
         std::string{"auth_cache_ttl=2.5\nauth_cache_refresh_interval=2.51\n"},
@@ -551,7 +543,7 @@ TEST_P(ValidMetadataHttpAuthTimersTest, ValidMetadataHttpAuthTimers) {
   ASSERT_NO_FATAL_FAILURE(wait_for_port_ready(router_port));
 }
 
-INSTANTIATE_TEST_CASE_P(
+INSTANTIATE_TEST_SUITE_P(
     ValidMetadataHttpAuthTimers, ValidMetadataHttpAuthTimersTest,
     ::testing::Values(
         std::string{
@@ -587,7 +579,7 @@ TEST_P(MetadataHttpAuthTestCustomTimers, MetadataHttpAuthCustomTimers) {
                                        kContentTypeJson));
 }
 
-INSTANTIATE_TEST_CASE_P(
+INSTANTIATE_TEST_SUITE_P(
     MetadataHttpAuthCustomTimers, MetadataHttpAuthTestCustomTimers,
     ::testing::Values(
         std::string{"auth_cache_ttl=3600\nauth_cache_refresh_interval=2\n"},
@@ -622,13 +614,6 @@ TEST_F(MetadataHttpAuthTest, ExpiredAuthCacheTTL) {
   // Start to fail metadata cache updates
   set_mock_metadata({{kTestUser1, ""}}, cluster_http_port, cluster_id,
                     cluster_node_port, fail_on_md_query, 0, view_id);
-
-  // auth_cache_ttl is not yet expired
-  EXPECT_GT(wait_for_rest_auth_query(2, cluster_http_port), 0);
-
-  ASSERT_NO_FATAL_FAILURE(request_json(rest_client, uri, HttpMethod::Get,
-                                       HttpStatusCode::Ok, json_doc,
-                                       kContentTypeJson));
 
   // wait long enough for the auth cache to expire
   std::this_thread::sleep_for(cache_ttl);
@@ -682,7 +667,7 @@ TEST_P(MetadataAuthCacheUpdate, AuthCacheUpdate) {
       json_doc, GetParam().second_http_response.type));
 }
 
-INSTANTIATE_TEST_CASE_P(
+INSTANTIATE_TEST_SUITE_P(
     AuthCacheUpdate, MetadataAuthCacheUpdate,
     ::testing::Values(
         // add user

@@ -54,6 +54,8 @@ SET(xplugin_SRC
   src/variables/status_variables.cc
   src/server/server_factory.cc
   src/helper/multithread/mutex.cc
+  src/helper/multithread/xsync_point.cc
+  src/helper/multithread/initializer.cc
   src/helper/multithread/cond.cc
   src/helper/multithread/rw_lock.cc
   src/helper/generate_hash.cc
@@ -81,6 +83,7 @@ SET(xplugin_SRC
   src/services/registrator.cc
   src/services/service_registry_registration.cc
   src/services/service_sys_variables.cc
+  src/services/service_audit_api_connection.cc
   src/services/services.cc
   src/services/service_udf_registration.cc
   src/xpl_plugin.cc
@@ -151,4 +154,5 @@ SET(xplugin_SRC
 
 SET(xplugin_global_reset_SRC
   src/components/global_status_reset.cc
+  src/components/test_emit_gr_notifications.cc
 )

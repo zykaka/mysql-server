@@ -1,5 +1,5 @@
 /*
-   Copyright (c) 2003, 2019, Oracle and/or its affiliates. All rights reserved.
+   Copyright (c) 2003, 2020, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -2049,16 +2049,16 @@ SimulatedBlock::allocRecordAligned(const char * type, size_t s, size_t n, void *
   Uint64 real_size = (Uint64)((Uint64)n)*((Uint64)s) + over_alloc;
   refresh_watch_dog(9);
   if (real_size > 0){
-#ifdef VM_TRACE_MEM
-    ndbout_c("%s::allocRecord(%s, %u, %u) = %llu bytes", 
-	     getBlockName(number()), 
-	     type,
-	     s,
-	     n,
-	     real_size);
+#if defined(VM_TRACE_MEM)
+    g_eventLogger->info("%s::allocRecord(%s, %zu, %zu) = %llu bytes",
+	                getBlockName(number()),
+	                type,
+	                s,
+	                n,
+	                real_size);
 #endif
     if( real_size == (Uint64)size )
-      p = ndbd_malloc(size);
+      p = ndbd_malloc_watched(size, get_watch_dog());
     if (p == NULL){
       char buf1[255];
       char buf2[255];
@@ -2179,6 +2179,16 @@ SimulatedBlock::refresh_watch_dog(Uint32 place)
   (*m_watchDogCounter) = place;
 #else
   globalData.incrementWatchDogCounter(place);
+#endif
+}
+
+volatile Uint32*
+SimulatedBlock::get_watch_dog()
+{
+#ifdef NDBD_MULTITHREADED
+  return m_watchDogCounter;
+#else
+  return globalData.getWatchDogPtr();
 #endif
 }
 
@@ -2593,6 +2603,7 @@ SimulatedBlock::execCALLBACK_CONF(Signal* signal)
   Uint32 callbackData = conf->callbackData;
   Uint32 callbackInfo = conf->callbackInfo;
   Uint32 returnCode = conf->returnCode;
+  ndbrequire(returnCode == 0);
 
   ndbrequire(m_callbackTableAddr != 0);
   const CallbackEntry& ce = getCallbackEntry(callbackIndex);
@@ -2601,7 +2612,13 @@ SimulatedBlock::execCALLBACK_CONF(Signal* signal)
   Callback callback;
   callback.m_callbackFunction = function;
   callback.m_callbackData = callbackData;
-  execute(signal, callback, returnCode);
+
+  /**
+   * For both PROCESS_LOG_SYNC_WAITERS and PROCESS_LOG_BUFFER_WAITERS,
+   * sendCallbackConf() places logfile_group_id in senderData.
+   * drop_table_log_buffer_callback() needs logfile_group_id.
+  */
+  execute(signal, callback, senderData);
 
   if (ce.m_flags & CALLBACK_ACK) {
     jam();
@@ -4775,7 +4792,6 @@ SimulatedBlock::execLOCAL_ROUTE_ORD(Signal* signal)
 bool
 SimulatedBlock::debugOutOn()
 {
-  return true;
   SignalLoggerManager::LogMode mask = SignalLoggerManager::LogInOut;
   return
     globalData.testOn &&

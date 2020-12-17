@@ -130,14 +130,14 @@ inline MY_ATTRIBUTE((warn_unused_result)) ulint
   return (btr_search_get_n_fields(cursor->n_fields, cursor->n_bytes));
 }
 
-/** Builds a hash index on a page with the given parameters. If the page
-already has a hash index with different parameters, the old hash index is
-removed. If index is non-NULL, this function checks if n_fields and n_bytes
-are sensible values, and does not build a hash index if not.
-@param[in]	index		index for which to build, or NULL if not known
-@param[in]	block		index page, s- or x-latched
+/** Builds a hash index on a page with the given parameters. If the page already
+has a hash index with different parameters, the old hash index is removed.
+If index is non-NULL, this function checks if n_fields and n_bytes are
+sensible, and does not build a hash index if not.
+@param[in,out]	index		index for which to build, or NULL if not known
+@param[in,out]	block		index page, s-/x- latched.
 @param[in]	n_fields	hash this many full fields
-@param[in]	n_bytes		hash this many bytes from the next field
+@param[in]	n_bytes		hash this many bytes of the next field
 @param[in]	left_side	hash for searches from left side */
 static void btr_search_build_page_hash_index(dict_index_t *index,
                                              buf_block_t *block, ulint n_fields,
@@ -297,7 +297,7 @@ static void btr_search_disable_ref_count(dict_table_t *table) {
 }
 
 /** Disable the adaptive hash search system and empty the index.
-@param[in]	need_mutex	need to acquire dict_sys->mutex */
+@param[in]	need_mutex	Need to acquire dict_sys->mutex */
 void btr_search_disable(bool need_mutex) {
   dict_table_t *table;
 
@@ -371,7 +371,6 @@ btr_search_t *btr_search_info_create(mem_heap_t *heap) {
 
   info->ref_count = 0;
   info->root_guess = nullptr;
-  info->withdraw_clock = 0;
 
   info->hash_analysis = 0;
   info->n_hash_potential = 0;
@@ -699,17 +698,17 @@ void btr_search_info_update_slow(btr_search_t *info, btr_cur_t *cursor) {
 /** Checks if a guessed position for a tree cursor is right. Note that if
 mode is PAGE_CUR_LE, which is used in inserts, and the function returns
 TRUE, then cursor->up_match and cursor->low_match both have sensible values.
-@param[in,out]	cursor		guess cursor position
+@param[in,out]	cursor		Guess cursor position
 @param[in]	can_only_compare_to_cursor_rec
-                                if we do not have a latch on the page of cursor,
+                                If we do not have a latch on the page of cursor,
                                 but a latch corresponding search system, then
                                 ONLY the columns of the record UNDER the cursor
                                 are protected, not the next or previous record
                                 in the chain: we cannot look at the next or
                                 previous record to check our guess!
-@param[in]	tuple		data tuple
+@param[in]	tuple		Data tuple
 @param[in]	mode		PAGE_CUR_L, PAGE_CUR_LE, PAGE_CUR_G, PAGE_CUR_GE
-@param[in]	mtr		mini transaction
+@param[in]	mtr		Mini-transaction
 @return true if success */
 static ibool btr_search_check_guess(btr_cur_t *cursor,
                                     ibool can_only_compare_to_cursor_rec,
@@ -846,20 +845,20 @@ static void btr_search_failure(btr_search_t *info, btr_cur_t *cursor) {
 of the index. Note that if mode is PAGE_CUR_LE, which is used in inserts,
 and the function returns TRUE, then cursor->up_match and cursor->low_match
 both have sensible values.
-@param[in,out]	index		index
-@param[in,out]	info		index search info
-@param[in]	tuple		logical record
+@param[in,out]	index		Index
+@param[in,out]	info		Index search info
+@param[in]	tuple		Logical record
 @param[in]	mode		PAGE_CUR_L, ....
 @param[in]	latch_mode	BTR_SEARCH_LEAF, ...;
                                 NOTE that only if has_search_latch is 0, we will
                                 have a latch set on the cursor page, otherwise
                                 we assume the caller uses his search latch
                                 to protect the record!
-@param[out]	cursor		tree cursor
+@param[out]	cursor		Tree cursor
 @param[in]	has_search_latch
-                                latch mode the caller currently has on
+                                Latch mode the caller currently has on
                                 search system: RW_S/X_LATCH or 0
-@param[in]	mtr		mini transaction
+@param[in]	mtr		Mini-transaction
 @return true if succeeded */
 ibool btr_search_guess_on_hash(dict_index_t *index, btr_search_t *info,
                                const dtuple_t *tuple, ulint mode,
@@ -1291,7 +1290,8 @@ void btr_drop_ahi_for_table(dict_table_t *table) {
   const dict_index_t *indexes[MAX_INDEXES];
   static constexpr unsigned DROP_BATCH = 1024;
 
-  page_id_t drop[DROP_BATCH];
+  std::vector<page_id_t> drop;
+  drop.reserve(DROP_BATCH);
   const page_size_t page_size(dict_table_page_size(table));
 
   for (;;) {
@@ -1316,8 +1316,7 @@ void btr_drop_ahi_for_table(dict_table_t *table) {
     }
 
     for (ulint i = 0; i < srv_buf_pool_instances; ++i) {
-      unsigned n_drop = 0;
-
+      drop.clear();
       buf_pool_t *buf_pool = buf_pool_from_array(i);
       mutex_enter(&buf_pool->LRU_list_mutex);
       const buf_page_t *prev;
@@ -1341,8 +1340,8 @@ void btr_drop_ahi_for_table(dict_table_t *table) {
         }
 
         if (std::search_n(indexes, end, 1, index) != end) {
-          drop[n_drop].copy_from(bpage->id);
-          if (++n_drop == DROP_BATCH) {
+          drop.emplace_back(bpage->id);
+          if (drop.size() == DROP_BATCH) {
             break;
           }
         }
@@ -1350,8 +1349,8 @@ void btr_drop_ahi_for_table(dict_table_t *table) {
 
       mutex_exit(&buf_pool->LRU_list_mutex);
 
-      for (unsigned i = 0; i < n_drop; ++i) {
-        btr_search_drop_page_hash_when_freed(drop[i], page_size);
+      for (const page_id_t &page_id : drop) {
+        btr_search_drop_page_hash_when_freed(page_id, page_size);
       }
     }
 
@@ -1371,7 +1370,8 @@ void btr_drop_ahi_for_index(dict_index_t *index) {
   static constexpr unsigned DROP_BATCH = 1024;
 
   const dict_table_t *table = index->table;
-  page_id_t drop[DROP_BATCH];
+  std::vector<page_id_t> drop;
+  drop.reserve(DROP_BATCH);
   const page_size_t page_size(dict_table_page_size(table));
 
   while (true) {
@@ -1380,7 +1380,7 @@ void btr_drop_ahi_for_index(dict_index_t *index) {
     }
 
     for (ulint i = 0; i < srv_buf_pool_instances; ++i) {
-      unsigned n_drop = 0;
+      drop.clear();
 
       buf_pool_t *buf_pool = buf_pool_from_array(i);
       mutex_enter(&buf_pool->LRU_list_mutex);
@@ -1404,16 +1404,16 @@ void btr_drop_ahi_for_index(dict_index_t *index) {
           continue;
         }
 
-        drop[n_drop].copy_from(bpage->id);
-        if (++n_drop == DROP_BATCH) {
+        drop.emplace_back(bpage->id);
+        if (drop.size() == DROP_BATCH) {
           break;
         }
       }
 
       mutex_exit(&buf_pool->LRU_list_mutex);
 
-      for (unsigned i = 0; i < n_drop; ++i) {
-        btr_search_drop_page_hash_when_freed(drop[i], page_size);
+      for (const page_id_t &page_id : drop) {
+        btr_search_drop_page_hash_when_freed(page_id, page_size);
       }
     }
 
@@ -1421,11 +1421,11 @@ void btr_drop_ahi_for_index(dict_index_t *index) {
   }
 }
 
-/** Build a hash index on a page with the given parameters. If the page already
+/** Builds a hash index on a page with the given parameters. If the page already
 has a hash index with different parameters, the old hash index is removed.
 If index is non-NULL, this function checks if n_fields and n_bytes are
 sensible, and does not build a hash index if not.
-@param[in,out]	index		index for which to build.
+@param[in,out]	index		index for which to build, or NULL if not known
 @param[in,out]	block		index page, s-/x- latched.
 @param[in]	n_fields	hash this many full fields
 @param[in]	n_bytes		hash this many bytes of the next field

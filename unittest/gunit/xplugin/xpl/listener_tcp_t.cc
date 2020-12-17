@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2016, 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2016, 2020, Oracle and/or its affiliates.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License, version 2.0,
@@ -62,7 +62,7 @@ MATCHER_P(EqCastToCStr, expected, "") {
 
 class Listener_tcp_testsuite : public Test {
  public:
-  void SetUp() {
+  void SetUp() override {
     KEY_socket_x_tcpip = 1;
 
     m_mock_factory = std::make_shared<StrictMock<Mock_factory>>();
@@ -497,13 +497,6 @@ TEST_F(Listener_tcp_testsuite, setup_listener_success_evean_socket_opt_fails) {
   // SUT destructor
   ASSERT_NO_FATAL_FAILURE(assert_verify_and_reinitailize_rules());
   EXPECT_CALL(*m_mock_socket, close());
-}
-
-TEST_F(Listener_tcp_testsuite, get_name_and_configuration) {
-  make_sut(ALL_INTERFACES_6, 2222);
-
-  ASSERT_STREQ("bind-address: '::' port: 2222",
-               sut->get_name_and_configuration().c_str());
 }
 
 TEST_F(Listener_tcp_testsuite,

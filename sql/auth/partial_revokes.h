@@ -1,4 +1,4 @@
-/* Copyright (c) 2018, 2019, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2018, 2020, Oracle and/or its affiliates.
 
 This program is free software; you can redistribute it and/or modify
 it under the terms of the GNU General Public License, version 2.0,
@@ -80,7 +80,7 @@ class Abstract_restrictions {
 class DB_restrictions final : public Abstract_restrictions {
  public:
   DB_restrictions(MEM_ROOT *mem_root);
-  virtual ~DB_restrictions() override;
+  ~DB_restrictions() override;
 
   db_revocations &operator()(void) { return db_restrictions(); }
   DB_restrictions(const DB_restrictions &restrictions);
@@ -106,8 +106,8 @@ class DB_restrictions final : public Abstract_restrictions {
 
  private:
   db_revocations &db_restrictions() { return m_restrictions; }
-  void remove(const ulong remove_restrictions, ulong &restrictions_mask) const
-      noexcept;
+  void remove(const ulong remove_restrictions,
+              ulong &restrictions_mask) const noexcept;
 
  private:
   /** Database restrictions */

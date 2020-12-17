@@ -1,5 +1,5 @@
 /*
-  Copyright (c) 2019, 2020, Oracle and/or its affiliates. All rights reserved.
+  Copyright (c) 2019, 2020, Oracle and/or its affiliates.
 
   This program is free software; you can redistribute it and/or modify
   it under the terms of the GNU General Public License, version 2.0,
@@ -251,7 +251,8 @@ TEST_F(RouterPidfileOptionTest, PidFileOptionTwiceWithoutValue) {
   router_cmdline.emplace_back("--pid-file");
   router_cmdline.emplace_back("--pid-file");
 
-  auto &router = ProcessManager::launch_router(router_cmdline, EXIT_FAILURE);
+  auto &router = ProcessManager::launch_router(router_cmdline, EXIT_FAILURE,
+                                               true, false, -1s);
 
   check_exit_code(router, EXIT_FAILURE, 1s);
 
@@ -270,7 +271,8 @@ TEST_F(RouterPidfileOptionTest, PidFileOptionTwice) {
   router_cmdline.emplace_back("--pid-file=" + pidfile_tmp.str());
   router_cmdline.emplace_back("--pid-file=" + pidfile.str());
 
-  auto &router = ProcessManager::launch_router(router_cmdline, EXIT_FAILURE);
+  auto &router = ProcessManager::launch_router(router_cmdline, EXIT_FAILURE,
+                                               true, false, -1s);
 
   check_exit_code(router, EXIT_FAILURE, 1s);
 
@@ -295,7 +297,8 @@ TEST_F(RouterPidfileOptionTest, PidFileOptionCfgTwice) {
                                  "mysqlrouter.conf", extra_params);
   router_cmdline = {"-c", conf_file};
 
-  auto &router = ProcessManager::launch_router(router_cmdline, EXIT_FAILURE);
+  auto &router = ProcessManager::launch_router(router_cmdline, EXIT_FAILURE,
+                                               true, false, -1s);
 
   check_exit_code(router, EXIT_FAILURE, 1s);
 
@@ -393,7 +396,7 @@ TEST_P(RouterPidfileOptionValueTest, PidFileOptionValueTest) {
   EXPECT_TRUE(router->expect_output("PID .* written to '.*'", true));
 }
 
-INSTANTIATE_TEST_CASE_P(
+INSTANTIATE_TEST_SUITE_P(
     PidFileOptionValueTest, RouterPidfileOptionValueTest,
     ::testing::Values(
         // absolute path pidfile value : TS_FR01_01 /  TS_FR01_02 (O)
@@ -430,11 +433,11 @@ INSTANTIATE_TEST_CASE_P(
                             false)));
 
 #ifndef _WIN32
-INSTANTIATE_TEST_CASE_P(PidFileOptionValueTestUnix,
-                        RouterPidfileOptionValueTest,
-                        ::testing::Values(
-                            // whitespace : TS_FR01_03 (O)
-                            PidFileOptionParams(" ", false)));
+INSTANTIATE_TEST_SUITE_P(PidFileOptionValueTestUnix,
+                         RouterPidfileOptionValueTest,
+                         ::testing::Values(
+                             // whitespace : TS_FR01_03 (O)
+                             PidFileOptionParams(" ", false)));
 #endif
 
 /**
@@ -460,7 +463,8 @@ TEST_P(RouterPidfileOptionValueTestError, PidFileOptionValueTestError) {
   // start router with parameterized value for --pid-file, and expect error
   router_cmdline.emplace_back("--pid-file=" + test_params.filename);
 
-  auto &router = ProcessManager::launch_router(router_cmdline, EXIT_FAILURE);
+  auto &router = ProcessManager::launch_router(router_cmdline, EXIT_FAILURE,
+                                               true, false, -1s);
 
   check_exit_code(router, EXIT_FAILURE, 1s);
 
@@ -468,7 +472,7 @@ TEST_P(RouterPidfileOptionValueTestError, PidFileOptionValueTestError) {
   EXPECT_TRUE(router.expect_output(test_params.pattern, true));
 }
 
-INSTANTIATE_TEST_CASE_P(
+INSTANTIATE_TEST_SUITE_P(
     PidFileOptionValueTestError, RouterPidfileOptionValueTestError,
     ::testing::Values(
         // empty value : TS_FR10_01 / TS_FR10_02
@@ -540,16 +544,16 @@ TEST_P(RouterPidfileOptionCfgValueTest, PidFileOptionCfgValueTest) {
   EXPECT_TRUE(router->expect_output("PID .* written to '.*'", true));
 }
 
-INSTANTIATE_TEST_CASE_P(PidFileOptionCfgValueTest,
-                        RouterPidfileOptionCfgValueTest,
-                        ::testing::Values(
-                            // path with whitespace : TS_FR01_06
-                            PidFileOptionCfgParams(mysql_harness::Path(FOO)
-                                                       .join(WHITESPACE_FOLDER)
-                                                       .join(PIDFILE_WHITESPACE)
-                                                       .c_str()),
-                            // non-empty filename of 2 quotes : TS_FR01_05
-                            PidFileOptionCfgParams("''")));
+INSTANTIATE_TEST_SUITE_P(
+    PidFileOptionCfgValueTest, RouterPidfileOptionCfgValueTest,
+    ::testing::Values(
+        // path with whitespace : TS_FR01_06
+        PidFileOptionCfgParams(mysql_harness::Path(FOO)
+                                   .join(WHITESPACE_FOLDER)
+                                   .join(PIDFILE_WHITESPACE)
+                                   .c_str()),
+        // non-empty filename of 2 quotes : TS_FR01_05
+        PidFileOptionCfgParams("''")));
 
 /**
  * @test
@@ -577,7 +581,8 @@ TEST_P(RouterPidfileOptionCfgValueTestError, PidFileOptionCfgValueTestError) {
   router_cmdline = {"-c", conf_file};
 
   // start router with config file, and expect error
-  auto &router = ProcessManager::launch_router(router_cmdline, EXIT_FAILURE);
+  auto &router = ProcessManager::launch_router(router_cmdline, EXIT_FAILURE,
+                                               true, false, -1s);
 
   check_exit_code(router, EXIT_FAILURE, 1s);
 
@@ -586,11 +591,11 @@ TEST_P(RouterPidfileOptionCfgValueTestError, PidFileOptionCfgValueTestError) {
       router.expect_output("^Error: PID filename '.*' is illegal", true));
 }
 
-INSTANTIATE_TEST_CASE_P(PidFileOptionCfgValueTestError,
-                        RouterPidfileOptionCfgValueTestError,
-                        ::testing::Values(
-                            // empty value : TS_FR08_01
-                            PidFileOptionCfgErrorParams("")));
+INSTANTIATE_TEST_SUITE_P(PidFileOptionCfgValueTestError,
+                         RouterPidfileOptionCfgValueTestError,
+                         ::testing::Values(
+                             // empty value : TS_FR08_01
+                             PidFileOptionCfgErrorParams("")));
 
 #ifndef _WIN32
 /**
@@ -618,7 +623,8 @@ TEST_P(RouterPidfileOptionEnvValueTestError, PidFileOptionEnvValueTestError) {
   SetEnvRouterPid(test_params.filename.c_str());
 
   // start router with default config file, and expect error
-  auto &router = ProcessManager::launch_router(router_cmdline, EXIT_FAILURE);
+  auto &router = ProcessManager::launch_router(router_cmdline, EXIT_FAILURE,
+                                               true, false, -1s);
 
   check_exit_code(router, EXIT_FAILURE, 1s);
 
@@ -630,11 +636,11 @@ TEST_P(RouterPidfileOptionEnvValueTestError, PidFileOptionEnvValueTestError) {
       router.expect_output("^Error: PID filename '.*' is illegal", true));
 }
 
-INSTANTIATE_TEST_CASE_P(PidFileOptionEnvValueTestError,
-                        RouterPidfileOptionEnvValueTestError,
-                        ::testing::Values(
-                            // empty value : TS_FR09_01 (M), TS_FR09_02 (M)
-                            PidFileOptionEnvErrorParams("")));
+INSTANTIATE_TEST_SUITE_P(PidFileOptionEnvValueTestError,
+                         RouterPidfileOptionEnvValueTestError,
+                         ::testing::Values(
+                             // empty value : TS_FR09_01 (M), TS_FR09_02 (M)
+                             PidFileOptionEnvErrorParams("")));
 #endif
 
 /**
@@ -717,17 +723,17 @@ TEST_P(RouterPidfileOptionSupremacyTest, PidFileOptionSupremacyTest) {
   EXPECT_TRUE(router->expect_output("PID .* written to '.*'", true));
 }
 
-INSTANTIATE_TEST_CASE_P(PidFileOptionSupremacyTest,
-                        RouterPidfileOptionSupremacyTest,
-                        ::testing::Values(
-                            // --pid-file > pid_file > ROUTER_PID : TS_FR02_01
-                            PidFileOptionSupremacyParams(OPT | CFG | ENV),
-                            // --pid-file > pid_file : TS_FR02_02
-                            PidFileOptionSupremacyParams(OPT | CFG),
-                            // --pid-file > ROUTER_PID : TS_FR02_03
-                            PidFileOptionSupremacyParams(OPT | ENV),
-                            // pid_file > ROUTER_PID : TS_FR03_01
-                            PidFileOptionSupremacyParams(CFG | ENV)));
+INSTANTIATE_TEST_SUITE_P(PidFileOptionSupremacyTest,
+                         RouterPidfileOptionSupremacyTest,
+                         ::testing::Values(
+                             // --pid-file > pid_file > ROUTER_PID : TS_FR02_01
+                             PidFileOptionSupremacyParams(OPT | CFG | ENV),
+                             // --pid-file > pid_file : TS_FR02_02
+                             PidFileOptionSupremacyParams(OPT | CFG),
+                             // --pid-file > ROUTER_PID : TS_FR02_03
+                             PidFileOptionSupremacyParams(OPT | ENV),
+                             // pid_file > ROUTER_PID : TS_FR03_01
+                             PidFileOptionSupremacyParams(CFG | ENV)));
 
 /**
  * @test
@@ -760,7 +766,8 @@ TEST_P(RouterPidfileOptionSupremacyCornerCaseTest,
 
   router_cmdline = {"-c", conf_file};
 
-  auto &router = ProcessManager::launch_router(router_cmdline, EXIT_FAILURE);
+  auto &router = ProcessManager::launch_router(router_cmdline, EXIT_FAILURE,
+                                               true, false, -1s);
 
   check_exit_code(router, EXIT_FAILURE, 1s);
 
@@ -768,13 +775,13 @@ TEST_P(RouterPidfileOptionSupremacyCornerCaseTest,
   EXPECT_TRUE(router.expect_output(test_params.pattern, true));
 }
 
-INSTANTIATE_TEST_CASE_P(PidFileOptionSupremacyCornerCaseTest,
-                        RouterPidfileOptionSupremacyCornerCaseTest,
-                        ::testing::Values(
-                            // empty value : TS_FR03_02
-                            PidFileOptionSupremacyCornerCaseParams(
-                                "pid_file = ",
-                                "^Error: PID filename '.*' is illegal.")));
+INSTANTIATE_TEST_SUITE_P(PidFileOptionSupremacyCornerCaseTest,
+                         RouterPidfileOptionSupremacyCornerCaseTest,
+                         ::testing::Values(
+                             // empty value : TS_FR03_02
+                             PidFileOptionSupremacyCornerCaseParams(
+                                 "pid_file = ",
+                                 "^Error: PID filename '.*' is illegal.")));
 
 /**
  * @test
@@ -817,7 +824,8 @@ TEST_P(RouterPidfileOptionExistsTest, PidFileOptionExistsTest) {
     router_cmdline.emplace_back("--pid-file=" + pidfile.str());
   }
 
-  auto &router = ProcessManager::launch_router(router_cmdline, EXIT_FAILURE);
+  auto &router = ProcessManager::launch_router(router_cmdline, EXIT_FAILURE,
+                                               true, false, -1s);
 
   check_exit_code(router, EXIT_FAILURE, 1s);
 
@@ -834,14 +842,14 @@ TEST_P(RouterPidfileOptionExistsTest, PidFileOptionExistsTest) {
       "^Error: PID file .* found. Already running?", true));
 }
 
-INSTANTIATE_TEST_CASE_P(PidFileOptionExistsTest, RouterPidfileOptionExistsTest,
-                        ::testing::Values(
-                            // Start when --pid-file file exists : TS_FR12_01
-                            PidFileExistsParams(OPT),
-                            // Start when pid_file file exists : TS_FR12_02
-                            PidFileExistsParams(CFG),
-                            // Start when ROUTER_PID file exists : TS_FR12_03
-                            PidFileExistsParams(ENV)));
+INSTANTIATE_TEST_SUITE_P(PidFileOptionExistsTest, RouterPidfileOptionExistsTest,
+                         ::testing::Values(
+                             // Start when --pid-file file exists : TS_FR12_01
+                             PidFileExistsParams(OPT),
+                             // Start when pid_file file exists : TS_FR12_02
+                             PidFileExistsParams(CFG),
+                             // Start when ROUTER_PID file exists : TS_FR12_03
+                             PidFileExistsParams(ENV)));
 
 int main(int argc, char *argv[]) {
   init_windows_sockets();

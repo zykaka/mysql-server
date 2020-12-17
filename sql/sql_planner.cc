@@ -1,4 +1,4 @@
-/* Copyright (c) 2000, 2019, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2000, 2020, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -46,6 +46,7 @@
 #include "my_bitmap.h"
 #include "my_compiler.h"
 #include "my_dbug.h"
+#include "my_double2ulonglong.h"
 #include "my_macros.h"
 #include "sql/enum_query_type.h"
 #include "sql/field.h"
@@ -98,17 +99,13 @@ static uint cache_record_length(JOIN *join, uint idx) {
     JOIN_TAB *join_tab = *pos;
     if (!join_tab->used_fieldlength)  // Not calculated yet
     {
-      uint used_fields, used_blobs;
-      bool used_null_fields, used_uneven_bit_fields;
       /*
         (1) needs_rowid: we don't know if Duplicate Weedout may be
         used, length will thus be inaccurate, this is acceptable.
       */
       calc_used_field_length(join_tab->table(),
                              false,  // (1)
-                             &used_fields, &join_tab->used_fieldlength,
-                             &used_blobs, &used_null_fields,
-                             &used_uneven_bit_fields);
+                             &join_tab->used_fieldlength);
     }
     length += join_tab->used_fieldlength;
   }
@@ -879,10 +876,9 @@ double Optimize_table_order::calculate_scan_cost(
                                        tab->records() - *rows_after_filtering));
 
       trace_access_scan->add("using_join_cache", true);
-      trace_access_scan->add("buffers_needed",
-                             buffer_count >= std::numeric_limits<ulong>::max()
-                                 ? std::numeric_limits<ulong>::max()
-                                 : static_cast<ulong>(buffer_count));
+      trace_access_scan->add(
+          "buffers_needed",
+          static_cast<ulonglong>(std::min(buffer_count, ULLONG_MAX_DOUBLE)));
     }
   }
 
@@ -1276,7 +1272,7 @@ float calculate_condition_filter(const JOIN_TAB *const tab,
          tab->join()->select_lex->master_unit()->outer_select() !=
              nullptr ||                                 // 2c
          !tab->join()->select_lex->sj_nests.empty() ||  // 2d
-         ((tab->join()->order || tab->join()->group_list) &&
+         ((!tab->join()->order.empty() || !tab->join()->group_list.empty()) &&
           tab->join()->unit->select_limit_cnt != HA_POS_ERROR) ||  // 2e
          thd->lex->is_explain())))                                 // 2f
     return COND_FILTER_ALLPASS;
@@ -1324,7 +1320,7 @@ float calculate_condition_filter(const JOIN_TAB *const tab,
         over the next 'actual_key_parts' works.
       */
       for (uint i = 0; i < key->actual_key_parts; i++)
-        bitmap_set_bit(&table->tmp_set, key->key_part[i].field->field_index);
+        bitmap_set_bit(&table->tmp_set, key->key_part[i].field->field_index());
     } else {
       const Key_use *curr_ku = keyuse;
 
@@ -1361,7 +1357,7 @@ float calculate_condition_filter(const JOIN_TAB *const tab,
              curr_ku->keypart_map & keyuse->bound_keyparts)  // 2)
       {
         bitmap_set_bit(&table->tmp_set,
-                       key->key_part[curr_ku->keypart].field->field_index);
+                       key->key_part[curr_ku->keypart].field->field_index());
         curr_ku++;
       }
     }
@@ -1398,7 +1394,7 @@ float calculate_condition_filter(const JOIN_TAB *const tab,
         const KEY *key = table->key_info + keyno;
         for (uint i = 0; i < table->quick_key_parts[keyno]; i++)
           bitmap_set_bit(&fields_current_quick,
-                         key->key_part[i].field->field_index);
+                         key->key_part[i].field->field_index());
 
         /*
           If any of the fields used to get the rows estimate for this
@@ -1490,13 +1486,11 @@ cleanup:
 static ulonglong get_bound_sj_equalities(const JOIN_TAB *tab,
                                          table_map not_available_tables) {
   ulonglong bound_sj_equalities = 0;
-  List_iterator<Item> it_o(tab->emb_sj_nest->nested_join->sj_outer_exprs);
-  List_iterator_fast<Item> it_i(tab->emb_sj_nest->nested_join->sj_inner_exprs);
-  Item *outer, *inner;
-  for (uint i = 0;; ++i) {
-    outer = it_o++;
-    if (!outer) break;
-    inner = it_i++;
+  auto it_o = tab->emb_sj_nest->nested_join->sj_outer_exprs.begin();
+  auto it_i = tab->emb_sj_nest->nested_join->sj_inner_exprs.begin();
+  for (uint i = 0; it_o != tab->emb_sj_nest->nested_join->sj_outer_exprs.end();
+       ++i, ++it_o, ++it_i) {
+    Item *outer = *it_o, *inner = *it_i;
     if (!((not_available_tables)&outer->used_tables())) {
       bound_sj_equalities |= 1ULL << i;
       continue;
@@ -1716,7 +1710,7 @@ bool Optimize_table_order::semijoin_loosescan_fill_driving_table_position(
     if ((handled_sj_equalities | bound_sj_equalities) !=  // (1)
         LOWER_BITS(
             ulonglong,
-            tab->emb_sj_nest->nested_join->sj_inner_exprs.elements))  // (1)
+            tab->emb_sj_nest->nested_join->sj_inner_exprs.size()))  // (1)
     {
       trace_idx.add("index_handles_needed_semijoin_equalities", false);
       continue;
@@ -2325,7 +2319,7 @@ bool Optimize_table_order::greedy_search(table_map remaining_tables) {
     */
     DBUG_ASSERT(join->best_read < DBL_MAX);
 
-    if (size_remain <= search_depth) {
+    if (size_remain <= search_depth || use_best_so_far) {
       /*
         'join->best_positions' contains a complete optimal extension of the
         current partial QEP.
@@ -2516,7 +2510,7 @@ bool Optimize_table_order::consider_plan(uint idx,
         secondary_engine->compare_secondary_engine_cost != nullptr) {
       double secondary_engine_cost;
       if (secondary_engine->compare_secondary_engine_cost(
-              thd, *join, Candidate_table_order(join), cost, &cheaper,
+              thd, *join, cost, &use_best_so_far, &cheaper,
               &secondary_engine_cost))
         return true;
       chosen = cheaper;
@@ -2550,10 +2544,8 @@ bool Optimize_table_order::consider_plan(uint idx,
       (Similar code in best_extension_by_li...)
     */
     join->best_read = cost - 0.001;
-    join->best_rowcount = join->positions[idx].prefix_rowcount >=
-                                  std::numeric_limits<ha_rows>::max()
-                              ? std::numeric_limits<ha_rows>::max()
-                              : (ha_rows)join->positions[idx].prefix_rowcount;
+    join->best_rowcount = static_cast<ha_rows>(
+        std::min(join->positions[idx].prefix_rowcount, ULLONG_MAX_DOUBLE));
     join->sort_cost = sort_cost;
     join->windowing_cost = windowing_cost;
     found_plan_with_allowed_sj = plan_uses_allowed_sj;
@@ -2733,7 +2725,7 @@ bool Optimize_table_order::best_extension_by_limited_search(
 
   Deps_of_remaining_lateral_derived_tables deps_lateral(join, ~excluded_tables);
 
-  for (JOIN_TAB **pos = join->best_ref + idx; *pos; pos++) {
+  for (JOIN_TAB **pos = join->best_ref + idx; *pos && !use_best_so_far; pos++) {
     JOIN_TAB *const s = *pos;
     const table_map real_table_bit = s->table_ref->map();
 
@@ -4311,7 +4303,7 @@ void Optimize_table_order::advance_sj_state(table_map remaining_tables,
     if (emb_sj_nest &&  // (1a)
         emb_sj_nest->nested_join->sj_enabled_strategies &
             OPTIMIZER_SWITCH_LOOSE_SCAN &&                          // (1b)
-        emb_sj_nest->nested_join->sj_inner_exprs.elements <= 64 &&  // (2)
+        emb_sj_nest->nested_join->sj_inner_exprs.size() <= 64 &&    // (2)
         ((remaining_tables_incl & emb_sj_nest->sj_inner_tables) ==  // (3)
          emb_sj_nest->sj_inner_tables) &&                           // (3)
         pos->dups_producing_tables == 0 &&                          // (4)

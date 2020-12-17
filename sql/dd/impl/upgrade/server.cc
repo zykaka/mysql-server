@@ -1,4 +1,4 @@
-/* Copyright (c) 2019, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2019, 2020, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -38,8 +38,9 @@
 #include "scripts/sql_commands_system_tables_data_fix.h"
 #include "sql/dd/cache/dictionary_client.h"  // dd::cache::Dictionary_client
 #include "sql/dd/dd_schema.h"                // dd::Schema_MDL_locker
-#include "sql/dd/dd_tablespace.h"            // dd::fill_table_and_parts...
-#include "sql/dd/dd_trigger.h"               // dd::create_trigger
+#include "sql/dd/dd_table.h"  // dd::warn_on_deprecated_prefix_key_partition
+#include "sql/dd/dd_tablespace.h"                 // dd::fill_table_and_parts...
+#include "sql/dd/dd_trigger.h"                    // dd::create_trigger
 #include "sql/dd/impl/bootstrap/bootstrap_ctx.h"  // dd::DD_bootstrap_ctx
 #include "sql/dd/impl/bootstrap/bootstrapper.h"
 #include "sql/dd/impl/tables/dd_properties.h"  // dd::tables::DD_properties
@@ -419,6 +420,15 @@ bool fix_sys_schema(THD *thd) {
 bool fix_mysql_tables(THD *thd) {
   const char **query_ptr;
 
+  DBUG_EXECUTE_IF(
+      "schema_read_only",
+      if (dd::execute_query(thd, "CREATE SCHEMA schema_read_only") ||
+          dd::execute_query(thd, "ALTER SCHEMA schema_read_only READ ONLY=1") ||
+          dd::execute_query(thd, "CREATE TABLE schema_read_only.t(i INT)") ||
+          dd::execute_query(thd, "DROP SCHEMA schema_read_only") ||
+          dd::execute_query(thd, "CREATE TABLE IF NOT EXISTS S.upgrade(i INT)"))
+          DBUG_ASSERT(false););
+
   if (ignore_error_and_execute(thd, "USE mysql")) {
     LogErr(ERROR_LEVEL, ER_DD_UPGRADE_FAILED_FIND_VALID_DATA_DIR);
     return true;
@@ -502,6 +512,9 @@ bool do_server_upgrade_checks(THD *thd) {
 
     if (examine_each(&error_count, &tables, [&](const dd::Table *table) {
           (void)invalid_triggers(thd, schema->name().c_str(), *table);
+          // Check for usage of prefix key index in PARTITION BY KEY() function.
+          dd::warn_on_deprecated_prefix_key_partition(
+              thd, schema->name().c_str(), table->name().c_str(), table, true);
         }))
       break;
 

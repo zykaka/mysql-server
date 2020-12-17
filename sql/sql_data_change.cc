@@ -1,4 +1,4 @@
-/* Copyright (c) 2000, 2019, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2000, 2020, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -89,11 +89,11 @@ bool COPY_INFO::get_function_default_columns(TABLE *table) {
          f->has_insert_default_datetime_value_expression()) ||
         (m_optype == UPDATE_OPERATION &&
          f->has_update_default_datetime_value_expression()))
-      bitmap_set_bit(m_function_default_columns, f->field_index);
+      bitmap_set_bit(m_function_default_columns, f->field_index());
     // if it's a default expression also mark the columns it reads
     if (m_optype == INSERT_OPERATION &&
         f->has_insert_default_general_value_expression()) {
-      bitmap_set_bit(m_function_default_columns, f->field_index);
+      bitmap_set_bit(m_function_default_columns, f->field_index());
       for (uint j = 0; j < table->s->fields; j++) {
         if (bitmap_is_set(&f->m_default_val_expr->base_columns_map, j)) {
           bitmap_set_bit(table->read_set, j);
@@ -114,15 +114,15 @@ bool COPY_INFO::get_function_default_columns(TABLE *table) {
     If the lvalue is an expression tree, we clear all columns in it from the
     bitmap.
   */
-  List<Item> *all_changed_columns[2] = {m_changed_columns, m_changed_columns2};
+  mem_root_deque<Item *> *all_changed_columns[2] = {m_changed_columns,
+                                                    m_changed_columns2};
   for (uint i = 0; i < 2; i++) {
     if (all_changed_columns[i] != nullptr) {
-      List_iterator<Item> lvalue_it(*all_changed_columns[i]);
-      Item *lvalue_item;
-      while ((lvalue_item = lvalue_it++) != nullptr)
+      for (Item *lvalue_item : *all_changed_columns[i]) {
         lvalue_item->walk(
             &Item::remove_column_from_bitmap, enum_walk::SUBQUERY_POSTFIX,
             reinterpret_cast<uchar *>(m_function_default_columns));
+      }
     }
   }
 

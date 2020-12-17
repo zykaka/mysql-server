@@ -1,4 +1,4 @@
-# Copyright (c) 2015, 2019, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2015, 2020, Oracle and/or its affiliates.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License, version 2.0,
@@ -22,6 +22,8 @@
 INCLUDE_DIRECTORIES(../include ../src ../../../tests/helpers)
 
 SET(TESTS
+  test_certificate_generator.cc
+  test_certificate_handler.cc
   test_cluster_metadata.cc
   test_config_files.cc
   test_config_generator.cc
@@ -35,6 +37,10 @@ SET(TESTS
   test_mysqlrouter_app.cc
   test_mysqlrouter_utils.cc
   )
+# This compiler fails to handle some of the mock functions involved.
+IF(MY_COMPILER_IS_SUNPRO)
+  LIST(REMOVE_ITEM TESTS test_mysqlrouter_app.cc)
+ENDIF()
 
 FOREACH(TEST_FILE ${TESTS})
   ADD_TEST_FILE(${TEST_FILE}
@@ -70,6 +76,9 @@ ENDFOREACH()
 IF(MY_COMPILER_IS_CLANG)
   STRING_APPEND(CMAKE_CXX_FLAGS " -Wno-deprecated")
 ENDIF()
+
+# TODO(sgunders): Remove when all GMock tests use MOCK_METHOD().
+STRING(REPLACE "-Wsuggest-override" "" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
 
 # Use configuration file templates to generate configuration files
 SET(FILE_TEMPLATES
